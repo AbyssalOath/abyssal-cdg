@@ -1,0 +1,17 @@
+[package]
+name = "abyssal-cdg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "persistence", "wayland", "x11"] }
+egui = "0.28"
+rfd = "0.14"
+rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
+symphonia = { version = "0.5", features = ["all"] }
+font8x8 = "0.3"
+anyhow = "1.0"
+ab_glyph = "0.2.32"
+
+[profile.release]
+opt-level = 2

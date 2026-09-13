@@ -1,0 +1,26 @@
+# Build output (Cargo.lock IS committed - this is a binary crate, not a library)
+/target
+
+# Editor/IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# rustfmt backup files (created with `cargo fmt --backup`, harmless to ignore)
+**/*.rs.bk
+
+# Local env overrides, if any get added later
+.env
+.env.local
+
+# Likely-accidental exports if you run/test from the repo root
+/*.cdg
+/*.mp4
