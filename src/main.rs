@@ -761,8 +761,7 @@ impl KaraokeApp {
                                             as usize;
                                         let sung_part: String =
                                             word_text.chars().take(split).collect();
-                                        let rest: String =
-                                            word_text.chars().skip(split).collect();
+                                        let rest: String = word_text.chars().skip(split).collect();
                                         let suffix = if i + 1 < spans.len() { " " } else { "" };
                                         let append =
                                             |ui_job: &mut egui::text::LayoutJob,
@@ -1239,7 +1238,10 @@ impl eframe::App for KaraokeApp {
                                  held-out highlight ends exactly on time.",
                             );
                         });
-                        if ui.small_button("Reset word & end timing for this line").clicked() {
+                        if ui
+                            .small_button("Reset word & end timing for this line")
+                            .clicked()
+                        {
                             self.reset_word_overrides(i);
                         }
                     });

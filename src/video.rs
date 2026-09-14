@@ -19,12 +19,12 @@
 //! This requires `ffmpeg` to be installed and on the PATH; we check for it
 //! up front and return a clear error with install instructions if missing.
 
+#[cfg(test)]
+use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
     countdown_window, countdown_window_between, current_line_wipe_fraction, group_into_blocks,
     hide_upcoming_lines, normalize_text, TimedLine,
 };
-#[cfg(test)]
-use crate::lyrics::MAX_BLOCK_LINES;
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
