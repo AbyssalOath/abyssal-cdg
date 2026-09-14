@@ -13,6 +13,7 @@ mod formats;
 mod lyrics;
 mod timeline;
 mod video;
+mod vocals;
 
 use audio::AudioPlayer;
 use eframe::egui;
@@ -100,6 +101,13 @@ struct KaraokeApp {
     video_resolution: Resolution,
     /// Set while a video export is running in a background thread.
     video_export: Option<VideoExportHandle>,
+    /// Whether "Export video (.mp4)…" should mux in a vocals-reduced copy
+    /// of the audio (via [`vocals::remove_vocals_to_file`]) instead of the
+    /// original.
+    remove_vocals_for_video: bool,
+    /// Set while a standalone instrumental-audio export is running in a
+    /// background thread.
+    vocal_removal_export: Option<VocalRemovalExportHandle>,
 
     /// Zoom/scroll state for the fine-tuning timeline.
     timeline_view: timeline::View,
@@ -130,6 +138,13 @@ struct TimelineDrag {
 /// can take anywhere from several seconds to a couple of minutes).
 struct VideoExportHandle {
     progress: Arc<AtomicU32>, // 0..=1000 (tenths of a percent)
+    result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+}
+
+/// Shared state for a standalone instrumental-audio export running on a
+/// background thread. No progress fraction - a single ffmpeg filter pass
+/// over audio is usually quick enough that a busy indicator is enough.
+struct VocalRemovalExportHandle {
     result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
 }
 
@@ -169,6 +184,8 @@ impl KaraokeApp {
             seek_drag_value: None,
             video_resolution: Resolution::Hd1080,
             video_export: None,
+            remove_vocals_for_video: false,
+            vocal_removal_export: None,
             timeline_view: timeline::View::default(),
             timeline_drag: None,
         }
@@ -561,11 +578,31 @@ impl KaraokeApp {
         let result = Arc::new(Mutex::new(None));
         let progress_clone = progress.clone();
         let result_clone = result.clone();
+        let remove_vocals = self.remove_vocals_for_video;
 
         self.status = "Rendering video… this can take a while for longer songs.".to_string();
         self.video_export = Some(VideoExportHandle { progress, result });
 
         std::thread::spawn(move || {
+            // Remove vocals first (into a throwaway temp file) if asked -
+            // render_video just needs *some* audio file path to mux in, so
+            // swapping it for the instrumental copy is all that's needed to
+            // carry the same "remove vocals" option into the exported video.
+            let instrumental_path = if remove_vocals {
+                let tmp = std::env::temp_dir().join(format!(
+                    "abyssal-cdg-instrumental-{}.wav",
+                    std::process::id()
+                ));
+                if let Err(e) = vocals::remove_vocals_to_file(&audio_path, &tmp) {
+                    *result_clone.lock().unwrap() = Some(Err(format!("Vocal removal failed: {e}")));
+                    return;
+                }
+                Some(tmp)
+            } else {
+                None
+            };
+            let render_audio_path = instrumental_path.as_deref().unwrap_or(&audio_path);
+
             let r = video::render_video(
                 &timed,
                 total_duration,
@@ -574,15 +611,94 @@ impl KaraokeApp {
                 artist.as_deref(),
                 resolution,
                 30,
-                &audio_path,
+                render_audio_path,
                 &output_path,
                 |p| {
                     progress_clone.store((p * 1000.0) as u32, Ordering::Relaxed);
                 },
             );
+            if let Some(tmp) = &instrumental_path {
+                let _ = std::fs::remove_file(tmp);
+            }
             let mapped = r.map(|()| output_path).map_err(|e| e.to_string());
             *result_clone.lock().unwrap() = Some(mapped);
         });
+    }
+
+    fn start_vocal_removal_export(&mut self) {
+        if self.vocal_removal_export.is_some() {
+            self.status = "An instrumental export is already in progress.".to_string();
+            return;
+        }
+        let Some(audio_path) = self
+            .audio
+            .as_ref()
+            .and_then(|a| a.path())
+            .map(|p| p.to_path_buf())
+        else {
+            self.status = "Load an audio file first.".to_string();
+            return;
+        };
+
+        let default_name = self
+            .audio
+            .as_ref()
+            .and_then(|a| a.file_name())
+            .map(|n| {
+                let stem = n.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(n);
+                format!("{stem}-instrumental.mp3")
+            })
+            .unwrap_or_else(|| "instrumental.mp3".to_string());
+
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("MP3 audio", &["mp3"])
+            .add_filter("WAV audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let result = Arc::new(Mutex::new(None));
+        let result_clone = result.clone();
+
+        self.status =
+            "Removing vocals… (phase cancellation - quality depends on the mix)".to_string();
+        self.vocal_removal_export = Some(VocalRemovalExportHandle { result });
+
+        std::thread::spawn(move || {
+            let r = vocals::remove_vocals_to_file(&audio_path, &output_path);
+            let mapped = r.map(|()| output_path).map_err(|e| e.to_string());
+            *result_clone.lock().unwrap() = Some(mapped);
+        });
+    }
+
+    /// Checks on a running instrumental-audio export, if any, updating
+    /// status when it finishes. Returns true while still in progress (so
+    /// the caller knows to keep repainting for the busy indicator).
+    fn poll_vocal_removal_export(&mut self) -> bool {
+        let Some(handle) = &self.vocal_removal_export else {
+            return false;
+        };
+        let finished = handle.result.lock().unwrap().take();
+        if let Some(result) = finished {
+            match result {
+                Ok(path) => {
+                    self.status = format!(
+                        "Saved {} - vocals reduced via phase cancellation; quality varies by \
+                         mix, so give it a listen before relying on it.",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    self.status = format!("Instrumental export failed: {e}");
+                }
+            }
+            self.vocal_removal_export = None;
+            false
+        } else {
+            true
+        }
     }
 
     /// Checks on a running video export, if any, updating status when it
@@ -1176,6 +1292,9 @@ impl eframe::App for KaraokeApp {
         if self.poll_video_export() {
             ctx.request_repaint();
         }
+        if self.poll_vocal_removal_export() {
+            ctx.request_repaint();
+        }
         self.auto_follow_word_tap_line();
 
         // Keyboard shortcuts - only when no text field etc. has focus, so
@@ -1322,8 +1441,10 @@ impl eframe::App for KaraokeApp {
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.add_space(4.0);
             let exporting_video = self.video_export.is_some();
+            let exporting_instrumental = self.vocal_removal_export.is_some();
+            let busy = exporting_video || exporting_instrumental;
             ui.horizontal(|ui| {
-                ui.add_enabled_ui(!exporting_video, |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
                     if ui.button("Export .cdg…").clicked() {
                         self.export();
                     }
@@ -1345,6 +1466,7 @@ impl eframe::App for KaraokeApp {
                                 "4K",
                             );
                         });
+                    ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals");
                     if ui.button("Export video (.mp4)…").clicked() {
                         self.start_video_export();
                     }
@@ -1354,6 +1476,27 @@ impl eframe::App for KaraokeApp {
                 let frac = handle.progress.load(Ordering::Relaxed) as f32 / 1000.0;
                 ui.add(egui::ProgressBar::new(frac).show_percentage());
             }
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    if ui.button("Export instrumental audio…").clicked() {
+                        self.start_vocal_removal_export();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Both vocal-removal options use phase cancellation (subtracting one \
+                         stereo channel from the other) - cheap and needs nothing beyond \
+                         ffmpeg, but only reduces a vocal that's panned dead center, and will \
+                         also dull other centered elements (bass, kick, ...). Try it on your \
+                         mix before relying on it.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if exporting_instrumental {
+                    ui.spinner();
+                }
+            });
             if !self.status.is_empty() {
                 ui.label(&self.status);
             }
