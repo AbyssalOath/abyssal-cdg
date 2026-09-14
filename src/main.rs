@@ -17,8 +17,8 @@ use audio::AudioPlayer;
 use eframe::egui;
 use export::Palette;
 use lyrics::{
-    countdown_window, parse_pasted_lyrics, resolve_timing, word_timings, LyricLine, Singer,
-    TimedLine,
+    countdown_window, group_into_blocks, hide_upcoming_lines, parse_pasted_lyrics, resolve_timing,
+    LyricLine, Singer, TimedLine,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -381,6 +381,7 @@ impl KaraokeApp {
                 end,
                 line.singer,
                 line.word_overrides.clone(),
+                line.sing_end_override,
                 line.starts_new_block,
             ));
             indices.push(orig_idx);
@@ -430,8 +431,27 @@ impl KaraokeApp {
             for o in line.word_overrides.iter_mut() {
                 *o = None;
             }
+            line.sing_end_override = None;
         }
-        self.status = "Word timing reset to automatic for this line.".to_string();
+        self.status = "Word and end timing reset to automatic for this line.".to_string();
+    }
+
+    /// Tap the moment the line's *last* word actually finishes being sung.
+    /// Without this, the last word's held-out color-wipe end is only ever
+    /// the automatic word-count estimate ([`lyrics::estimate_sing_duration`]),
+    /// which has no way to know when a manually-tapped last word was
+    /// actually finished singing - so once every word's start is fine-tuned,
+    /// this is what makes the *end* of the line's highlight accurate too.
+    fn tap_line_end(&mut self, line_idx: usize) {
+        let Some(audio) = &self.audio else { return };
+        if !audio.is_playing() {
+            self.status = "Press Play first, then tap when the line finishes.".to_string();
+            return;
+        }
+        let pos = audio.position();
+        if let Some(line) = self.lines.get_mut(line_idx) {
+            line.sing_end_override = Some(pos);
+        }
     }
 
     fn start_video_export(&mut self) {
@@ -681,76 +701,115 @@ impl KaraokeApp {
                     .enumerate()
                     .find(|(_, l)| t >= l.start && t < l.end)
                 {
-                    Some((idx, line)) => {
-                        let (unsung, highlight) = self.singer_colors(line.singer);
-                        let mut job = egui::text::LayoutJob {
-                            halign: egui::Align::Center,
-                            ..Default::default()
-                        };
-                        // Same continuous per-line fraction the video/CDG exporters use, so
-                        // the wipe moves smoothly through a word's letters as it's held out
-                        // instead of the whole word snapping to `highlight` the instant its
-                        // timestamp is reached (which looked instantaneous for long-held
-                        // words and words with few characters alike).
-                        let normalized = lyrics::normalize_text(&line.text);
-                        let chars: Vec<char> = normalized.chars().collect();
-                        let words = word_timings(line);
-                        let spans = lyrics::word_char_spans(&normalized);
-                        let boundary =
-                            lyrics::current_line_wipe_fraction(line, t) * chars.len().max(1) as f32;
-                        let font_id = egui::FontId::proportional(18.0);
-                        for (i, &(offset, len)) in spans.iter().enumerate() {
-                            let word_text: String = chars[offset..offset + len].iter().collect();
-                            let is_manual = words.get(i).map(|w| w.is_manual).unwrap_or(false);
-                            let split = ((boundary - offset as f32).round().clamp(0.0, len as f32))
-                                as usize;
-                            let sung_part: String = word_text.chars().take(split).collect();
-                            let rest: String = word_text.chars().skip(split).collect();
-                            let suffix = if i + 1 < spans.len() { " " } else { "" };
-                            let append =
-                                |ui_job: &mut egui::text::LayoutJob,
-                                 text: &str,
-                                 color: egui::Color32| {
-                                    if text.is_empty() {
-                                        return;
-                                    }
-                                    let underline = if is_manual {
-                                        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.6))
-                                    } else {
-                                        egui::Stroke::NONE
-                                    };
-                                    ui_job.append(
-                                        text,
-                                        0.0,
-                                        egui::TextFormat {
-                                            color,
-                                            underline,
-                                            font_id: font_id.clone(),
-                                            ..Default::default()
-                                        },
+                    Some((current_idx, _)) => {
+                        // Show the whole verse block the current line belongs
+                        // to - like a real karaoke video's verse block, not
+                        // just the current line - so the preview matches what
+                        // the video/CDG exporters actually display.
+                        let blocks = group_into_blocks(&timed);
+                        let block = blocks
+                            .iter()
+                            .find(|b| b.contains(&current_idx))
+                            .cloned()
+                            .unwrap_or_else(|| vec![current_idx]);
+                        let slot_in_block =
+                            block.iter().position(|&i| i == current_idx).unwrap_or(0);
+
+                        // Once the current line is done being sung and there's a real
+                        // musical break before the next one (long enough to warrant the
+                        // countdown dots below), hide the not-yet-started lines in this
+                        // block instead of leaving them on screen the whole time - it
+                        // should read as "done, waiting" (then the countdown, then the
+                        // next line), not show lyrics that are still a break away.
+                        let current_line = &timed[current_idx];
+                        let hide_upcoming = hide_upcoming_lines(current_line, t);
+
+                        for (slot, &idx) in block.iter().enumerate() {
+                            let line = &timed[idx];
+                            let (unsung, highlight) = self.singer_colors(line.singer);
+                            let normalized = lyrics::normalize_text(&line.text);
+                            match slot.cmp(&slot_in_block) {
+                                std::cmp::Ordering::Less => {
+                                    // Already sung - shown fully in the highlight color.
+                                    ui.colored_label(
+                                        highlight,
+                                        egui::RichText::new(normalized).size(18.0),
                                     );
-                                };
-                            append(&mut job, &sung_part, highlight);
-                            append(&mut job, &format!("{rest}{suffix}"), unsung);
+                                }
+                                std::cmp::Ordering::Equal => {
+                                    let mut job = egui::text::LayoutJob {
+                                        halign: egui::Align::Center,
+                                        ..Default::default()
+                                    };
+                                    // Same continuous per-line fraction the video/CDG exporters
+                                    // use, so the wipe moves smoothly through a word's letters
+                                    // as it's held out instead of the whole word snapping to
+                                    // `highlight` the instant its timestamp is reached (which
+                                    // looked instantaneous for long-held words and words with
+                                    // few characters alike).
+                                    let chars: Vec<char> = normalized.chars().collect();
+                                    let spans = lyrics::word_char_spans(&normalized);
+                                    let boundary = lyrics::current_line_wipe_fraction(line, t)
+                                        * chars.len().max(1) as f32;
+                                    let font_id = egui::FontId::proportional(18.0);
+                                    for (i, &(offset, len)) in spans.iter().enumerate() {
+                                        let word_text: String =
+                                            chars[offset..offset + len].iter().collect();
+                                        let split = ((boundary - offset as f32)
+                                            .round()
+                                            .clamp(0.0, len as f32))
+                                            as usize;
+                                        let sung_part: String =
+                                            word_text.chars().take(split).collect();
+                                        let rest: String =
+                                            word_text.chars().skip(split).collect();
+                                        let suffix = if i + 1 < spans.len() { " " } else { "" };
+                                        let append =
+                                            |ui_job: &mut egui::text::LayoutJob,
+                                             text: &str,
+                                             color: egui::Color32| {
+                                                if text.is_empty() {
+                                                    return;
+                                                }
+                                                ui_job.append(
+                                                    text,
+                                                    0.0,
+                                                    egui::TextFormat {
+                                                        color,
+                                                        font_id: font_id.clone(),
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                            };
+                                        append(&mut job, &sung_part, highlight);
+                                        append(&mut job, &format!("{rest}{suffix}"), unsung);
+                                    }
+                                    ui.label(job);
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    if hide_upcoming {
+                                        ui.add_space(22.0);
+                                    } else {
+                                        ui.colored_label(
+                                            unsung,
+                                            egui::RichText::new(normalized).size(18.0),
+                                        );
+                                    }
+                                }
+                            }
                         }
-                        ui.label(job);
 
                         ui.add_space(8.0);
 
-                        if let Some(next) = timed.get(idx + 1) {
-                            ui.colored_label(
-                                self.color_preview,
-                                egui::RichText::new(&next.text).size(14.0),
-                            );
-                        }
-
-                        if let Some((cd_start, cd_end)) = countdown_window(line) {
+                        if let Some((cd_start, cd_end)) = countdown_window(current_line) {
                             if t >= cd_start {
                                 let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
                                     .clamp(0.0, 1.0);
                                 let lit = ((frac * 4.0).floor() as i32 + 1).clamp(0, 4) as usize;
-                                let next_singer =
-                                    timed.get(idx + 1).map(|l| l.singer).unwrap_or(line.singer);
+                                let next_singer = timed
+                                    .get(current_idx + 1)
+                                    .map(|l| l.singer)
+                                    .unwrap_or(current_line.singer);
                                 let (_, next_highlight) = self.singer_colors(next_singer);
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
@@ -1161,7 +1220,26 @@ impl eframe::App for KaraokeApp {
                                 }
                             }
                         });
-                        if ui.small_button("Reset word timing for this line").clicked() {
+                        ui.horizontal(|ui| {
+                            let manual_end = self.lines[i].sing_end_override;
+                            let text = match manual_end {
+                                Some(t) => format!("End of line ({t:.1}s)"),
+                                None => "End of line (auto)".to_string(),
+                            };
+                            let button = egui::Button::new(text).fill(if manual_end.is_some() {
+                                egui::Color32::from_rgb(35, 90, 45)
+                            } else {
+                                ui.visuals().widgets.inactive.weak_bg_fill
+                            });
+                            if ui.add(button).clicked() {
+                                self.tap_line_end(i);
+                            }
+                            ui.label(
+                                "- tap the instant the last word finishes, so its \
+                                 held-out highlight ends exactly on time.",
+                            );
+                        });
+                        if ui.small_button("Reset word & end timing for this line").clicked() {
                             self.reset_word_overrides(i);
                         }
                     });

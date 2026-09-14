@@ -384,6 +384,13 @@ pub fn render_cdg(
         }
 
         if let Some((cd_start, cd_end)) = countdown_window(line) {
+            // There's a real musical break before the next line - don't
+            // leave its dim preview sitting on screen for the whole break;
+            // clear it as soon as this line is done being sung, so the
+            // screen reads as "done, waiting" and then the countdown dots,
+            // rather than showing a line that's still a break away.
+            w.advance_to(line.sing_end);
+            clear_row(&mut w, PREVIEW_ROW);
             let next_singer = timed_lines
                 .get(i + 1)
                 .map(|l| l.singer)

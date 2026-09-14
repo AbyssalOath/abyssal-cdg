@@ -20,9 +20,11 @@
 //! up front and return a clear error with install instructions if missing.
 
 use crate::lyrics::{
-    countdown_window, countdown_window_between, current_line_wipe_fraction, normalize_text,
-    TimedLine,
+    countdown_window, countdown_window_between, current_line_wipe_fraction, group_into_blocks,
+    hide_upcoming_lines, normalize_text, TimedLine,
 };
+#[cfg(test)]
+use crate::lyrics::MAX_BLOCK_LINES;
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
@@ -31,11 +33,6 @@ use std::process::{Command, Stdio};
 
 static DEJAVU_REGULAR: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 static DEJAVU_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
-
-/// A verse block never shows more than this many lines at once - beyond
-/// this it'd get cramped, so a long uninterrupted run of lines is split
-/// into consecutive blocks instead.
-const MAX_BLOCK_LINES: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolution {
@@ -302,32 +299,6 @@ fn draw_text_line_uniform(
     );
 }
 
-/// Groups consecutive line indices into display blocks of at most
-/// [`MAX_BLOCK_LINES`], splitting wherever [`TimedLine::starts_new_block`]
-/// is set - i.e. wherever there was a blank line in the pasted lyrics - so
-/// a block matches exactly what looked like one verse/stanza when you
-/// pasted the lyrics in, regardless of how the actual singing timing
-/// happens to fall (that's a separate concern - see the countdown
-/// indicator, which is still timing-based).
-fn group_into_blocks(timed_lines: &[TimedLine]) -> Vec<Vec<usize>> {
-    let mut blocks = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
-    for (i, line) in timed_lines.iter().enumerate() {
-        let starts_new = i == 0 || line.starts_new_block;
-        if starts_new && !current.is_empty() {
-            blocks.push(std::mem::take(&mut current));
-        }
-        current.push(i);
-        if current.len() >= MAX_BLOCK_LINES {
-            blocks.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
-    blocks
-}
-
 /// Number of countdown dots lit (0..=4) for a countdown window that runs
 /// from `cd_start` to `cd_end`, at time `t`. Dot `k` (0-indexed) lights up
 /// at the *start* of its quarter of the window and stays lit through to
@@ -430,6 +401,14 @@ fn render_frame(
         .unwrap_or_else(|| vec![current_idx]);
     let slot_in_block = block.iter().position(|&i| i == current_idx).unwrap_or(0);
 
+    // Once the current line is done being sung and there's a real musical
+    // break before the next one (long enough to warrant the countdown
+    // indicator below), hide the not-yet-started lines in this block
+    // instead of leaving them sitting on screen the whole time - the screen
+    // should read as "done, waiting" (then the countdown dots, then the
+    // next line), not show lyrics that are still a break away.
+    let hide_upcoming = hide_upcoming_lines(&timed_lines[current_idx], t);
+
     let line_height = h * 0.11;
     let font_size = h * 0.055;
     let total_height = block.len() as f32 * line_height;
@@ -471,16 +450,18 @@ fn render_frame(
                 );
             }
             std::cmp::Ordering::Greater => {
-                draw_text_line_uniform(
-                    canvas,
-                    regular,
-                    font_size,
-                    w / 2.0,
-                    y,
-                    &text,
-                    unsung,
-                    max_width,
-                );
+                if !hide_upcoming {
+                    draw_text_line_uniform(
+                        canvas,
+                        regular,
+                        font_size,
+                        w / 2.0,
+                        y,
+                        &text,
+                        unsung,
+                        max_width,
+                    );
+                }
             }
         }
     }

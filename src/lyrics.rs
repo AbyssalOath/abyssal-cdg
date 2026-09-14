@@ -65,6 +65,16 @@ pub struct LyricLine {
     /// word until the user fine-tunes it). Mixing manual and automatic
     /// words within the same line is fine.
     pub word_overrides: Vec<Option<f64>>,
+    /// Manual override for when this line's singing actually finishes (i.e.
+    /// when the last word should stop being held out and the color-wipe
+    /// should be complete). `None` means "use the automatic estimate" (see
+    /// [`estimate_sing_duration`]), which is only ever a heuristic based on
+    /// word count - fine for lines the user hasn't fine-tuned, but often not
+    /// accurate enough once every word's *start* has been manually tapped,
+    /// since the estimate has no way to know when the last word was actually
+    /// finished being sung. Set by tapping "End of line" in the fine-tune
+    /// panel while the last word is still playing.
+    pub sing_end_override: Option<f64>,
     /// True if this line should start a new on-screen verse block in the
     /// video export - i.e. it was preceded by a blank line in the pasted
     /// lyrics (or it's the very first line). Defaults to `true` for lines
@@ -83,6 +93,7 @@ impl LyricLine {
             start: None,
             singer: Singer::default(),
             word_overrides: vec![None; word_count],
+            sing_end_override: None,
             starts_new_block: true,
         }
     }
@@ -139,7 +150,7 @@ pub struct TimedLine {
 impl TimedLine {
     #[allow(dead_code)]
     pub fn new(text: String, start: f64, end: f64, singer: Singer) -> Self {
-        Self::with_overrides(text, start, end, singer, Vec::new(), true)
+        Self::with_overrides(text, start, end, singer, Vec::new(), None, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -149,10 +160,14 @@ impl TimedLine {
         end: f64,
         singer: Singer,
         word_overrides: Vec<Option<f64>>,
+        sing_end_override: Option<f64>,
         starts_new_block: bool,
     ) -> Self {
         let window = (end - start).max(0.0);
-        let sing_end = (start + estimate_sing_duration(&text, window)).clamp(start, end);
+        let sing_end = match sing_end_override {
+            Some(manual) => manual.clamp(start, end),
+            None => (start + estimate_sing_duration(&text, window)).clamp(start, end),
+        };
         Self {
             text,
             start,
@@ -165,9 +180,10 @@ impl TimedLine {
     }
 }
 
-/// (start, text, singer, word_overrides, starts_new_block) - one sorted
-/// line's fields, used only as [`resolve_timing`]'s working representation.
-type SortedLine<'a> = (f64, &'a str, Singer, &'a [Option<f64>], bool);
+/// One sorted line's fields - (start, text, singer, word_overrides,
+/// sing_end_override, starts_new_block) - used only as [`resolve_timing`]'s
+/// working representation.
+type SortedLine<'a> = (f64, &'a str, Singer, &'a [Option<f64>], Option<f64>, bool);
 
 /// Resolve start/end windows for every line. Requires every line to already
 /// have a `start` set (caller should validate this first). Lines are sorted
@@ -183,6 +199,7 @@ pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<T
                     l.text.as_str(),
                     l.singer,
                     l.word_overrides.as_slice(),
+                    l.sing_end_override,
                     l.starts_new_block,
                 )
             })
@@ -192,7 +209,7 @@ pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<T
 
     let mut out = Vec::with_capacity(sorted.len());
     for i in 0..sorted.len() {
-        let (start, text, singer, overrides, starts_new_block) = sorted[i];
+        let (start, text, singer, overrides, sing_end_override, starts_new_block) = sorted[i];
         let end = if i + 1 < sorted.len() {
             sorted[i + 1].0
         } else {
@@ -207,6 +224,7 @@ pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<T
             end,
             singer,
             overrides.to_vec(),
+            sing_end_override,
             starts_new_block,
         ));
     }
@@ -220,6 +238,7 @@ pub struct TimedWord<'a> {
     #[allow(dead_code)]
     pub text: &'a str,
     pub highlight_at: f64,
+    #[allow(dead_code)]
     pub is_manual: bool,
 }
 
@@ -313,6 +332,38 @@ pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
     1.0
 }
 
+/// A verse block never shows more than this many lines at once - beyond
+/// this it'd get cramped, so a long uninterrupted run of lines is split
+/// into consecutive blocks instead.
+pub const MAX_BLOCK_LINES: usize = 5;
+
+/// Groups consecutive line indices into display blocks of at most
+/// [`MAX_BLOCK_LINES`], splitting wherever [`TimedLine::starts_new_block`]
+/// is set - i.e. wherever there was a blank line in the pasted lyrics - so
+/// a block matches exactly what looked like one verse/stanza when you
+/// pasted the lyrics in, regardless of how the actual singing timing
+/// happens to fall (that's a separate concern - see the countdown
+/// indicator, which is still timing-based). Shared by the video exporter
+/// and the live preview so both group lines identically.
+pub fn group_into_blocks(timed_lines: &[TimedLine]) -> Vec<Vec<usize>> {
+    let mut blocks = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for (i, line) in timed_lines.iter().enumerate() {
+        let starts_new = i == 0 || line.starts_new_block;
+        if starts_new && !current.is_empty() {
+            blocks.push(std::mem::take(&mut current));
+        }
+        current.push(i);
+        if current.len() >= MAX_BLOCK_LINES {
+            blocks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
 /// If there's a long enough gap between `after` (when singing/display
 /// activity last stopped) and `next_start` (when the next thing begins),
 /// returns the `(countdown_start, countdown_end)` window (in seconds) during
@@ -341,6 +392,18 @@ pub fn countdown_window_between(after: f64, next_start: f64) -> Option<(f64, f64
 /// is always equal to `line.end` (i.e. the next line's start).
 pub fn countdown_window(line: &TimedLine) -> Option<(f64, f64)> {
     countdown_window_between(line.sing_end, line.end)
+}
+
+/// True once `line` is done being sung (`t >= line.sing_end`) and there's a
+/// real musical break before the next line (i.e. [`countdown_window`] would
+/// fire). Any not-yet-started lines still visible in the same on-screen
+/// block should be hidden while this is true, instead of sitting on screen
+/// for the whole break - the screen should read as "done, waiting" (then
+/// the countdown indicator, then the next line), not show lyrics that are
+/// still a break away. Shared by the video exporter, the CDG exporter, and
+/// the live preview so all three agree on when to hide ahead-of-time lines.
+pub fn hide_upcoming_lines(line: &TimedLine, t: f64) -> bool {
+    t >= line.sing_end && countdown_window(line).is_some()
 }
 
 #[cfg(test)]
@@ -476,5 +539,43 @@ mod tests {
     fn new_lines_have_no_manual_overrides_by_default() {
         let line = LyricLine::new("a b c");
         assert_eq!(line.word_overrides, vec![None, None, None]);
+    }
+
+    #[test]
+    fn sing_end_override_takes_precedence_over_estimate() {
+        let mut lines = vec![LyricLine::new("one two three four")];
+        lines[0].start = Some(10.0);
+        // The automatic estimate for 4 short words would land well before
+        // the 20s window closes - a manual override should win instead.
+        lines[0].sing_end_override = Some(17.5);
+        let timed = resolve_timing(&lines, Some(20.0));
+        assert_eq!(timed[0].sing_end, 17.5);
+
+        // A manual override past the line's own end must still be clamped,
+        // just like the automatic estimate is.
+        lines[0].sing_end_override = Some(25.0);
+        let timed = resolve_timing(&lines, Some(20.0));
+        assert_eq!(timed[0].sing_end, 20.0);
+    }
+
+    #[test]
+    fn sing_end_override_defaults_to_none() {
+        let line = LyricLine::new("a b c");
+        assert_eq!(line.sing_end_override, None);
+    }
+
+    #[test]
+    fn hide_upcoming_lines_only_during_a_real_break() {
+        // Short line, huge window -> long break -> hide once singing's done.
+        let long_gap = TimedLine::new("hi".into(), 0.0, 20.0, Singer::Male);
+        assert!(!hide_upcoming_lines(&long_gap, 0.0)); // still singing
+        assert!(!hide_upcoming_lines(&long_gap, long_gap.sing_end - 0.01)); // just before done
+        assert!(hide_upcoming_lines(&long_gap, long_gap.sing_end)); // done, break starts
+        assert!(hide_upcoming_lines(&long_gap, 19.9)); // still in the break
+
+        // Tight line, no meaningful gap -> never hide, even once "sung".
+        let tight = TimedLine::new("hi there".into(), 0.0, 2.0, Singer::Male);
+        assert!(!hide_upcoming_lines(&tight, tight.sing_end));
+        assert!(!hide_upcoming_lines(&tight, 2.0));
     }
 }
