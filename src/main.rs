@@ -61,6 +61,37 @@ enum WordTapMode {
     End,
 }
 
+/// Cursor to show while hovering (or actively dragging) a timeline bubble -
+/// `active_mode` is `Some` while a drag on *this* bubble is already under
+/// way (so the icon doesn't flicker to whatever's under the pointer as it
+/// moves outside the bubble's own edges mid-drag); otherwise it's derived
+/// from where within the bubble the pointer currently is.
+fn timeline_cursor_icon(
+    active_mode: Option<timeline::DragMode>,
+    response: &egui::Response,
+    bubble_rect: egui::Rect,
+) -> Option<egui::CursorIcon> {
+    let mode = match active_mode {
+        Some(m) => m,
+        None => {
+            let pos = response.hover_pos()?;
+            timeline::classify_drag(pos.x - bubble_rect.left(), bubble_rect.width())
+        }
+    };
+    Some(match mode {
+        timeline::DragMode::Body => {
+            if response.dragged() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            }
+        }
+        timeline::DragMode::LeftEdge | timeline::DragMode::RightEdge => {
+            egui::CursorIcon::ResizeHorizontal
+        }
+    })
+}
+
 struct KaraokeApp {
     audio: Option<AudioPlayer>,
     audio_error: Option<String>,
@@ -116,21 +147,26 @@ struct KaraokeApp {
     timeline_drag: Option<TimelineDrag>,
 }
 
+/// Which timeline bubble a [`TimelineDrag`] is dragging - a whole line, or
+/// one word within the currently word-expanded line (see
+/// [`KaraokeApp::word_tap_line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineDragTarget {
+    Line,
+    Word(usize),
+}
+
 /// An in-progress drag on the fine-tuning timeline. Captured at
 /// `drag_started()` and held for the duration of the drag so every frame
-/// applies the delta from the *original* values (rather than compounding
-/// per-frame deltas, which would drift under egui's rounding).
+/// resolves the delta from the drag's *original* pointer position (rather
+/// than compounding per-frame deltas, which would drift under egui's
+/// rounding).
 struct TimelineDrag {
-    /// Index into `self.lines` of the bubble being dragged.
+    /// Index into `self.lines` of the line being dragged (whether the drag
+    /// target is the line itself or one of its words).
     line_idx: usize,
-    mode: timeline::DragMode,
-    orig_start: f64,
-    orig_sing_end: f64,
-    bounds: timeline::DragBounds,
-    /// Screen-space pointer x when the drag began - deltas are computed
-    /// from here each frame (rather than accumulating per-frame deltas) so
-    /// there's no drift from repeated floating-point addition.
-    drag_start_pointer_x: f32,
+    target: TimelineDragTarget,
+    session: timeline::DragSession,
 }
 
 /// Shared state for a video export running on a background thread, so the
@@ -1022,9 +1058,13 @@ impl KaraokeApp {
     /// timed line, spanning its sung window `[start, sing_end)` - a
     /// kdenlive/karaodeo-style clip track. Dragging a bubble's body moves
     /// `start` (preserving its duration); dragging its left/right edge
-    /// trims `start`/`sing_end` independently. This writes the exact same
-    /// `LyricLine` fields the tap-based workflow and the "Fine-tune words"
-    /// panel do, so all three stay in sync automatically.
+    /// trims `start`/`sing_end` independently. Clicking a line's bubble
+    /// also expands it into a second row of per-word bubbles underneath
+    /// (spanning each word's `[highlight_at, held_until)`), with the same
+    /// drag behavior, for word-level fine-tuning without leaving the
+    /// timeline. This writes the exact same `LyricLine` fields the
+    /// tap-based workflow and the "Fine-tune words" panel do, so all three
+    /// stay in sync automatically.
     fn draw_timeline(&mut self, ui: &mut egui::Ui) {
         let (timed, indices) = self.resolved_with_indices();
         let area_width = ui.available_width();
@@ -1047,7 +1087,7 @@ impl KaraokeApp {
             }
             ui.label(
                 "Drag a bubble to move it, its edges to trim start/end - scroll to zoom, \
-                 drag empty space to pan.",
+                 drag empty space to pan. Click a line to fine-tune its words below.",
             );
         });
 
@@ -1058,7 +1098,18 @@ impl KaraokeApp {
             return;
         }
 
-        let height = 64.0;
+        // The selected line (if any) also gets a row of per-word bubbles -
+        // find its position in `timed`/`indices` (`None` if the selected
+        // line isn't timed yet, e.g. was just added).
+        let selected_pos = self
+            .word_tap_line
+            .and_then(|orig_idx| indices.iter().position(|&i| i == orig_idx));
+
+        let ruler_h = 16.0;
+        let line_row_h = 28.0;
+        let row_gap = 6.0;
+        let word_row_h = 28.0;
+        let height = ruler_h + 4.0 + line_row_h + row_gap + word_row_h + 4.0;
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(area_width, height),
             egui::Sense::click_and_drag(),
@@ -1077,8 +1128,7 @@ impl KaraokeApp {
             }
         }
 
-        // Time ruler.
-        let ruler_h = 16.0;
+        // Time ruler - shared by both rows since they're on the same axis.
         let interval = timeline::tick_interval_secs(self.timeline_view.px_per_sec, 50.0);
         let visible_secs = (rect.width() / self.timeline_view.px_per_sec) as f64;
         let mut t = (self.timeline_view.scroll_secs / interval).floor() * interval;
@@ -1104,10 +1154,8 @@ impl KaraokeApp {
             t += interval;
         }
 
-        // Bubbles - one per timed line, in start-time order.
-        let bubble_top = rect.top() + ruler_h + 4.0;
-        let bubble_h = (rect.bottom() - bubble_top - 4.0).max(8.0);
-
+        // Line bubbles - one per timed line, in start-time order.
+        let line_row_top = rect.top() + ruler_h + 4.0;
         for (i, line) in timed.iter().enumerate() {
             let orig_idx = indices[i];
             let x0 = self.timeline_view.time_to_x(rect.left(), line.start);
@@ -1116,8 +1164,11 @@ impl KaraokeApp {
                 continue; // fully off-screen - skip drawing and interaction
             }
             let bubble_rect = egui::Rect::from_min_max(
-                egui::pos2(x0.max(rect.left()), bubble_top),
-                egui::pos2(x1.max(x0 + 1.0).min(rect.right()), bubble_top + bubble_h),
+                egui::pos2(x0.max(rect.left()), line_row_top),
+                egui::pos2(
+                    x1.max(x0 + 1.0).min(rect.right()),
+                    line_row_top + line_row_h,
+                ),
             );
 
             let id = ui.id().with(("timeline_bubble", orig_idx));
@@ -1133,24 +1184,7 @@ impl KaraokeApp {
             };
             painter.rect_filled(bubble_rect, 3.0, fill);
             painter.rect_stroke(bubble_rect, 3.0, stroke);
-
-            // Edge-grab affordance strips, scaled down for narrow bubbles
-            // exactly like `timeline::classify_drag` does.
-            let edge_w = timeline::EDGE_GRAB_PX.min(bubble_rect.width() / 2.0);
-            if edge_w > 0.5 {
-                let edge_color = egui::Color32::from_white_alpha(70);
-                let left_edge = egui::Rect::from_min_size(
-                    bubble_rect.min,
-                    egui::vec2(edge_w, bubble_rect.height()),
-                );
-                let right_edge = egui::Rect::from_min_size(
-                    egui::pos2(bubble_rect.right() - edge_w, bubble_rect.top()),
-                    egui::vec2(edge_w, bubble_rect.height()),
-                );
-                painter.rect_filled(left_edge, 0.0, edge_color);
-                painter.rect_filled(right_edge, 0.0, edge_color);
-            }
-
+            Self::draw_edge_grab_strips(&painter, bubble_rect);
             if bubble_rect.width() > 16.0 {
                 painter.with_clip_rect(bubble_rect.shrink(2.0)).text(
                     egui::pos2(bubble_rect.left() + 4.0, bubble_rect.center().y),
@@ -1159,6 +1193,15 @@ impl KaraokeApp {
                     egui::FontId::proportional(12.0),
                     egui::Color32::WHITE,
                 );
+            }
+
+            let active_mode = self
+                .timeline_drag
+                .as_ref()
+                .filter(|d| d.line_idx == orig_idx && d.target == TimelineDragTarget::Line)
+                .map(|d| d.session.mode);
+            if let Some(icon) = timeline_cursor_icon(active_mode, &bubble_response, bubble_rect) {
+                ui.ctx().set_cursor_icon(icon);
             }
 
             if bubble_response.clicked() {
@@ -1189,59 +1232,32 @@ impl KaraokeApp {
                     }
                     self.timeline_drag = Some(TimelineDrag {
                         line_idx: orig_idx,
-                        mode,
-                        orig_start: line.start,
-                        orig_sing_end: line.sing_end,
-                        bounds,
-                        drag_start_pointer_x: pos.x,
+                        target: TimelineDragTarget::Line,
+                        session: timeline::DragSession::start(
+                            mode,
+                            line.start,
+                            line.sing_end,
+                            bounds,
+                            pos.x,
+                        ),
                     });
                 }
             }
 
             if bubble_response.dragged() {
                 if let Some(pos) = bubble_response.interact_pointer_pos() {
-                    let apply = self
+                    let resolved = self
                         .timeline_drag
                         .as_ref()
-                        .filter(|d| d.line_idx == orig_idx);
-                    if let Some(drag) = apply {
-                        let delta_secs = ((pos.x - drag.drag_start_pointer_x)
-                            / self.timeline_view.px_per_sec)
-                            as f64;
-                        match drag.mode {
-                            timeline::DragMode::Body => {
-                                let (s, e) = timeline::apply_body_drag(
-                                    drag.orig_start,
-                                    drag.orig_sing_end,
-                                    delta_secs,
-                                    drag.bounds,
-                                );
-                                if let Some(l) = self.lines.get_mut(orig_idx) {
-                                    l.start = Some(s);
-                                    l.sing_end_override = Some(e);
-                                }
+                        .filter(|d| d.line_idx == orig_idx && d.target == TimelineDragTarget::Line)
+                        .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
+                    if let Some((new_start, new_sing_end)) = resolved {
+                        if let Some(l) = self.lines.get_mut(orig_idx) {
+                            if let Some(s) = new_start {
+                                l.start = Some(s);
                             }
-                            timeline::DragMode::LeftEdge => {
-                                let s = timeline::apply_left_edge_drag(
-                                    drag.orig_start,
-                                    drag.orig_sing_end,
-                                    delta_secs,
-                                    drag.bounds,
-                                );
-                                if let Some(l) = self.lines.get_mut(orig_idx) {
-                                    l.start = Some(s);
-                                }
-                            }
-                            timeline::DragMode::RightEdge => {
-                                let e = timeline::apply_right_edge_drag(
-                                    drag.orig_start,
-                                    drag.orig_sing_end,
-                                    delta_secs,
-                                    drag.bounds,
-                                );
-                                if let Some(l) = self.lines.get_mut(orig_idx) {
-                                    l.sing_end_override = Some(e);
-                                }
+                            if let Some(e) = new_sing_end {
+                                l.sing_end_override = Some(e);
                             }
                         }
                     }
@@ -1249,9 +1265,148 @@ impl KaraokeApp {
             }
 
             if bubble_response.drag_stopped()
-                && self.timeline_drag.as_ref().map(|d| d.line_idx) == Some(orig_idx)
+                && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
+                    == Some((orig_idx, TimelineDragTarget::Line))
             {
                 self.timeline_drag = None;
+            }
+        }
+
+        // Word bubbles for the selected line (if any), directly below.
+        let word_row_top = line_row_top + line_row_h + row_gap;
+        let word_row_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), word_row_top),
+            egui::vec2(rect.width(), word_row_h),
+        );
+        match selected_pos {
+            None => {
+                painter.text(
+                    word_row_rect.left_center() + egui::vec2(4.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    "Click a line above to fine-tune its words here.",
+                    egui::FontId::proportional(11.0),
+                    text_color,
+                );
+            }
+            Some(pos) => {
+                let sel_orig_idx = indices[pos];
+                let line = &timed[pos];
+                let words = lyrics::word_timings(line);
+                for (w, word) in words.iter().enumerate() {
+                    let x0 = self.timeline_view.time_to_x(rect.left(), word.highlight_at);
+                    let x1 = self.timeline_view.time_to_x(rect.left(), word.held_until);
+                    if x1 < rect.left() || x0 > rect.right() {
+                        continue;
+                    }
+                    let bubble_rect = egui::Rect::from_min_max(
+                        egui::pos2(x0.max(rect.left()), word_row_top),
+                        egui::pos2(
+                            x1.max(x0 + 1.0).min(rect.right()),
+                            word_row_top + word_row_h,
+                        ),
+                    );
+
+                    let id = ui.id().with(("timeline_word_bubble", sel_orig_idx, w));
+                    let bubble_response =
+                        ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
+
+                    let (_, highlight) = self.singer_colors(line.singer);
+                    painter.rect_filled(bubble_rect, 3.0, highlight.gamma_multiply(0.7));
+                    painter.rect_stroke(
+                        bubble_rect,
+                        3.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::WHITE.gamma_multiply(0.5)),
+                    );
+                    Self::draw_edge_grab_strips(&painter, bubble_rect);
+                    if bubble_rect.width() > 14.0 {
+                        painter.with_clip_rect(bubble_rect.shrink(2.0)).text(
+                            egui::pos2(bubble_rect.left() + 3.0, bubble_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            word.text,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+
+                    let target = TimelineDragTarget::Word(w);
+                    let active_mode = self
+                        .timeline_drag
+                        .as_ref()
+                        .filter(|d| d.line_idx == sel_orig_idx && d.target == target)
+                        .map(|d| d.session.mode);
+                    if let Some(icon) =
+                        timeline_cursor_icon(active_mode, &bubble_response, bubble_rect)
+                    {
+                        ui.ctx().set_cursor_icon(icon);
+                    }
+
+                    if bubble_response.drag_started() {
+                        if let Some(pos) = bubble_response.interact_pointer_pos() {
+                            let local_x = pos.x - bubble_rect.left();
+                            let mode = timeline::classify_drag(local_x, bubble_rect.width());
+                            // Unlike a line's `sing_end`, a word's default
+                            // `held_until` is anchored to the *next* word's
+                            // start (or the line's `sing_end`), not derived
+                            // from this word's own start - so trimming the
+                            // left edge never needs to pin the end first.
+                            let min_start = if w > 0 {
+                                words[w - 1].held_until
+                            } else {
+                                line.start
+                            };
+                            let max_end = words
+                                .get(w + 1)
+                                .map(|nw| nw.highlight_at)
+                                .unwrap_or(line.sing_end);
+                            let bounds = timeline::DragBounds {
+                                min_start,
+                                max_sing_end: max_end,
+                            };
+                            self.timeline_drag = Some(TimelineDrag {
+                                line_idx: sel_orig_idx,
+                                target,
+                                session: timeline::DragSession::start(
+                                    mode,
+                                    word.highlight_at,
+                                    word.held_until,
+                                    bounds,
+                                    pos.x,
+                                ),
+                            });
+                        }
+                    }
+
+                    if bubble_response.dragged() {
+                        if let Some(pos) = bubble_response.interact_pointer_pos() {
+                            let resolved = self
+                                .timeline_drag
+                                .as_ref()
+                                .filter(|d| d.line_idx == sel_orig_idx && d.target == target)
+                                .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
+                            if let Some((new_start, new_end)) = resolved {
+                                if let Some(l) = self.lines.get_mut(sel_orig_idx) {
+                                    if let Some(s) = new_start {
+                                        if let Some(slot) = l.word_overrides.get_mut(w) {
+                                            *slot = Some(s);
+                                        }
+                                    }
+                                    if let Some(e) = new_end {
+                                        if let Some(slot) = l.word_end_overrides.get_mut(w) {
+                                            *slot = Some(e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if bubble_response.drag_stopped()
+                        && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
+                            == Some((sel_orig_idx, target))
+                    {
+                        self.timeline_drag = None;
+                    }
+                }
             }
         }
 
@@ -1267,11 +1422,31 @@ impl KaraokeApp {
         }
 
         // Panning: only when the drag didn't start on a bubble (checked
-        // after the bubble loop so a same-frame bubble drag start already
+        // after the bubble loops so a same-frame bubble drag start already
         // populated `timeline_drag` and takes priority).
         if self.timeline_drag.is_none() && response.dragged() {
             self.timeline_view.pan_by_pixels(response.drag_delta().x);
         }
+    }
+
+    /// Small brighter strips at a bubble's left/right edges hinting that
+    /// they can be grabbed to resize - scaled down for narrow bubbles
+    /// exactly like [`timeline::classify_drag`] does, so the strips never
+    /// claim more of the bubble than actually responds as an edge.
+    fn draw_edge_grab_strips(painter: &egui::Painter, bubble_rect: egui::Rect) {
+        let edge_w = timeline::EDGE_GRAB_PX.min(bubble_rect.width() / 2.0);
+        if edge_w <= 0.5 {
+            return;
+        }
+        let edge_color = egui::Color32::from_white_alpha(70);
+        let left_edge =
+            egui::Rect::from_min_size(bubble_rect.min, egui::vec2(edge_w, bubble_rect.height()));
+        let right_edge = egui::Rect::from_min_size(
+            egui::pos2(bubble_rect.right() - edge_w, bubble_rect.top()),
+            egui::vec2(edge_w, bubble_rect.height()),
+        );
+        painter.rect_filled(left_edge, 0.0, edge_color);
+        painter.rect_filled(right_edge, 0.0, edge_color);
     }
 }
 
