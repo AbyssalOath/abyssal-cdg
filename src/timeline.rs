@@ -167,6 +167,64 @@ pub fn apply_right_edge_drag(
     (orig_sing_end + delta_secs).clamp(min_sing_end.min(bounds.max_sing_end), bounds.max_sing_end)
 }
 
+/// Everything needed to keep resolving a bubble drag frame-to-frame from
+/// its original pointer position, without drift - works identically
+/// whether the bubble represents a whole line (`start`/`sing_end`) or a
+/// single word (`highlight_at`/`held_until`); the caller decides where the
+/// resolved values get written back.
+#[derive(Clone, Copy, Debug)]
+pub struct DragSession {
+    pub mode: DragMode,
+    pub orig_start: f64,
+    pub orig_end: f64,
+    pub bounds: DragBounds,
+    /// Screen-space pointer x when the drag began.
+    pub drag_start_pointer_x: f32,
+}
+
+impl DragSession {
+    pub fn start(
+        mode: DragMode,
+        orig_start: f64,
+        orig_end: f64,
+        bounds: DragBounds,
+        drag_start_pointer_x: f32,
+    ) -> Self {
+        Self {
+            mode,
+            orig_start,
+            orig_end,
+            bounds,
+            drag_start_pointer_x,
+        }
+    }
+
+    /// Resolves the current pointer x (same screen space as
+    /// `drag_start_pointer_x`) into new `(start, end)` values - `None` for
+    /// whichever side this drag mode doesn't touch, so the caller only
+    /// writes back the field(s) that actually changed.
+    pub fn resolve(&self, pointer_x: f32, px_per_sec: f32) -> (Option<f64>, Option<f64>) {
+        let delta_secs = ((pointer_x - self.drag_start_pointer_x) / px_per_sec) as f64;
+        match self.mode {
+            DragMode::Body => {
+                let (s, e) =
+                    apply_body_drag(self.orig_start, self.orig_end, delta_secs, self.bounds);
+                (Some(s), Some(e))
+            }
+            DragMode::LeftEdge => {
+                let s =
+                    apply_left_edge_drag(self.orig_start, self.orig_end, delta_secs, self.bounds);
+                (Some(s), None)
+            }
+            DragMode::RightEdge => {
+                let e =
+                    apply_right_edge_drag(self.orig_start, self.orig_end, delta_secs, self.bounds);
+                (None, Some(e))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +368,43 @@ mod tests {
         assert!(new_end > 10.0);
         let new_end = apply_right_edge_drag(10.0, 15.0, 1000.0, bounds);
         assert_eq!(new_end, 100.0);
+    }
+
+    #[test]
+    fn drag_session_resolve_only_reports_changed_sides() {
+        let bounds = DragBounds {
+            min_start: 0.0,
+            max_sing_end: 100.0,
+        };
+
+        let body = DragSession::start(DragMode::Body, 10.0, 13.0, bounds, 200.0);
+        let (s, e) = body.resolve(200.0 + 5.0 * 40.0, 40.0); // +5s at 40px/sec
+        assert_eq!(s, Some(15.0));
+        assert_eq!(e, Some(18.0));
+
+        let left = DragSession::start(DragMode::LeftEdge, 10.0, 13.0, bounds, 200.0);
+        let (s, e) = left.resolve(200.0 + 40.0, 40.0); // +1s
+        assert_eq!(s, Some(11.0));
+        assert_eq!(e, None);
+
+        let right = DragSession::start(DragMode::RightEdge, 10.0, 13.0, bounds, 200.0);
+        let (s, e) = right.resolve(200.0 + 40.0, 40.0); // +1s
+        assert_eq!(s, None);
+        assert_eq!(e, Some(14.0));
+    }
+
+    #[test]
+    fn drag_session_resolve_is_stable_across_repeated_calls_at_the_same_position() {
+        // Resolving twice at the same pointer position (simulating two
+        // frames with no mouse movement) must give identical results - no
+        // drift from calling `resolve` every frame.
+        let bounds = DragBounds {
+            min_start: 0.0,
+            max_sing_end: 100.0,
+        };
+        let session = DragSession::start(DragMode::Body, 10.0, 13.0, bounds, 200.0);
+        let first = session.resolve(250.0, 40.0);
+        let second = session.resolve(250.0, 40.0);
+        assert_eq!(first, second);
     }
 }
