@@ -590,25 +590,37 @@ impl KaraokeApp {
                     Some((idx, line)) => {
                         let (unsung, highlight) = self.singer_colors(line.singer);
                         let mut job = egui::text::LayoutJob { halign: egui::Align::Center, ..Default::default() };
+                        // Same continuous per-line fraction the video/CDG exporters use, so
+                        // the wipe moves smoothly through a word's letters as it's held out
+                        // instead of the whole word snapping to `highlight` the instant its
+                        // timestamp is reached (which looked instantaneous for long-held
+                        // words and words with few characters alike).
+                        let normalized = lyrics::normalize_text(&line.text);
+                        let chars: Vec<char> = normalized.chars().collect();
                         let words = word_timings(line);
-                        for (i, w) in words.iter().enumerate() {
-                            let color = if t >= w.highlight_at { highlight } else { unsung };
-                            let text = if i + 1 < words.len() { format!("{} ", w.text) } else { w.text.to_string() };
-                            let underline = if w.is_manual {
-                                egui::Stroke::new(1.0_f32, color.gamma_multiply(0.6))
-                            } else {
-                                egui::Stroke::NONE
+                        let spans = lyrics::word_char_spans(&normalized);
+                        let boundary = lyrics::current_line_wipe_fraction(line, t) * chars.len().max(1) as f32;
+                        let font_id = egui::FontId::proportional(18.0);
+                        for (i, &(offset, len)) in spans.iter().enumerate() {
+                            let word_text: String = chars[offset..offset + len].iter().collect();
+                            let is_manual = words.get(i).map(|w| w.is_manual).unwrap_or(false);
+                            let split = ((boundary - offset as f32).round().clamp(0.0, len as f32)) as usize;
+                            let sung_part: String = word_text.chars().take(split).collect();
+                            let rest: String = word_text.chars().skip(split).collect();
+                            let suffix = if i + 1 < spans.len() { " " } else { "" };
+                            let append = |ui_job: &mut egui::text::LayoutJob, text: &str, color: egui::Color32| {
+                                if text.is_empty() {
+                                    return;
+                                }
+                                let underline = if is_manual {
+                                    egui::Stroke::new(1.0_f32, color.gamma_multiply(0.6))
+                                } else {
+                                    egui::Stroke::NONE
+                                };
+                                ui_job.append(text, 0.0, egui::TextFormat { color, underline, font_id: font_id.clone(), ..Default::default() });
                             };
-                            job.append(
-                                &text,
-                                0.0,
-                                egui::TextFormat {
-                                    color,
-                                    underline,
-                                    font_id: egui::FontId::proportional(18.0),
-                                    ..Default::default()
-                                },
-                            );
+                            append(&mut job, &sung_part, highlight);
+                            append(&mut job, &format!("{rest}{suffix}"), unsung);
                         }
                         ui.label(job);
 

@@ -19,7 +19,7 @@
 //! This requires `ffmpeg` to be installed and on the PATH; we check for it
 //! up front and return a clear error with install instructions if missing.
 
-use crate::lyrics::{countdown_window, countdown_window_between, word_timings, TimedLine};
+use crate::lyrics::{countdown_window, countdown_window_between, current_line_wipe_fraction, normalize_text, TimedLine};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
@@ -157,25 +157,6 @@ fn measure_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
     text.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum()
 }
 
-/// Re-join words with a single space - this is what's actually measured
-/// and drawn, and what word/char spans are computed against, so they
-/// always agree regardless of whatever whitespace was in the source text.
-fn normalize_text(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// (char offset within the normalized text, char length) for each word.
-fn word_char_spans(text: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut offset = 0usize;
-    for w in text.split_whitespace() {
-        let len = w.chars().count();
-        spans.push((offset, len));
-        offset += len + 1;
-    }
-    spans
-}
-
 /// Draws `text` centered at `center_x`, with one color per character
 /// (`colors[i]` for the i-th char of `text`; if there are fewer colors
 /// than characters, the last one is reused). Shrinks the font uniformly if
@@ -300,41 +281,6 @@ fn draw_text_line_uniform(
 ) {
     let colors = vec![color; text.chars().count().max(1)];
     draw_text_line_chars(canvas, font, scale_px, center_x, baseline_y, text, &colors, max_width);
-}
-
-/// A continuous (not stepped) 0.0..=1.0 fraction of the way across the
-/// currently-singing line, at time `t`. This is what drives
-/// [`draw_text_line_wipe`]'s pixel boundary. It's still *anchored* to each
-/// word's own timestamp (from [`word_timings`]) for accuracy - reaching
-/// the right fraction at the right moment for each word - but linearly
-/// interpolates between those anchors instead of jumping, so the wipe
-/// moves continuously through every word's letters rather than only at
-/// word boundaries.
-fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
-    let text = normalize_text(&line.text);
-    let char_count = text.chars().count().max(1) as f32;
-    let spans = word_char_spans(&text);
-    let words = word_timings(line);
-    if words.is_empty() || spans.is_empty() {
-        return 0.0;
-    }
-    if t <= words[0].highlight_at {
-        return 0.0;
-    }
-
-    for (i, &(offset, len)) in spans.iter().enumerate() {
-        let Some(word) = words.get(i) else { continue };
-        let word_start = word.highlight_at;
-        let word_end = words.get(i + 1).map(|w| w.highlight_at).unwrap_or(line.sing_end.max(word_start + 0.05));
-        let frac_start = offset as f32 / char_count;
-        let frac_end = (offset + len) as f32 / char_count;
-        if t < word_end || i + 1 == words.len() {
-            let dur = (word_end - word_start).max(0.05);
-            let local = ((t - word_start) / dur).clamp(0.0, 1.0) as f32;
-            return frac_start + (frac_end - frac_start) * local;
-        }
-    }
-    1.0
 }
 
 /// Groups consecutive line indices into display blocks of at most
@@ -589,7 +535,7 @@ pub fn render_video(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lyrics::{resolve_timing, LyricLine, Singer};
+    use crate::lyrics::{resolve_timing, word_timings, LyricLine, Singer};
 
     #[test]
     fn lerp_interpolates_correctly() {

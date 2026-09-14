@@ -222,6 +222,61 @@ pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
     out
 }
 
+/// Re-join words with a single space - this is what's actually measured
+/// and drawn, and what word/char spans are computed against, so they
+/// always agree regardless of whatever whitespace was in the source text.
+pub fn normalize_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// (char offset within the normalized text, char length) for each word.
+pub fn word_char_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for w in text.split_whitespace() {
+        let len = w.chars().count();
+        spans.push((offset, len));
+        offset += len + 1;
+    }
+    spans
+}
+
+/// A continuous (not stepped) 0.0..=1.0 fraction of the way across the
+/// currently-singing line, at time `t`. This is what drives the karaoke
+/// color wipe in both the video exporter and the live preview. It's still
+/// *anchored* to each word's own timestamp (from [`word_timings`]) for
+/// accuracy - reaching the right fraction at the right moment for each word
+/// - but linearly interpolates between those anchors instead of jumping, so
+/// the wipe moves continuously through every word's letters (and through a
+/// single word held for several seconds) rather than only snapping at word
+/// boundaries.
+pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
+    let text = normalize_text(&line.text);
+    let char_count = text.chars().count().max(1) as f32;
+    let spans = word_char_spans(&text);
+    let words = word_timings(line);
+    if words.is_empty() || spans.is_empty() {
+        return 0.0;
+    }
+    if t <= words[0].highlight_at {
+        return 0.0;
+    }
+
+    for (i, &(offset, len)) in spans.iter().enumerate() {
+        let Some(word) = words.get(i) else { continue };
+        let word_start = word.highlight_at;
+        let word_end = words.get(i + 1).map(|w| w.highlight_at).unwrap_or(line.sing_end.max(word_start + 0.05));
+        let frac_start = offset as f32 / char_count;
+        let frac_end = (offset + len) as f32 / char_count;
+        if t < word_end || i + 1 == words.len() {
+            let dur = (word_end - word_start).max(0.05);
+            let local = ((t - word_start) / dur).clamp(0.0, 1.0) as f32;
+            return frac_start + (frac_end - frac_start) * local;
+        }
+    }
+    1.0
+}
+
 /// If there's a long enough gap between `after` (when singing/display
 /// activity last stopped) and `next_start` (when the next thing begins),
 /// returns the `(countdown_start, countdown_end)` window (in seconds) during
