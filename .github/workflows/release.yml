@@ -67,7 +67,21 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
-        run: cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }} --verbose
+        shell: bash
+        # cargo-packager downloads its per-format toolchains (NSIS, WiX,
+        # linuxdeploy, etc.) from GitHub release assets on first use, and
+        # that CDN occasionally returns a transient 502/504 - retry a few
+        # times with backoff before giving up, rather than failing the
+        # whole release on a network blip.
+        run: |
+          for attempt in 1 2 3; do
+            if cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }} --verbose; then
+              exit 0
+            fi
+            echo "cargo packager failed (attempt $attempt/3)"
+            sleep $((attempt * 15))
+          done
+          exit 1
 
       - name: Rename assets
         shell: bash
