@@ -61,11 +61,17 @@ struct PlaybackClock {
 
 impl PlaybackClock {
     fn new() -> Self {
-        Self { base_position: 0.0, running_since: None }
+        Self {
+            base_position: 0.0,
+            running_since: None,
+        }
     }
 
     fn position(&self) -> f64 {
-        let elapsed = self.running_since.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let elapsed = self
+            .running_since
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
         self.base_position + elapsed
     }
 
@@ -102,7 +108,11 @@ impl PlaybackClock {
     fn seek(&mut self, pos: f64) {
         let was_running = self.is_running();
         self.base_position = pos.max(0.0);
-        self.running_since = if was_running { Some(Instant::now()) } else { None };
+        self.running_since = if was_running {
+            Some(Instant::now())
+        } else {
+            None
+        };
     }
 }
 
@@ -174,7 +184,10 @@ impl AudioPlayer {
 
     /// (Re)start playback from the beginning.
     pub fn play_from_start(&mut self) -> Result<()> {
-        let path = self.path.clone().ok_or_else(|| anyhow!("no audio file loaded"))?;
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| anyhow!("no audio file loaded"))?;
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
@@ -203,7 +216,10 @@ impl AudioPlayer {
     /// container's seek-table quality - and decoding runs many times faster
     /// than real time, so it's still effectively instant.
     pub fn seek(&mut self, pos: f64) -> Result<()> {
-        let path = self.path.clone().ok_or_else(|| anyhow!("no audio file loaded"))?;
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| anyhow!("no audio file loaded"))?;
         let pos = match self.duration {
             Some(d) => pos.clamp(0.0, d),
             None => pos.max(0.0),
@@ -310,7 +326,10 @@ mod tests {
         // Immediately after resuming, position should still be ~paused_at,
         // not reset to 10.0 or 0.0.
         let just_after = clock.position();
-        assert!((just_after - paused_at).abs() < TOL, "expected ~{paused_at}, got {just_after}");
+        assert!(
+            (just_after - paused_at).abs() < TOL,
+            "expected ~{paused_at}, got {just_after}"
+        );
     }
 
     #[test]
@@ -353,6 +372,10 @@ mod tests {
         // Use a tolerance, not exact equality: some real wall-clock time
         // elapses between seek() and position() even in a tight test, and
         // the clock is still "running" (clamped to 0.0, not stopped).
-        assert!(clock.position() < TOL, "expected ~0.0, got {}", clock.position());
+        assert!(
+            clock.position() < TOL,
+            "expected ~0.0, got {}",
+            clock.position()
+        );
     }
 }

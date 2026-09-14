@@ -1,3 +1,10 @@
+// Windows GUI apps default to the "console" subsystem, which pops up (and
+// keeps open) a terminal window behind the app for the lifetime of the
+// process. Switching to the "windows" subsystem in release builds hides
+// that window - debug builds keep the console so `println!`/panic output
+// is still visible while developing.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod cdg;
 mod export;
@@ -9,7 +16,10 @@ mod video;
 use audio::AudioPlayer;
 use eframe::egui;
 use export::Palette;
-use lyrics::{countdown_window, parse_pasted_lyrics, resolve_timing, word_timings, LyricLine, Singer, TimedLine};
+use lyrics::{
+    countdown_window, parse_pasted_lyrics, resolve_timing, word_timings, LyricLine, Singer,
+    TimedLine,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -92,7 +102,10 @@ impl KaraokeApp {
     fn new() -> Self {
         let (audio, audio_error) = match AudioPlayer::new() {
             Ok(a) => (Some(a), None),
-            Err(e) => (None, Some(format!("Couldn't open an audio output device: {e}"))),
+            Err(e) => (
+                None,
+                Some(format!("Couldn't open an audio output device: {e}")),
+            ),
         };
         let p = Palette::default();
         Self {
@@ -172,7 +185,9 @@ impl KaraokeApp {
     fn resolved(&self) -> (Vec<TimedLine>, f64) {
         let duration_hint = self.audio.as_ref().and_then(|a| a.duration());
         let timed = resolve_timing(&self.lines, duration_hint);
-        let total = duration_hint.unwrap_or(0.0).max(timed.last().map(|t| t.end).unwrap_or(0.0));
+        let total = duration_hint
+            .unwrap_or(0.0)
+            .max(timed.last().map(|t| t.end).unwrap_or(0.0));
         (timed, total)
     }
 
@@ -201,7 +216,10 @@ impl KaraokeApp {
     fn parse_lyrics(&mut self) {
         self.lines = parse_pasted_lyrics(&self.lyrics_raw);
         self.next_untimed = 0;
-        self.status = format!("Parsed {} line(s). Play the song and tap along.", self.lines.len());
+        self.status = format!(
+            "Parsed {} line(s). Play the song and tap along.",
+            self.lines.len()
+        );
     }
 
     fn load_lyrics_file_dialog(&mut self) {
@@ -238,13 +256,24 @@ impl KaraokeApp {
 
         match result {
             Ok(lines) if lines.is_empty() => {
-                self.status = format!("Detected {} but found no lyric lines in the file.", format.label());
+                self.status = format!(
+                    "Detected {} but found no lyric lines in the file.",
+                    format.label()
+                );
             }
             Ok(lines) => {
                 let already_timed = lines.iter().filter(|l| l.start.is_some()).count();
-                self.lyrics_raw = lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n");
+                self.lyrics_raw = lines
+                    .iter()
+                    .map(|l| l.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 self.lines = lines;
-                self.next_untimed = self.lines.iter().position(|l| l.start.is_none()).unwrap_or(self.lines.len());
+                self.next_untimed = self
+                    .lines
+                    .iter()
+                    .position(|l| l.start.is_none())
+                    .unwrap_or(self.lines.len());
                 self.status = if already_timed > 0 {
                     format!(
                         "Loaded {} line(s) as {} - {} already timed. Play to fine-tune words, \
@@ -255,11 +284,19 @@ impl KaraokeApp {
                         already_timed
                     )
                 } else {
-                    format!("Loaded {} line(s) as {}. Play the song and tap along.", self.lines.len(), format.label())
+                    format!(
+                        "Loaded {} line(s) as {}. Play the song and tap along.",
+                        self.lines.len(),
+                        format.label()
+                    )
                 };
             }
             Err(e) => {
-                self.status = format!("Couldn't parse {} as {}: {e}", path.display(), format.label());
+                self.status = format!(
+                    "Couldn't parse {} as {}: {e}",
+                    path.display(),
+                    format.label()
+                );
             }
         }
     }
@@ -338,7 +375,14 @@ impl KaraokeApp {
                 }
             };
             let line = &self.lines[orig_idx];
-            timed.push(TimedLine::with_overrides(line.text.clone(), start, end, line.singer, line.word_overrides.clone(), line.starts_new_block));
+            timed.push(TimedLine::with_overrides(
+                line.text.clone(),
+                start,
+                end,
+                line.singer,
+                line.word_overrides.clone(),
+                line.starts_new_block,
+            ));
             indices.push(orig_idx);
         }
         (timed, indices)
@@ -400,15 +444,28 @@ impl KaraokeApp {
             self.status = "No lines are timed yet - tap along with the song first.".to_string();
             return;
         }
-        let Some(audio_path) = self.audio.as_ref().and_then(|a| a.path()).map(|p| p.to_path_buf()) else {
+        let Some(audio_path) = self
+            .audio
+            .as_ref()
+            .and_then(|a| a.path())
+            .map(|p| p.to_path_buf())
+        else {
             self.status = "Load an audio file first - the video needs it for sound.".to_string();
             return;
         };
 
         let (timed, total_duration) = self.resolved();
         let palette = self.video_palette();
-        let title = if self.title.trim().is_empty() { None } else { Some(self.title.trim().to_string()) };
-        let artist = if self.artist.trim().is_empty() { None } else { Some(self.artist.trim().to_string()) };
+        let title = if self.title.trim().is_empty() {
+            None
+        } else {
+            Some(self.title.trim().to_string())
+        };
+        let artist = if self.artist.trim().is_empty() {
+            None
+        } else {
+            Some(self.artist.trim().to_string())
+        };
         let resolution = self.video_resolution;
 
         let default_name = self
@@ -461,12 +518,17 @@ impl KaraokeApp {
     /// finishes. Returns true while an export is still in progress (so the
     /// caller knows to keep repainting for the progress bar).
     fn poll_video_export(&mut self) -> bool {
-        let Some(handle) = &self.video_export else { return false };
+        let Some(handle) = &self.video_export else {
+            return false;
+        };
         let finished = handle.result.lock().unwrap().take();
         if let Some(result) = finished {
             match result {
                 Ok(path) => {
-                    self.status = format!("Saved {} - a complete standalone video, ready to share or upload.", path.display());
+                    self.status = format!(
+                        "Saved {} - a complete standalone video, ready to share or upload.",
+                        path.display()
+                    );
                 }
                 Err(e) => {
                     self.status = format!("Video export failed: {e}");
@@ -506,8 +568,16 @@ impl KaraokeApp {
             return;
         };
 
-        let title = if self.title.trim().is_empty() { None } else { Some(self.title.trim()) };
-        let artist = if self.artist.trim().is_empty() { None } else { Some(self.artist.trim()) };
+        let title = if self.title.trim().is_empty() {
+            None
+        } else {
+            Some(self.title.trim())
+        };
+        let artist = if self.artist.trim().is_empty() {
+            None
+        } else {
+            Some(self.artist.trim())
+        };
 
         let bytes = export::render_cdg(&timed, total_duration, &self.palette(), title, artist);
         match std::fs::write(&path, &bytes) {
@@ -518,8 +588,12 @@ impl KaraokeApp {
                      look for that pair automatically.",
                     path.display(),
                     total_duration,
-                    path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-                    path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    path.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                 );
             }
             Err(e) => {
@@ -550,10 +624,16 @@ impl KaraokeApp {
 
                 if has_title_card && t < card_end {
                     if !self.title.trim().is_empty() {
-                        ui.colored_label(self.color_title, egui::RichText::new(&self.title).size(20.0).strong());
+                        ui.colored_label(
+                            self.color_title,
+                            egui::RichText::new(&self.title).size(20.0).strong(),
+                        );
                     }
                     if !self.artist.trim().is_empty() {
-                        ui.colored_label(self.color_artist, egui::RichText::new(format!("by {}", self.artist)).size(14.0));
+                        ui.colored_label(
+                            self.color_artist,
+                            egui::RichText::new(format!("by {}", self.artist)).size(14.0),
+                        );
                     }
                     return;
                 }
@@ -565,17 +645,27 @@ impl KaraokeApp {
                 // sitting on the generic "nothing timed yet" note icon.
                 if let Some(first) = timed.first() {
                     if t < first.start {
-                        if let Some((cd_start, cd_end)) = lyrics::countdown_window_between(card_end, first.start) {
+                        if let Some((cd_start, cd_end)) =
+                            lyrics::countdown_window_between(card_end, first.start)
+                        {
                             if t >= cd_start {
-                                let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001)).clamp(0.0, 1.0);
+                                let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
+                                    .clamp(0.0, 1.0);
                                 let lit = ((frac * 4.0).floor() as i32 + 1).clamp(0, 4) as usize;
                                 let (_, highlight) = self.singer_colors(first.singer);
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     ui.add_space(width / 2.0 - 40.0);
                                     for dot in 0..4 {
-                                        let color = if dot < lit { highlight } else { self.color_preview };
-                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                        let color = if dot < lit {
+                                            highlight
+                                        } else {
+                                            self.color_preview
+                                        };
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
                                         ui.painter().circle_filled(rect.center(), 6.0, color);
                                         ui.add_space(8.0);
                                     }
@@ -586,10 +676,17 @@ impl KaraokeApp {
                     }
                 }
 
-                match timed.iter().enumerate().find(|(_, l)| t >= l.start && t < l.end) {
+                match timed
+                    .iter()
+                    .enumerate()
+                    .find(|(_, l)| t >= l.start && t < l.end)
+                {
                     Some((idx, line)) => {
                         let (unsung, highlight) = self.singer_colors(line.singer);
-                        let mut job = egui::text::LayoutJob { halign: egui::Align::Center, ..Default::default() };
+                        let mut job = egui::text::LayoutJob {
+                            halign: egui::Align::Center,
+                            ..Default::default()
+                        };
                         // Same continuous per-line fraction the video/CDG exporters use, so
                         // the wipe moves smoothly through a word's letters as it's held out
                         // instead of the whole word snapping to `highlight` the instant its
@@ -599,26 +696,40 @@ impl KaraokeApp {
                         let chars: Vec<char> = normalized.chars().collect();
                         let words = word_timings(line);
                         let spans = lyrics::word_char_spans(&normalized);
-                        let boundary = lyrics::current_line_wipe_fraction(line, t) * chars.len().max(1) as f32;
+                        let boundary =
+                            lyrics::current_line_wipe_fraction(line, t) * chars.len().max(1) as f32;
                         let font_id = egui::FontId::proportional(18.0);
                         for (i, &(offset, len)) in spans.iter().enumerate() {
                             let word_text: String = chars[offset..offset + len].iter().collect();
                             let is_manual = words.get(i).map(|w| w.is_manual).unwrap_or(false);
-                            let split = ((boundary - offset as f32).round().clamp(0.0, len as f32)) as usize;
+                            let split = ((boundary - offset as f32).round().clamp(0.0, len as f32))
+                                as usize;
                             let sung_part: String = word_text.chars().take(split).collect();
                             let rest: String = word_text.chars().skip(split).collect();
                             let suffix = if i + 1 < spans.len() { " " } else { "" };
-                            let append = |ui_job: &mut egui::text::LayoutJob, text: &str, color: egui::Color32| {
-                                if text.is_empty() {
-                                    return;
-                                }
-                                let underline = if is_manual {
-                                    egui::Stroke::new(1.0_f32, color.gamma_multiply(0.6))
-                                } else {
-                                    egui::Stroke::NONE
+                            let append =
+                                |ui_job: &mut egui::text::LayoutJob,
+                                 text: &str,
+                                 color: egui::Color32| {
+                                    if text.is_empty() {
+                                        return;
+                                    }
+                                    let underline = if is_manual {
+                                        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.6))
+                                    } else {
+                                        egui::Stroke::NONE
+                                    };
+                                    ui_job.append(
+                                        text,
+                                        0.0,
+                                        egui::TextFormat {
+                                            color,
+                                            underline,
+                                            font_id: font_id.clone(),
+                                            ..Default::default()
+                                        },
+                                    );
                                 };
-                                ui_job.append(text, 0.0, egui::TextFormat { color, underline, font_id: font_id.clone(), ..Default::default() });
-                            };
                             append(&mut job, &sung_part, highlight);
                             append(&mut job, &format!("{rest}{suffix}"), unsung);
                         }
@@ -627,21 +738,33 @@ impl KaraokeApp {
                         ui.add_space(8.0);
 
                         if let Some(next) = timed.get(idx + 1) {
-                            ui.colored_label(self.color_preview, egui::RichText::new(&next.text).size(14.0));
+                            ui.colored_label(
+                                self.color_preview,
+                                egui::RichText::new(&next.text).size(14.0),
+                            );
                         }
 
                         if let Some((cd_start, cd_end)) = countdown_window(line) {
                             if t >= cd_start {
-                                let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001)).clamp(0.0, 1.0);
+                                let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
+                                    .clamp(0.0, 1.0);
                                 let lit = ((frac * 4.0).floor() as i32 + 1).clamp(0, 4) as usize;
-                                let next_singer = timed.get(idx + 1).map(|l| l.singer).unwrap_or(line.singer);
+                                let next_singer =
+                                    timed.get(idx + 1).map(|l| l.singer).unwrap_or(line.singer);
                                 let (_, next_highlight) = self.singer_colors(next_singer);
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     ui.add_space(width / 2.0 - 40.0);
                                     for dot in 0..4 {
-                                        let color = if dot < lit { next_highlight } else { self.color_preview };
-                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                        let color = if dot < lit {
+                                            next_highlight
+                                        } else {
+                                            self.color_preview
+                                        };
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
                                         ui.painter().circle_filled(rect.center(), 6.0, color);
                                         ui.add_space(8.0);
                                     }
@@ -650,7 +773,11 @@ impl KaraokeApp {
                         }
                     }
                     None => {
-                        ui.label(egui::RichText::new("♪").size(28.0).color(self.color_preview));
+                        ui.label(
+                            egui::RichText::new("♪")
+                                .size(28.0)
+                                .color(self.color_preview),
+                        );
                     }
                 }
             });
@@ -663,7 +790,12 @@ impl eframe::App for KaraokeApp {
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         if playing {
             ctx.request_repaint();
-            if self.audio.as_ref().map(|a| a.finished_naturally()).unwrap_or(false) {
+            if self
+                .audio
+                .as_ref()
+                .map(|a| a.finished_naturally())
+                .unwrap_or(false)
+            {
                 self.audio.as_mut().unwrap().stop();
             }
         }
@@ -828,8 +960,16 @@ impl eframe::App for KaraokeApp {
                     egui::ComboBox::from_id_source("video_res")
                         .selected_text(self.video_resolution.label())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.video_resolution, Resolution::Hd1080, "1080p");
-                            ui.selectable_value(&mut self.video_resolution, Resolution::Uhd4k, "4K");
+                            ui.selectable_value(
+                                &mut self.video_resolution,
+                                Resolution::Hd1080,
+                                "1080p",
+                            );
+                            ui.selectable_value(
+                                &mut self.video_resolution,
+                                Resolution::Uhd4k,
+                                "4K",
+                            );
                         });
                     if ui.button("Export video (.mp4)…").clicked() {
                         self.start_video_export();
@@ -870,9 +1010,11 @@ impl eframe::App for KaraokeApp {
                     self.load_lyrics_file_dialog();
                 }
                 ui.label(
-                    egui::RichText::new("Supports LRC (.lrc), UltraStar (.txt), and KOK - auto-detected.")
-                        .small()
-                        .weak(),
+                    egui::RichText::new(
+                        "Supports LRC (.lrc), UltraStar (.txt), and KOK - auto-detected.",
+                    )
+                    .small()
+                    .weak(),
                 );
                 ui.add_space(8.0);
                 ui.separator();
@@ -886,11 +1028,18 @@ impl eframe::App for KaraokeApp {
                     && self.next_untimed < self.lines.len();
                 ui.add_enabled_ui(can_tap, |ui| {
                     let label = if self.next_untimed < self.lines.len() {
-                        format!("⏱ Tap next line ({}/{})  [Space]", self.next_untimed + 1, self.lines.len())
+                        format!(
+                            "⏱ Tap next line ({}/{})  [Space]",
+                            self.next_untimed + 1,
+                            self.lines.len()
+                        )
                     } else {
                         "⏱ Tap next line".to_string()
                     };
-                    if ui.add_sized([ui.available_width(), 48.0], egui::Button::new(label)).clicked() {
+                    if ui
+                        .add_sized([ui.available_width(), 48.0], egui::Button::new(label))
+                        .clicked()
+                    {
                         self.tap_next();
                     }
                 });
@@ -901,58 +1050,71 @@ impl eframe::App for KaraokeApp {
             .default_width(340.0)
             .width_range(260.0..=560.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().id_source("right_panel_scroll").show(ui, |ui| {
-                    ui.label("4. Preview (matches the exported file):");
-                    self.draw_preview(ui);
-                    ui.add_space(10.0);
-                    ui.separator();
-                    egui::CollapsingHeader::new("Colors").default_open(false).show(ui, |ui| {
-                        egui::Grid::new("colors_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                            ui.label("Background");
-                            ui.color_edit_button_srgba(&mut self.color_bg);
-                            ui.end_row();
+                egui::ScrollArea::vertical()
+                    .id_source("right_panel_scroll")
+                    .show(ui, |ui| {
+                        ui.label("4. Preview (matches the exported file):");
+                        self.draw_preview(ui);
+                        ui.add_space(10.0);
+                        ui.separator();
+                        egui::CollapsingHeader::new("Colors")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("colors_grid")
+                                    .num_columns(2)
+                                    .spacing([8.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Background");
+                                        ui.color_edit_button_srgba(&mut self.color_bg);
+                                        ui.end_row();
 
-                            ui.label("Male - upcoming");
-                            ui.color_edit_button_srgba(&mut self.color_male_unsung);
-                            ui.end_row();
-                            ui.label("Male - sung");
-                            ui.color_edit_button_srgba(&mut self.color_male_highlight);
-                            ui.end_row();
+                                        ui.label("Male - upcoming");
+                                        ui.color_edit_button_srgba(&mut self.color_male_unsung);
+                                        ui.end_row();
+                                        ui.label("Male - sung");
+                                        ui.color_edit_button_srgba(&mut self.color_male_highlight);
+                                        ui.end_row();
 
-                            ui.label("Female - upcoming");
-                            ui.color_edit_button_srgba(&mut self.color_female_unsung);
-                            ui.end_row();
-                            ui.label("Female - sung");
-                            ui.color_edit_button_srgba(&mut self.color_female_highlight);
-                            ui.end_row();
+                                        ui.label("Female - upcoming");
+                                        ui.color_edit_button_srgba(&mut self.color_female_unsung);
+                                        ui.end_row();
+                                        ui.label("Female - sung");
+                                        ui.color_edit_button_srgba(
+                                            &mut self.color_female_highlight,
+                                        );
+                                        ui.end_row();
 
-                            ui.label("Duet - upcoming");
-                            ui.color_edit_button_srgba(&mut self.color_duet_unsung);
-                            ui.end_row();
-                            ui.label("Duet - sung");
-                            ui.color_edit_button_srgba(&mut self.color_duet_highlight);
-                            ui.end_row();
+                                        ui.label("Duet - upcoming");
+                                        ui.color_edit_button_srgba(&mut self.color_duet_unsung);
+                                        ui.end_row();
+                                        ui.label("Duet - sung");
+                                        ui.color_edit_button_srgba(&mut self.color_duet_highlight);
+                                        ui.end_row();
 
-                            ui.label("Screaming - upcoming");
-                            ui.color_edit_button_srgba(&mut self.color_screaming_unsung);
-                            ui.end_row();
-                            ui.label("Screaming - sung");
-                            ui.color_edit_button_srgba(&mut self.color_screaming_highlight);
-                            ui.end_row();
+                                        ui.label("Screaming - upcoming");
+                                        ui.color_edit_button_srgba(
+                                            &mut self.color_screaming_unsung,
+                                        );
+                                        ui.end_row();
+                                        ui.label("Screaming - sung");
+                                        ui.color_edit_button_srgba(
+                                            &mut self.color_screaming_highlight,
+                                        );
+                                        ui.end_row();
 
-                            ui.label("Next-line preview");
-                            ui.color_edit_button_srgba(&mut self.color_preview);
-                            ui.end_row();
+                                        ui.label("Next-line preview");
+                                        ui.color_edit_button_srgba(&mut self.color_preview);
+                                        ui.end_row();
 
-                            ui.label("Title card - title");
-                            ui.color_edit_button_srgba(&mut self.color_title);
-                            ui.end_row();
-                            ui.label("Title card - artist");
-                            ui.color_edit_button_srgba(&mut self.color_artist);
-                            ui.end_row();
-                        });
+                                        ui.label("Title card - title");
+                                        ui.color_edit_button_srgba(&mut self.color_title);
+                                        ui.end_row();
+                                        ui.label("Title card - artist");
+                                        ui.color_edit_button_srgba(&mut self.color_artist);
+                                        ui.end_row();
+                                    });
+                            });
                     });
-                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -976,11 +1138,15 @@ impl eframe::App for KaraokeApp {
                              Click a word again to retime it. Green = manually timed; the \
                              rest still use the automatic estimate.",
                         );
-                        let words: Vec<String> =
-                            self.lines[i].text.split_whitespace().map(|s| s.to_string()).collect();
+                        let words: Vec<String> = self.lines[i]
+                            .text
+                            .split_whitespace()
+                            .map(|s| s.to_string())
+                            .collect();
                         ui.horizontal_wrapped(|ui| {
                             for (w_idx, word) in words.iter().enumerate() {
-                                let manual = self.lines[i].word_overrides.get(w_idx).copied().flatten();
+                                let manual =
+                                    self.lines[i].word_overrides.get(w_idx).copied().flatten();
                                 let text = match manual {
                                     Some(t) => format!("{word} ({t:.1}s)"),
                                     None => word.clone(),
@@ -1046,10 +1212,26 @@ impl eframe::App for KaraokeApp {
                                         Singer::Screaming => "Screaming",
                                     })
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut self.lines[i].singer, Singer::Male, "Male");
-                                        ui.selectable_value(&mut self.lines[i].singer, Singer::Female, "Female");
-                                        ui.selectable_value(&mut self.lines[i].singer, Singer::Duet, "Duet");
-                                        ui.selectable_value(&mut self.lines[i].singer, Singer::Screaming, "Screaming");
+                                        ui.selectable_value(
+                                            &mut self.lines[i].singer,
+                                            Singer::Male,
+                                            "Male",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.lines[i].singer,
+                                            Singer::Female,
+                                            "Female",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.lines[i].singer,
+                                            Singer::Duet,
+                                            "Duet",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.lines[i].singer,
+                                            Singer::Screaming,
+                                            "Screaming",
+                                        );
                                     });
 
                                 if ui.small_button("Tap").clicked() {

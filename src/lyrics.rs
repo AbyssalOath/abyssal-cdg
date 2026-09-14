@@ -153,18 +153,40 @@ impl TimedLine {
     ) -> Self {
         let window = (end - start).max(0.0);
         let sing_end = (start + estimate_sing_duration(&text, window)).clamp(start, end);
-        Self { text, start, end, sing_end, singer, word_overrides, starts_new_block }
+        Self {
+            text,
+            start,
+            end,
+            sing_end,
+            singer,
+            word_overrides,
+            starts_new_block,
+        }
     }
 }
+
+/// (start, text, singer, word_overrides, starts_new_block) - one sorted
+/// line's fields, used only as [`resolve_timing`]'s working representation.
+type SortedLine<'a> = (f64, &'a str, Singer, &'a [Option<f64>], bool);
 
 /// Resolve start/end windows for every line. Requires every line to already
 /// have a `start` set (caller should validate this first). Lines are sorted
 /// by start time. The final line's end is `total_duration` (or `start + 4.0`
 /// if `total_duration` is unknown / shorter than that).
 pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<TimedLine> {
-    let mut sorted: Vec<(f64, &str, Singer, &[Option<f64>], bool)> = lines
+    let mut sorted: Vec<SortedLine> = lines
         .iter()
-        .filter_map(|l| l.start.map(|s| (s, l.text.as_str(), l.singer, l.word_overrides.as_slice(), l.starts_new_block)))
+        .filter_map(|l| {
+            l.start.map(|s| {
+                (
+                    s,
+                    l.text.as_str(),
+                    l.singer,
+                    l.word_overrides.as_slice(),
+                    l.starts_new_block,
+                )
+            })
+        })
         .collect();
     sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
@@ -179,7 +201,14 @@ pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<T
                 _ => start + 4.0,
             }
         };
-        out.push(TimedLine::with_overrides(text.to_string(), start, end, singer, overrides.to_vec(), starts_new_block));
+        out.push(TimedLine::with_overrides(
+            text.to_string(),
+            start,
+            end,
+            singer,
+            overrides.to_vec(),
+            starts_new_block,
+        ));
     }
     out
 }
@@ -203,7 +232,11 @@ pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
     if words.is_empty() {
         return Vec::new();
     }
-    let total_chars: usize = words.iter().map(|w| w.chars().count()).sum::<usize>().max(1);
+    let total_chars: usize = words
+        .iter()
+        .map(|w| w.chars().count())
+        .sum::<usize>()
+        .max(1);
     let duration = (line.sing_end - line.start).max(0.05);
 
     let mut out = Vec::with_capacity(words.len());
@@ -245,8 +278,8 @@ pub fn word_char_spans(text: &str) -> Vec<(usize, usize)> {
 /// currently-singing line, at time `t`. This is what drives the karaoke
 /// color wipe in both the video exporter and the live preview. It's still
 /// *anchored* to each word's own timestamp (from [`word_timings`]) for
-/// accuracy - reaching the right fraction at the right moment for each word
-/// - but linearly interpolates between those anchors instead of jumping, so
+/// accuracy, reaching the right fraction at the right moment for each word,
+/// but linearly interpolates between those anchors instead of jumping, so
 /// the wipe moves continuously through every word's letters (and through a
 /// single word held for several seconds) rather than only snapping at word
 /// boundaries.
@@ -265,7 +298,10 @@ pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
     for (i, &(offset, len)) in spans.iter().enumerate() {
         let Some(word) = words.get(i) else { continue };
         let word_start = word.highlight_at;
-        let word_end = words.get(i + 1).map(|w| w.highlight_at).unwrap_or(line.sing_end.max(word_start + 0.05));
+        let word_end = words
+            .get(i + 1)
+            .map(|w| w.highlight_at)
+            .unwrap_or(line.sing_end.max(word_start + 0.05));
         let frac_start = offset as f32 / char_count;
         let frac_end = (offset + len) as f32 / char_count;
         if t < word_end || i + 1 == words.len() {
@@ -334,7 +370,11 @@ mod tests {
 
     #[test]
     fn resolve_timing_chains_end_to_next_start() {
-        let mut lines = vec![LyricLine::new("a"), LyricLine::new("b"), LyricLine::new("c")];
+        let mut lines = vec![
+            LyricLine::new("a"),
+            LyricLine::new("b"),
+            LyricLine::new("c"),
+        ];
         lines[0].start = Some(1.0);
         lines[1].start = Some(3.0);
         lines[2].start = Some(6.0);
@@ -348,7 +388,11 @@ mod tests {
 
     #[test]
     fn resolve_timing_skips_untimed_lines() {
-        let mut lines = vec![LyricLine::new("a"), LyricLine::new("skip me"), LyricLine::new("c")];
+        let mut lines = vec![
+            LyricLine::new("a"),
+            LyricLine::new("skip me"),
+            LyricLine::new("c"),
+        ];
         lines[0].start = Some(1.0);
         lines[2].start = Some(5.0);
         let timed = resolve_timing(&lines, Some(10.0));

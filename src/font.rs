@@ -96,7 +96,7 @@ pub fn glyph_tile_scaled(ch: char, scale: u8) -> Vec<Vec<TilePixels>> {
     for (tile_row, row_out) in result.iter_mut().enumerate() {
         for (tile_col, tile_out) in row_out.iter_mut().enumerate() {
             let mut tile = BLANK_TILE;
-            for r in 0..TILE_HEIGHT {
+            for (r, row_bits) in tile.iter_mut().enumerate() {
                 let cy = tile_row * TILE_HEIGHT + r;
                 let mut bits = 0u8;
                 for c in 0..6 {
@@ -105,7 +105,7 @@ pub fn glyph_tile_scaled(ch: char, scale: u8) -> Vec<Vec<TilePixels>> {
                         bits |= 1 << (5 - c); // CDG bit order: bit5=leftmost
                     }
                 }
-                tile[r] = bits;
+                *row_bits = bits;
             }
             *tile_out = tile;
         }

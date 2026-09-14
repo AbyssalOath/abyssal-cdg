@@ -61,7 +61,10 @@ pub fn detect_format(text: &str) -> LyricFormat {
 
     if head.lines().any(|l| {
         let l = l.trim_start();
-        l.starts_with("#TITLE:") || l.starts_with("#BPM:") || l.starts_with("#GAP:") || l.starts_with("#ARTIST:")
+        l.starts_with("#TITLE:")
+            || l.starts_with("#BPM:")
+            || l.starts_with("#GAP:")
+            || l.starts_with("#ARTIST:")
     }) {
         return LyricFormat::UltraStar;
     }
@@ -79,8 +82,12 @@ pub fn detect_format(text: &str) -> LyricFormat {
 
 fn is_lrc_timestamp_line(line: &str) -> bool {
     let line = line.trim_start();
-    let Some(rest) = line.strip_prefix('[') else { return false };
-    let Some(end) = rest.find(']') else { return false };
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
     parse_lrc_time_tag(&rest[..end]).is_some()
 }
 
@@ -116,6 +123,11 @@ fn is_new_block(prev_start: f64, cur_start: f64) -> bool {
     (cur_start - prev_start) > IMPORTED_BLOCK_GAP_THRESHOLD
 }
 
+// Not called from the app yet (no "export as LRC" menu item), only from
+// `export_lrc` below and its tests - kept and tested since it's a cheap,
+// already-correct counterpart to `import_lrc` that a future export feature
+// can wire straight up.
+#[allow(dead_code)]
 fn split_mmss(secs: f64) -> (u64, f64) {
     let secs = secs.max(0.0);
     let mm = (secs / 60.0).floor() as u64;
@@ -232,6 +244,7 @@ pub fn import_lrc(text: &str) -> Vec<LyricLine> {
 /// Exports timed lines back to LRC text. `enhanced = true` writes LRC2
 /// inline word tags (from [`crate::lyrics::word_timings`]); `false` writes
 /// plain line-level LRC1.
+#[allow(dead_code)]
 pub fn export_lrc(timed: &[TimedLine], enhanced: bool) -> String {
     let mut out = String::new();
     for line in timed {
@@ -283,7 +296,8 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
             gap_ms = v.trim().replace(',', ".").parse().unwrap_or(0.0);
         }
     }
-    let bpm = bpm.ok_or_else(|| "missing #BPM: header - not a recognizable UltraStar file".to_string())?;
+    let bpm =
+        bpm.ok_or_else(|| "missing #BPM: header - not a recognizable UltraStar file".to_string())?;
     if bpm <= 0.0 {
         return Err(format!("invalid #BPM: value ({bpm})"));
     }
@@ -300,7 +314,8 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
     let mut current: Option<PendingLine> = None;
     let mut current_singer = Singer::Male;
 
-    let finish = |current: &mut Option<PendingLine>, out: &mut Vec<(f64, String, Vec<f64>, Singer)>| {
+    let finish = |current: &mut Option<PendingLine>,
+                  out: &mut Vec<(f64, String, Vec<f64>, Singer)>| {
         if let Some(p) = current.take() {
             let trimmed = p.text.trim_end().to_string();
             if !trimmed.is_empty() {
@@ -363,7 +378,9 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
         if rest.len() < 4 {
             continue; // malformed note line - skip rather than abort the whole import
         }
-        let Some(start_beat) = rest[0].parse::<f64>().ok() else { continue };
+        let Some(start_beat) = rest[0].parse::<f64>().ok() else {
+            continue;
+        };
         // rest[1] = length (unused), rest[2] = pitch (parsed to confirm
         // shape, then intentionally discarded - see module docs).
         let _pitch: Option<i32> = rest[2].parse().ok();
@@ -453,7 +470,8 @@ pub fn import_kok(text: &str) -> Vec<LyricLine> {
         let should_break = match current.last() {
             Some((prev_t, prev_w)) => {
                 let estimated_prev_duration = (prev_w.chars().count() as f64 * 0.09).max(0.15);
-                (t - (prev_t + estimated_prev_duration) > WORD_GAP_THRESHOLD) || current.len() >= MAX_WORDS_PER_LINE
+                (t - (prev_t + estimated_prev_duration) > WORD_GAP_THRESHOLD)
+                    || current.len() >= MAX_WORDS_PER_LINE
             }
             None => false,
         };
@@ -468,7 +486,11 @@ pub fn import_kok(text: &str) -> Vec<LyricLine> {
 
     let mut result = Vec::with_capacity(line_groups.len());
     for (i, group) in line_groups.iter().enumerate() {
-        let text = group.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(" ");
+        let text = group
+            .iter()
+            .map(|(_, w)| w.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         let start = group[0].0;
         let mut line = LyricLine::new(&text);
         line.start = Some(start);
@@ -503,7 +525,8 @@ mod tests {
 
     #[test]
     fn detects_ultrastar() {
-        let text = "#TITLE:Song\n#ARTIST:Someone\n#BPM:200\n#GAP:1000\n: 0 4 0 Hel\n: 4 4 0 lo \n- 8\nE";
+        let text =
+            "#TITLE:Song\n#ARTIST:Someone\n#BPM:200\n#GAP:1000\n: 0 4 0 Hel\n: 4 4 0 lo \n- 8\nE";
         assert_eq!(detect_format(text), LyricFormat::UltraStar);
     }
 
@@ -554,7 +577,10 @@ mod tests {
         let lines = import_lrc(text);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "Some words here");
-        assert_eq!(lines[0].word_overrides, vec![Some(12.0), Some(12.9), Some(13.4)]);
+        assert_eq!(
+            lines[0].word_overrides,
+            vec![Some(12.0), Some(12.9), Some(13.4)]
+        );
     }
 
     #[test]
@@ -639,7 +665,11 @@ mod tests {
         let text = "1,56000;This ;2,12006;is ;2,5678;the ;3,02345;first ;3,4321;line;";
         let lines = import_kok(text);
         assert!(!lines.is_empty());
-        let all_words: String = lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join(" ");
+        let all_words: String = lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(all_words.contains("This"));
         assert!(all_words.contains("first"));
         assert!(all_words.contains("line"));
@@ -653,7 +683,10 @@ mod tests {
             text.push_str(&format!("{},00000;w{};", i, i));
         }
         let lines = import_kok(&text);
-        assert!(lines.len() >= 2, "expected the 15-word stream to split into multiple lines");
+        assert!(
+            lines.len() >= 2,
+            "expected the 15-word stream to split into multiple lines"
+        );
         for l in &lines {
             assert!(l.text.split_whitespace().count() <= 10);
         }

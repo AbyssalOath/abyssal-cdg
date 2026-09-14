@@ -49,7 +49,11 @@ pub struct CdgColor {
 impl CdgColor {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         // Clamp into 4-bit range defensively.
-        Self { r: r & 0x0F, g: g & 0x0F, b: b & 0x0F }
+        Self {
+            r: r & 0x0F,
+            g: g & 0x0F,
+            b: b & 0x0F,
+        }
     }
 }
 
@@ -65,7 +69,9 @@ pub struct CdgWriter {
 
 impl CdgWriter {
     pub fn new() -> Self {
-        Self { packets: Vec::new() }
+        Self {
+            packets: Vec::new(),
+        }
     }
 
     #[allow(dead_code)]
@@ -133,7 +139,14 @@ impl CdgWriter {
             data[i * 2] = b1 & 0x3F;
             data[i * 2 + 1] = b2 & 0x3F;
         }
-        self.push_packet(if high { INST_LOAD_CLUT_HIGH } else { INST_LOAD_CLUT_LOW }, data);
+        self.push_packet(
+            if high {
+                INST_LOAD_CLUT_HIGH
+            } else {
+                INST_LOAD_CLUT_LOW
+            },
+            data,
+        );
     }
 
     /// Draw a tile at (row, col) in the *safe* coordinate space (0-based,
@@ -206,7 +219,7 @@ mod tests {
         w.load_color_table(&colors, false);
         let bytes = w.into_bytes();
         assert_eq!(bytes[1], 30); // low CLUT instruction
-        // byte1 = (r<<2)|(g>>2) = (15<<2)|0 = 60 = 0x3C
+                                  // byte1 = (r<<2)|(g>>2) = (15<<2)|0 = 60 = 0x3C
         assert_eq!(bytes[4] & 0x3F, 0x3C);
     }
 }

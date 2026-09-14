@@ -2,6 +2,9 @@
 name = "abyssal-cdg"
 version = "0.1.0"
 edition = "2021"
+authors = ["LordSodomiser"]
+description = "Turns an audio file and pasted lyrics into a real karaoke .cdg file"
+license-file = "LICENSE"
 
 [dependencies]
 eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "persistence", "wayland", "x11"] }
@@ -15,3 +18,16 @@ ab_glyph = "0.2.32"
 
 [profile.release]
 opt-level = 2
+
+# Config for `cargo packager` (see .github/workflows/release.yml), which
+# builds the downloadable installers/images attached to GitHub releases.
+[package.metadata.packager]
+product-name = "Abyssal CDG Creator"
+identifier = "com.lordsodomiser.abyssal-cdg"
+category = "Music"
+
+# eframe (winit/glow) needs an X11 or Wayland stack plus xkbcommon, GTK3 is
+# needed for the native "load audio file" dialog (`rfd`), and ALSA is
+# needed for audio playback (`rodio`).
+[package.metadata.packager.deb]
+depends = ["libgtk-3-0", "libasound2", "libx11-6", "libxkbcommon0"]

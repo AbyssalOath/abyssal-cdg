@@ -19,7 +19,10 @@
 //! This requires `ffmpeg` to be installed and on the PATH; we check for it
 //! up front and return a clear error with install instructions if missing.
 
-use crate::lyrics::{countdown_window, countdown_window_between, current_line_wipe_fraction, normalize_text, TimedLine};
+use crate::lyrics::{
+    countdown_window, countdown_window_between, current_line_wipe_fraction, normalize_text,
+    TimedLine,
+};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
@@ -73,7 +76,11 @@ impl Rgb8 {
     fn lerp(self, other: Rgb8, t: f32) -> Rgb8 {
         let t = t.clamp(0.0, 1.0);
         let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-        Rgb8::new(mix(self.r, other.r), mix(self.g, other.g), mix(self.b, other.b))
+        Rgb8::new(
+            mix(self.r, other.r),
+            mix(self.g, other.g),
+            mix(self.b, other.b),
+        )
     }
 }
 
@@ -114,7 +121,11 @@ struct Canvas {
 
 impl Canvas {
     fn new(w: usize, h: usize) -> Self {
-        Self { w, h, buf: vec![0u8; w * h * 3] }
+        Self {
+            w,
+            h,
+            buf: vec![0u8; w * h * 3],
+        }
     }
 
     fn fill(&mut self, color: Rgb8) {
@@ -132,8 +143,10 @@ impl Canvas {
         let idx = (y as usize * self.w + x as usize) * 3;
         let a = alpha.clamp(0.0, 1.0);
         self.buf[idx] = (self.buf[idx] as f32 * (1.0 - a) + color.r as f32 * a).round() as u8;
-        self.buf[idx + 1] = (self.buf[idx + 1] as f32 * (1.0 - a) + color.g as f32 * a).round() as u8;
-        self.buf[idx + 2] = (self.buf[idx + 2] as f32 * (1.0 - a) + color.b as f32 * a).round() as u8;
+        self.buf[idx + 1] =
+            (self.buf[idx + 1] as f32 * (1.0 - a) + color.g as f32 * a).round() as u8;
+        self.buf[idx + 2] =
+            (self.buf[idx + 2] as f32 * (1.0 - a) + color.b as f32 * a).round() as u8;
     }
 }
 
@@ -154,7 +167,9 @@ fn draw_filled_circle(canvas: &mut Canvas, cx: f32, cy: f32, radius: f32, color:
 
 fn measure_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
     let scaled = font.as_scaled(scale);
-    text.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum()
+    text.chars()
+        .map(|c| scaled.h_advance(font.glyph_id(c)))
+        .sum()
 }
 
 /// Draws `text` centered at `center_x`, with one color per character
@@ -162,6 +177,7 @@ fn measure_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
 /// than characters, the last one is reused). Shrinks the font uniformly if
 /// the line would be wider than `max_width` - the "adjust font size if it
 /// starts clipping" behavior.
+#[allow(clippy::too_many_arguments)]
 fn draw_text_line_chars(
     canvas: &mut Canvas,
     font: &FontRef,
@@ -269,6 +285,7 @@ fn draw_text_line_wipe(
 }
 
 /// Convenience wrapper for a whole line in a single uniform color.
+#[allow(clippy::too_many_arguments)]
 fn draw_text_line_uniform(
     canvas: &mut Canvas,
     font: &FontRef,
@@ -280,7 +297,9 @@ fn draw_text_line_uniform(
     max_width: f32,
 ) {
     let colors = vec![color; text.chars().count().max(1)];
-    draw_text_line_chars(canvas, font, scale_px, center_x, baseline_y, text, &colors, max_width);
+    draw_text_line_chars(
+        canvas, font, scale_px, center_x, baseline_y, text, &colors, max_width,
+    );
 }
 
 /// Groups consecutive line indices into display blocks of at most
@@ -293,8 +312,8 @@ fn draw_text_line_uniform(
 fn group_into_blocks(timed_lines: &[TimedLine]) -> Vec<Vec<usize>> {
     let mut blocks = Vec::new();
     let mut current: Vec<usize> = Vec::new();
-    for i in 0..timed_lines.len() {
-        let starts_new = i == 0 || timed_lines[i].starts_new_block;
+    for (i, line) in timed_lines.iter().enumerate() {
+        let starts_new = i == 0 || line.starts_new_block;
         if starts_new && !current.is_empty() {
             blocks.push(std::mem::take(&mut current));
         }
@@ -319,7 +338,14 @@ fn countdown_lit_count(cd_start: f64, cd_end: f64, t: f64) -> usize {
     ((frac * 4.0).floor() as i64 + 1).clamp(0, 4) as usize
 }
 
-fn draw_countdown_dots(canvas: &mut Canvas, w: f32, h: f32, lit: usize, lit_color: Rgb8, dim_color: Rgb8) {
+fn draw_countdown_dots(
+    canvas: &mut Canvas,
+    w: f32,
+    h: f32,
+    lit: usize,
+    lit_color: Rgb8,
+    dim_color: Rgb8,
+) {
     let cy = h * 0.85;
     let radius = h * 0.012;
     let spacing = h * 0.05;
@@ -351,11 +377,29 @@ fn render_frame(
     let has_title_card = title.is_some() || artist.is_some();
     if has_title_card && t < card_end {
         if let Some(ti) = title {
-            draw_text_line_uniform(canvas, bold, h * 0.10, w / 2.0, h * 0.42, ti, palette.title, max_width);
+            draw_text_line_uniform(
+                canvas,
+                bold,
+                h * 0.10,
+                w / 2.0,
+                h * 0.42,
+                ti,
+                palette.title,
+                max_width,
+            );
         }
         if let Some(a) = artist {
             let by = format!("by {a}");
-            draw_text_line_uniform(canvas, regular, h * 0.05, w / 2.0, h * 0.52, &by, palette.artist, max_width);
+            draw_text_line_uniform(
+                canvas,
+                regular,
+                h * 0.05,
+                w / 2.0,
+                h * 0.52,
+                &by,
+                palette.artist,
+                max_width,
+            );
         }
         return;
     }
@@ -400,21 +444,53 @@ fn render_frame(
         match slot.cmp(&slot_in_block) {
             std::cmp::Ordering::Less => {
                 // Already sung - shown fully in the highlight color.
-                draw_text_line_uniform(canvas, regular, font_size, w / 2.0, y, &text, highlight, max_width);
+                draw_text_line_uniform(
+                    canvas,
+                    regular,
+                    font_size,
+                    w / 2.0,
+                    y,
+                    &text,
+                    highlight,
+                    max_width,
+                );
             }
             std::cmp::Ordering::Equal => {
                 let wipe_fraction = current_line_wipe_fraction(line, t);
-                draw_text_line_wipe(canvas, bold, font_size * 1.05, w / 2.0, y, &text, unsung, highlight, wipe_fraction, max_width);
+                draw_text_line_wipe(
+                    canvas,
+                    bold,
+                    font_size * 1.05,
+                    w / 2.0,
+                    y,
+                    &text,
+                    unsung,
+                    highlight,
+                    wipe_fraction,
+                    max_width,
+                );
             }
             std::cmp::Ordering::Greater => {
-                draw_text_line_uniform(canvas, regular, font_size, w / 2.0, y, &text, unsung, max_width);
+                draw_text_line_uniform(
+                    canvas,
+                    regular,
+                    font_size,
+                    w / 2.0,
+                    y,
+                    &text,
+                    unsung,
+                    max_width,
+                );
             }
         }
     }
 
     if let Some((cd_start, cd_end)) = countdown_window(&timed_lines[current_idx]) {
         if t >= cd_start {
-            let next_singer = timed_lines.get(current_idx + 1).map(|l| l.singer).unwrap_or(timed_lines[current_idx].singer);
+            let next_singer = timed_lines
+                .get(current_idx + 1)
+                .map(|l| l.singer)
+                .unwrap_or(timed_lines[current_idx].singer);
             let (_, highlight) = palette.singer_colors(next_singer);
             let lit = countdown_lit_count(cd_start, cd_end, t);
             draw_countdown_dots(canvas, w, h, lit, highlight, palette.preview);
@@ -425,7 +501,11 @@ fn render_frame(
 /// Confirms `ffmpeg` is installed and callable, with a clear, actionable
 /// error message if not (video export needs it; the `.cdg` path doesn't).
 pub fn check_ffmpeg_available() -> Result<()> {
-    let result = Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let result = Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     match result {
         Ok(status) if status.success() => Ok(()),
         _ => bail!(
@@ -457,8 +537,10 @@ pub fn render_video(
 ) -> Result<()> {
     check_ffmpeg_available()?;
 
-    let regular = FontRef::try_from_slice(DEJAVU_REGULAR).context("failed to parse embedded regular font")?;
-    let bold = FontRef::try_from_slice(DEJAVU_BOLD).context("failed to parse embedded bold font")?;
+    let regular =
+        FontRef::try_from_slice(DEJAVU_REGULAR).context("failed to parse embedded regular font")?;
+    let bold =
+        FontRef::try_from_slice(DEJAVU_BOLD).context("failed to parse embedded bold font")?;
 
     let (w, h) = resolution.dimensions();
     let card_end = crate::export::title_card_end(timed_lines);
@@ -507,12 +589,26 @@ pub fn render_video(
         .spawn()
         .context("failed to launch ffmpeg")?;
 
-    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("failed to open ffmpeg stdin"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open ffmpeg stdin"))?;
     let mut canvas = Canvas::new(w as usize, h as usize);
 
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 / fps as f64;
-        render_frame(&mut canvas, &regular, &bold, timed_lines, &blocks, palette, title, artist, card_end, t);
+        render_frame(
+            &mut canvas,
+            &regular,
+            &bold,
+            timed_lines,
+            &blocks,
+            palette,
+            title,
+            artist,
+            card_end,
+            t,
+        );
         if stdin.write_all(&canvas.buf).is_err() {
             break;
         }
@@ -523,10 +619,20 @@ pub fn render_video(
     drop(stdin);
     on_progress(1.0);
 
-    let output = child.wait_with_output().context("failed waiting for ffmpeg to finish")?;
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for ffmpeg to finish")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        let tail: String = stderr
+            .lines()
+            .rev()
+            .take(15)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         bail!("ffmpeg failed:\n{tail}");
     }
     Ok(())
@@ -594,7 +700,9 @@ mod tests {
 
     #[test]
     fn blocks_cap_at_max_lines() {
-        let mut lines: Vec<LyricLine> = (0..8).map(|i| LyricLine::new(format!("line {i}"))).collect();
+        let mut lines: Vec<LyricLine> = (0..8)
+            .map(|i| LyricLine::new(format!("line {i}")))
+            .collect();
         // Simulate one single unbroken run (no blank lines at all) - should
         // still get capped into chunks of at most MAX_BLOCK_LINES.
         for l in lines.iter_mut().skip(1) {
@@ -624,12 +732,21 @@ mod tests {
         for i in 0..=20 {
             let t = line.sing_end * (i as f64 / 20.0);
             let frac = current_line_wipe_fraction(line, t);
-            assert!(frac >= last_frac, "wipe fraction should never decrease over time");
-            assert!((0.0..=1.0).contains(&frac), "wipe fraction out of range: {frac}");
+            assert!(
+                frac >= last_frac,
+                "wipe fraction should never decrease over time"
+            );
+            assert!(
+                (0.0..=1.0).contains(&frac),
+                "wipe fraction out of range: {frac}"
+            );
             last_frac = frac;
         }
         // By sing_end, the wipe should have reached (or be very close to) the end.
-        assert!(last_frac > 0.95, "expected wipe to be nearly/fully complete by sing_end, got {last_frac}");
+        assert!(
+            last_frac > 0.95,
+            "expected wipe to be nearly/fully complete by sing_end, got {last_frac}"
+        );
     }
 
     #[test]
@@ -643,7 +760,10 @@ mod tests {
         // reached exactly the char-fraction where the 2nd word begins.
         let frac_at_word2_start = current_line_wipe_fraction(line, words[1].highlight_at);
         let expected = 3.0 / 8.0; // "aa " is 3 chars out of "aa bb cc" (8 chars)
-        assert!((frac_at_word2_start - expected).abs() < 0.01, "got {frac_at_word2_start}, expected ~{expected}");
+        assert!(
+            (frac_at_word2_start - expected).abs() < 0.01,
+            "got {frac_at_word2_start}, expected ~{expected}"
+        );
     }
 
     #[test]
@@ -685,7 +805,18 @@ mod tests {
         // Sample across the whole song including the intro countdown window.
         let mut t = 0.0;
         while t < 30.0 {
-            render_frame(&mut canvas, &regular, &bold, &timed, &blocks, &palette, Some("T"), Some("A"), card_end, t);
+            render_frame(
+                &mut canvas,
+                &regular,
+                &bold,
+                &timed,
+                &blocks,
+                &palette,
+                Some("T"),
+                Some("A"),
+                card_end,
+                t,
+            );
             t += 0.37;
         }
     }

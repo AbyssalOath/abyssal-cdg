@@ -108,7 +108,16 @@ impl Palette {
 
     fn high_clut(&self) -> [CdgColor; 8] {
         let zero = CdgColor::new(0, 0, 0);
-        [self.title, self.artist, self.screaming_unsung, self.screaming_highlight, zero, zero, zero, zero]
+        [
+            self.title,
+            self.artist,
+            self.screaming_unsung,
+            self.screaming_highlight,
+            zero,
+            zero,
+            zero,
+            zero,
+        ]
     }
 
     /// (unsung color index, highlight color index) for a given singer.
@@ -157,7 +166,11 @@ fn layout_line_scaled(text: &str, preferred_scale: u8) -> LineLayout {
         joined
     };
 
-    LineLayout { start_col, text: clipped, scale }
+    LineLayout {
+        start_col,
+        text: clipped,
+        scale,
+    }
 }
 
 /// (char offset within the laid-out line, char length) for each word.
@@ -195,7 +208,15 @@ fn draw_row_scaled(w: &mut CdgWriter, band_row: u8, layout: &LineLayout, color0:
 /// Draw just one character of an already-laid-out line at word/char index
 /// `char_idx` (0-based into `layout.text.chars()`) - used to redraw a single
 /// word in the highlight color without touching the rest of the line.
-fn draw_char_at(w: &mut CdgWriter, band_row: u8, layout: &LineLayout, char_idx: usize, ch: char, color0: u8, color1: u8) {
+fn draw_char_at(
+    w: &mut CdgWriter,
+    band_row: u8,
+    layout: &LineLayout,
+    char_idx: usize,
+    ch: char,
+    color0: u8,
+    color1: u8,
+) {
     let scale = layout.scale as usize;
     let col = layout.start_col as usize + char_idx * scale;
     if col + scale > SAFE_COLS as usize {
@@ -281,10 +302,22 @@ pub fn render_cdg(
     w.border_preset(BG);
 
     if let Some(t) = title {
-        draw_row_scaled(&mut w, TITLE_ROW, &layout_line_scaled(t, PREFERRED_SCALE), BG, TITLE);
+        draw_row_scaled(
+            &mut w,
+            TITLE_ROW,
+            &layout_line_scaled(t, PREFERRED_SCALE),
+            BG,
+            TITLE,
+        );
     }
     if let Some(a) = artist {
-        draw_row_scaled(&mut w, ARTIST_ROW, &layout_line_scaled(&format!("by {a}"), 1), BG, ARTIST);
+        draw_row_scaled(
+            &mut w,
+            ARTIST_ROW,
+            &layout_line_scaled(&format!("by {a}"), 1),
+            BG,
+            ARTIST,
+        );
     }
     // Only actually spend stream time on the title-card rows (and the wipe
     // that clears them) when there's something to show there - with no
@@ -338,12 +371,23 @@ pub fn render_cdg(
             for k in 0..*len {
                 let char_idx = offset + k;
                 let ch = chars.get(char_idx).copied().unwrap_or(' ');
-                draw_char_at(&mut w, CURRENT_ROW, &layout, char_idx, ch, BG, highlight_idx);
+                draw_char_at(
+                    &mut w,
+                    CURRENT_ROW,
+                    &layout,
+                    char_idx,
+                    ch,
+                    BG,
+                    highlight_idx,
+                );
             }
         }
 
         if let Some((cd_start, cd_end)) = countdown_window(line) {
-            let next_singer = timed_lines.get(i + 1).map(|l| l.singer).unwrap_or(line.singer);
+            let next_singer = timed_lines
+                .get(i + 1)
+                .map(|l| l.singer)
+                .unwrap_or(line.singer);
             let (_, next_highlight_idx) = palette.singer_colors(next_singer);
             schedule_countdown_dots(&mut w, cd_start, cd_end, next_highlight_idx);
         }
@@ -361,7 +405,10 @@ mod tests {
 
     #[test]
     fn renders_valid_packet_stream() {
-        let mut lines = vec![LyricLine::new("hello world"), LyricLine::new("second line here")];
+        let mut lines = vec![
+            LyricLine::new("hello world"),
+            LyricLine::new("second line here"),
+        ];
         lines[0].start = Some(0.5);
         lines[1].start = Some(3.0);
         let timed = resolve_timing(&lines, Some(6.0));
@@ -374,7 +421,10 @@ mod tests {
     fn empty_lines_still_produce_valid_padded_stream() {
         let bytes = render_cdg(&[], 3.0, &Palette::default(), None, None);
         assert_eq!(bytes.len() % 24, 0);
-        assert_eq!(bytes.len() / 24, (3.0 * crate::cdg::PACKETS_PER_SEC) as usize);
+        assert_eq!(
+            bytes.len() / 24,
+            (3.0 * crate::cdg::PACKETS_PER_SEC) as usize
+        );
     }
 
     #[test]
@@ -382,7 +432,13 @@ mod tests {
         let mut lines = vec![LyricLine::new("hello world")];
         lines[0].start = Some(2.0);
         let timed = resolve_timing(&lines, Some(6.0));
-        let bytes = render_cdg(&timed, 6.0, &Palette::default(), Some("My Song"), Some("An Artist"));
+        let bytes = render_cdg(
+            &timed,
+            6.0,
+            &Palette::default(),
+            Some("My Song"),
+            Some("An Artist"),
+        );
         assert_eq!(bytes.len() % 24, 0);
     }
 
@@ -394,7 +450,10 @@ mod tests {
         lines[1].start = Some(20.0); // huge gap -> triggers countdown
         let timed = resolve_timing(&lines, Some(22.0));
         let bytes = render_cdg(&timed, 22.0, &Palette::default(), None, None);
-        assert_eq!(bytes.len() / 24, (22.0 * crate::cdg::PACKETS_PER_SEC) as usize);
+        assert_eq!(
+            bytes.len() / 24,
+            (22.0 * crate::cdg::PACKETS_PER_SEC) as usize
+        );
     }
 
     #[test]
@@ -417,7 +476,13 @@ mod tests {
         lines[1].start = Some(3.0);
         lines[1].singer = crate::lyrics::Singer::Screaming;
         let timed = resolve_timing(&lines, Some(6.0));
-        let bytes = render_cdg(&timed, 6.0, &Palette::default(), Some("Title"), Some("Artist"));
+        let bytes = render_cdg(
+            &timed,
+            6.0,
+            &Palette::default(),
+            Some("Title"),
+            Some("Artist"),
+        );
         assert_eq!(bytes.len() % 24, 0);
     }
 
@@ -466,7 +531,13 @@ mod tests {
         lines[0].start = Some(0.0);
         lines[1].start = Some(3.0);
         let timed = resolve_timing(&lines, Some(8.0));
-        let bytes = render_cdg(&timed, 8.0, &Palette::default(), Some("A Title That Is Also Somewhat Long For A Title"), Some("Artist"));
+        let bytes = render_cdg(
+            &timed,
+            8.0,
+            &Palette::default(),
+            Some("A Title That Is Also Somewhat Long For A Title"),
+            Some("Artist"),
+        );
         assert_eq!(bytes.len() % 24, 0);
     }
 
@@ -480,7 +551,10 @@ mod tests {
         reflected.sort();
         let mut original: Vec<i32> = cols.iter().map(|&c| c as i32).collect();
         original.sort();
-        assert_eq!(reflected, original, "columns aren't symmetric around true center");
+        assert_eq!(
+            reflected, original,
+            "columns aren't symmetric around true center"
+        );
     }
 
     #[test]
@@ -495,9 +569,18 @@ mod tests {
         lines[0].start = Some(25.0); // long intro before this
         lines[1].start = Some(28.0);
         let timed = resolve_timing(&lines, Some(31.0));
-        let bytes = render_cdg(&timed, 31.0, &Palette::default(), Some("Title"), Some("Artist"));
+        let bytes = render_cdg(
+            &timed,
+            31.0,
+            &Palette::default(),
+            Some("Title"),
+            Some("Artist"),
+        );
         assert_eq!(bytes.len() % 24, 0);
-        assert_eq!(bytes.len() / 24, (31.0 * crate::cdg::PACKETS_PER_SEC) as usize);
+        assert_eq!(
+            bytes.len() / 24,
+            (31.0 * crate::cdg::PACKETS_PER_SEC) as usize
+        );
     }
 
     #[test]
@@ -511,6 +594,9 @@ mod tests {
         let timed = resolve_timing(&lines, Some(22.0));
         let bytes = render_cdg(&timed, 22.0, &Palette::default(), None, None);
         let tile_block_count = bytes.chunks(24).filter(|p| p[1] == 6).count();
-        assert!(tile_block_count > 0, "expected countdown dots to be drawn even without a title card");
+        assert!(
+            tile_block_count > 0,
+            "expected countdown dots to be drawn even without a title card"
+        );
     }
 }
