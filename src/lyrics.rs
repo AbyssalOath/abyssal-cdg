@@ -47,6 +47,13 @@ pub const COUNTDOWN_GAP_THRESHOLD: f64 = 5.0;
 /// the next line begins.
 pub const COUNTDOWN_LEAD_SECS: f64 = 4.0;
 
+/// How long an already-sung line (and any earlier lines still shown
+/// highlighted in the same block) lingers on screen after singing ends,
+/// during a break long enough to trigger the countdown indicator. Past
+/// this point the display goes blank (until the countdown dots appear)
+/// instead of leaving finished lyrics sitting there for the whole break.
+pub const SUNG_LINGER_SECS: f64 = 5.0;
+
 fn estimate_sing_duration(text: &str, window: f64) -> f64 {
     let word_count = text.split_whitespace().count().max(1);
     let est = (word_count as f64 * SECONDS_PER_WORD).max(MIN_SING_DURATION);
@@ -65,6 +72,17 @@ pub struct LyricLine {
     /// word until the user fine-tunes it). Mixing manual and automatic
     /// words within the same line is fine.
     pub word_overrides: Vec<Option<f64>>,
+    /// One slot per word - manual override for when a word's held-out
+    /// highlight should *end* (i.e. when the color-wipe should stop
+    /// advancing through its letters and freeze, waiting for the next
+    /// word). `None` means "use the automatic default": the next word's
+    /// (manual-or-estimated) start, or [`LyricLine::sing_end_override`]/the
+    /// automatic estimate for the line's last word - i.e. a continuous
+    /// wipe with no pause, which is what every word gets until fine-tuned.
+    /// Setting this lets a word's highlight stop *before* the next word's
+    /// start (e.g. a held note followed by a musical pause before the next
+    /// word), instead of always stretching to fill that whole gap.
+    pub word_end_overrides: Vec<Option<f64>>,
     /// Manual override for when this line's singing actually finishes (i.e.
     /// when the last word should stop being held out and the color-wipe
     /// should be complete). `None` means "use the automatic estimate" (see
@@ -73,7 +91,10 @@ pub struct LyricLine {
     /// accurate enough once every word's *start* has been manually tapped,
     /// since the estimate has no way to know when the last word was actually
     /// finished being sung. Set by tapping "End of line" in the fine-tune
-    /// panel while the last word is still playing.
+    /// panel while the last word is still playing. Also used by
+    /// [`countdown_window`] to know when this line's musical break (if any)
+    /// begins, so it's worth setting even if the last word already has its
+    /// own [`word_end_overrides`] entry.
     pub sing_end_override: Option<f64>,
     /// True if this line should start a new on-screen verse block in the
     /// video export - i.e. it was preceded by a blank line in the pasted
@@ -93,6 +114,7 @@ impl LyricLine {
             start: None,
             singer: Singer::default(),
             word_overrides: vec![None; word_count],
+            word_end_overrides: vec![None; word_count],
             sing_end_override: None,
             starts_new_block: true,
         }
@@ -143,6 +165,8 @@ pub struct TimedLine {
     pub singer: Singer,
     /// See [`LyricLine::word_overrides`].
     pub word_overrides: Vec<Option<f64>>,
+    /// See [`LyricLine::word_end_overrides`].
+    pub word_end_overrides: Vec<Option<f64>>,
     /// See [`LyricLine::starts_new_block`].
     pub starts_new_block: bool,
 }
@@ -150,66 +174,48 @@ pub struct TimedLine {
 impl TimedLine {
     #[allow(dead_code)]
     pub fn new(text: String, start: f64, end: f64, singer: Singer) -> Self {
-        Self::with_overrides(text, start, end, singer, Vec::new(), None, true)
+        let mut line = LyricLine::new(text);
+        line.singer = singer;
+        Self::from_line(&line, start, end)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_overrides(
-        text: String,
-        start: f64,
-        end: f64,
-        singer: Singer,
-        word_overrides: Vec<Option<f64>>,
-        sing_end_override: Option<f64>,
-        starts_new_block: bool,
-    ) -> Self {
+    /// Build a resolved [start, end) window for `line`, carrying over its
+    /// word/end/singer overrides. Used by [`resolve_timing`] and by the live
+    /// preview (which needs the same resolution but also wants to know
+    /// which original `LyricLine` each result came from).
+    pub fn from_line(line: &LyricLine, start: f64, end: f64) -> Self {
         let window = (end - start).max(0.0);
-        let sing_end = match sing_end_override {
+        let sing_end = match line.sing_end_override {
             Some(manual) => manual.clamp(start, end),
-            None => (start + estimate_sing_duration(&text, window)).clamp(start, end),
+            None => (start + estimate_sing_duration(&line.text, window)).clamp(start, end),
         };
         Self {
-            text,
+            text: line.text.clone(),
             start,
             end,
             sing_end,
-            singer,
-            word_overrides,
-            starts_new_block,
+            singer: line.singer,
+            word_overrides: line.word_overrides.clone(),
+            word_end_overrides: line.word_end_overrides.clone(),
+            starts_new_block: line.starts_new_block,
         }
     }
 }
-
-/// One sorted line's fields - (start, text, singer, word_overrides,
-/// sing_end_override, starts_new_block) - used only as [`resolve_timing`]'s
-/// working representation.
-type SortedLine<'a> = (f64, &'a str, Singer, &'a [Option<f64>], Option<f64>, bool);
 
 /// Resolve start/end windows for every line. Requires every line to already
 /// have a `start` set (caller should validate this first). Lines are sorted
 /// by start time. The final line's end is `total_duration` (or `start + 4.0`
 /// if `total_duration` is unknown / shorter than that).
 pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<TimedLine> {
-    let mut sorted: Vec<SortedLine> = lines
+    let mut sorted: Vec<(f64, &LyricLine)> = lines
         .iter()
-        .filter_map(|l| {
-            l.start.map(|s| {
-                (
-                    s,
-                    l.text.as_str(),
-                    l.singer,
-                    l.word_overrides.as_slice(),
-                    l.sing_end_override,
-                    l.starts_new_block,
-                )
-            })
-        })
+        .filter_map(|l| l.start.map(|s| (s, l)))
         .collect();
     sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     let mut out = Vec::with_capacity(sorted.len());
     for i in 0..sorted.len() {
-        let (start, text, singer, overrides, sing_end_override, starts_new_block) = sorted[i];
+        let (start, line) = sorted[i];
         let end = if i + 1 < sorted.len() {
             sorted[i + 1].0
         } else {
@@ -218,34 +224,36 @@ pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<T
                 _ => start + 4.0,
             }
         };
-        out.push(TimedLine::with_overrides(
-            text.to_string(),
-            start,
-            end,
-            singer,
-            overrides.to_vec(),
-            sing_end_override,
-            starts_new_block,
-        ));
+        out.push(TimedLine::from_line(line, start, end));
     }
     out
 }
 
-/// A word within a line, with its derived highlight-start time (proportional
-/// to its position within the line's *estimated singing window*, weighted
-/// by character count) - or the user's manually tapped time, if set.
+/// A word within a line, with its derived highlight start/end times
+/// (proportional to its position within the line's *estimated singing
+/// window*, weighted by character count) - or the user's manually tapped
+/// times, if set.
 pub struct TimedWord<'a> {
     #[allow(dead_code)]
     pub text: &'a str,
     pub highlight_at: f64,
+    /// When this word's held-out highlight should stop advancing (and
+    /// freeze, fully colored, until the next word begins). Defaults to the
+    /// next word's `highlight_at` (a continuous wipe with no pause) or, for
+    /// the line's last word, `line.sing_end` - unless manually overridden
+    /// (see [`LyricLine::word_end_overrides`]), in which case a gap can open
+    /// up between this word finishing and the next one starting.
+    pub held_until: f64,
     #[allow(dead_code)]
     pub is_manual: bool,
+    #[allow(dead_code)]
+    pub end_is_manual: bool,
 }
 
-/// Split a timed line into words, each with a derived highlight time
+/// Split a timed line into words, each with a derived highlight start/end
 /// spread across `[line.start, line.sing_end)`, proportional to cumulative
 /// character count - except where the user has manually overridden a
-/// specific word's time, which takes precedence.
+/// specific word's start and/or end time, which takes precedence.
 pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
     let words: Vec<&str> = line.text.split_whitespace().collect();
     if words.is_empty() {
@@ -258,18 +266,33 @@ pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
         .max(1);
     let duration = (line.sing_end - line.start).max(0.05);
 
-    let mut out = Vec::with_capacity(words.len());
+    // Resolve every word's *start* first (manual override, or the automatic
+    // character-weighted estimate), so each word's automatic *end* can then
+    // be defined as "the next word's resolved start" - matching the
+    // historical continuous-wipe behavior whenever no end is manually set.
+    let mut resolved_starts = Vec::with_capacity(words.len());
     let mut chars_so_far = 0usize;
     for (i, w) in words.iter().enumerate() {
         let frac = chars_so_far as f64 / total_chars as f64;
-        let auto_time = line.start + duration * frac;
-        let manual = line.word_overrides.get(i).copied().flatten();
+        let auto_start = line.start + duration * frac;
+        let manual_start = line.word_overrides.get(i).copied().flatten();
+        resolved_starts.push(manual_start.unwrap_or(auto_start));
+        chars_so_far += w.chars().count();
+    }
+
+    let mut out = Vec::with_capacity(words.len());
+    for (i, w) in words.iter().enumerate() {
+        let start = resolved_starts[i];
+        let manual_start = line.word_overrides.get(i).copied().flatten();
+        let default_end = resolved_starts.get(i + 1).copied().unwrap_or(line.sing_end);
+        let manual_end = line.word_end_overrides.get(i).copied().flatten();
         out.push(TimedWord {
             text: w,
-            highlight_at: manual.unwrap_or(auto_time),
-            is_manual: manual.is_some(),
+            highlight_at: start,
+            held_until: manual_end.unwrap_or(default_end).max(start),
+            is_manual: manual_start.is_some(),
+            end_is_manual: manual_end.is_some(),
         });
-        chars_so_far += w.chars().count();
     }
     out
 }
@@ -296,12 +319,14 @@ pub fn word_char_spans(text: &str) -> Vec<(usize, usize)> {
 /// A continuous (not stepped) 0.0..=1.0 fraction of the way across the
 /// currently-singing line, at time `t`. This is what drives the karaoke
 /// color wipe in both the video exporter and the live preview. It's still
-/// *anchored* to each word's own timestamp (from [`word_timings`]) for
+/// *anchored* to each word's own timestamps (from [`word_timings`]) for
 /// accuracy, reaching the right fraction at the right moment for each word,
-/// but linearly interpolates between those anchors instead of jumping, so
-/// the wipe moves continuously through every word's letters (and through a
-/// single word held for several seconds) rather than only snapping at word
-/// boundaries.
+/// but linearly interpolates within `[highlight_at, held_until)` instead of
+/// jumping, so the wipe moves continuously through a word's letters. Once a
+/// word reaches its own `held_until`, the fraction freezes there (fully
+/// colored) until the next word's `highlight_at` is reached - which is
+/// instantaneous (no freeze) for words that don't have a manual end
+/// override, since their `held_until` already *is* the next word's start.
 pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
     let text = normalize_text(&line.text);
     let char_count = text.chars().count().max(1) as f32;
@@ -317,13 +342,18 @@ pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
     for (i, &(offset, len)) in spans.iter().enumerate() {
         let Some(word) = words.get(i) else { continue };
         let word_start = word.highlight_at;
-        let word_end = words
-            .get(i + 1)
-            .map(|w| w.highlight_at)
-            .unwrap_or(line.sing_end.max(word_start + 0.05));
+        let word_end = word.held_until.max(word_start + 0.05);
+        let next_start = words.get(i + 1).map(|w| w.highlight_at);
         let frac_start = offset as f32 / char_count;
         let frac_end = (offset + len) as f32 / char_count;
-        if t < word_end || i + 1 == words.len() {
+        // Stay on this word for as long as `t` hasn't reached the next
+        // word's start yet (holding at `frac_end` once past this word's own
+        // end) - or, for the last word, for the rest of the line.
+        let still_on_this_word = match next_start {
+            Some(next) => t < next,
+            None => true,
+        };
+        if still_on_this_word {
             let dur = (word_end - word_start).max(0.05);
             let local = ((t - word_start) / dur).clamp(0.0, 1.0) as f32;
             return frac_start + (frac_end - frac_start) * local;
@@ -404,6 +434,22 @@ pub fn countdown_window(line: &TimedLine) -> Option<(f64, f64)> {
 /// the live preview so all three agree on when to hide ahead-of-time lines.
 pub fn hide_upcoming_lines(line: &TimedLine, t: f64) -> bool {
     t >= line.sing_end && countdown_window(line).is_some()
+}
+
+/// True once the already-sung display for `line` (this line, plus any
+/// earlier lines still shown highlighted in the same on-screen block)
+/// should be cleared too, during a break long enough to trigger the
+/// countdown indicator - either because it's lingered on screen for
+/// [`SUNG_LINGER_SECS`] since singing finished, or because the countdown is
+/// about to start (whichever comes first, so a short-but-still-qualifying
+/// break doesn't wait out the full linger before the dots appear). Implies
+/// [`hide_upcoming_lines`] is also true. Shared by the video exporter, the
+/// CDG exporter, and the live preview.
+pub fn blank_sung_lines(line: &TimedLine, t: f64) -> bool {
+    match countdown_window(line) {
+        Some((cd_start, _)) => t >= (line.sing_end + SUNG_LINGER_SECS).min(cd_start),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -577,5 +623,70 @@ mod tests {
         let tight = TimedLine::new("hi there".into(), 0.0, 2.0, Singer::Male);
         assert!(!hide_upcoming_lines(&tight, tight.sing_end));
         assert!(!hide_upcoming_lines(&tight, 2.0));
+    }
+
+    #[test]
+    fn blank_sung_lines_waits_for_linger_then_clears_until_countdown() {
+        // 30s gap: sing_end is at 2.0 (2 short words), so cd_start is at
+        // end-4.0. Linger keeps the sung line up for SUNG_LINGER_SECS past
+        // sing_end, then it should blank until the countdown begins.
+        let line = TimedLine::new("hi there".into(), 0.0, 30.0, Singer::Male);
+        let cd_start = countdown_window(&line).unwrap().0;
+        assert!(!blank_sung_lines(&line, line.sing_end)); // just finished, still lingering
+        assert!(!blank_sung_lines(
+            &line,
+            line.sing_end + SUNG_LINGER_SECS - 0.01
+        ));
+        assert!(blank_sung_lines(&line, line.sing_end + SUNG_LINGER_SECS)); // linger's up
+        assert!(blank_sung_lines(&line, cd_start - 0.01)); // still blank right up to the dots
+        assert!(blank_sung_lines(&line, cd_start)); // dots are on; sung line stays cleared
+
+        // Short/no gap -> never blank.
+        let tight = TimedLine::new("hi there".into(), 0.0, 2.0, Singer::Male);
+        assert!(!blank_sung_lines(&tight, tight.sing_end));
+        assert!(!blank_sung_lines(&tight, 2.0));
+    }
+
+    #[test]
+    fn word_end_override_lets_highlight_pause_before_next_word() {
+        let mut lines = vec![LyricLine::new("one two")];
+        lines[0].start = Some(0.0);
+        // Force a wide-open window so "two" would normally start much later
+        // than "one" finishes being highlighted by character count alone.
+        let timed_before = resolve_timing(&lines, Some(20.0));
+        let words_before = word_timings(&timed_before[0]);
+        let one_start = words_before[0].highlight_at;
+        let two_start = words_before[1].highlight_at;
+        assert!(
+            two_start > one_start + 0.1,
+            "test needs a real gap to hold across"
+        );
+
+        // Without an override, "one"'s own held_until already equals "two"'s
+        // start (a continuous wipe) - the fraction should keep climbing
+        // smoothly right up to when "two" begins.
+        let mid = one_start + (two_start - one_start) / 2.0;
+        let frac_no_override = current_line_wipe_fraction(&timed_before[0], mid);
+        assert!(frac_no_override > 0.0 && frac_no_override < 0.5);
+
+        // With an explicit end well before "two" starts, the wipe should
+        // reach full for "one" and then hold there until "two" begins.
+        let one_end = one_start + (two_start - one_start) * 0.25;
+        lines[0].word_end_overrides[0] = Some(one_end);
+        let timed_after = resolve_timing(&lines, Some(20.0));
+        let words_after = word_timings(&timed_after[0]);
+        assert_eq!(words_after[0].held_until, one_end);
+        assert!(words_after[0].end_is_manual);
+
+        let frac_at_end = current_line_wipe_fraction(&timed_after[0], one_end);
+        let frac_holding = current_line_wipe_fraction(&timed_after[0], mid); // past one_end, before two_start
+        assert!(
+            (frac_at_end - frac_holding).abs() < 1e-6,
+            "should hold at the same fraction"
+        );
+        assert!(
+            frac_at_end > frac_no_override,
+            "should reach 'one' full sooner than the default"
+        );
     }
 }

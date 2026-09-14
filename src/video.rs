@@ -22,8 +22,8 @@
 #[cfg(test)]
 use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
-    countdown_window, countdown_window_between, current_line_wipe_fraction, group_into_blocks,
-    hide_upcoming_lines, normalize_text, TimedLine,
+    blank_sung_lines, countdown_window, countdown_window_between, current_line_wipe_fraction,
+    group_into_blocks, hide_upcoming_lines, normalize_text, TimedLine,
 };
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
@@ -406,8 +406,11 @@ fn render_frame(
     // indicator below), hide the not-yet-started lines in this block
     // instead of leaving them sitting on screen the whole time - the screen
     // should read as "done, waiting" (then the countdown dots, then the
-    // next line), not show lyrics that are still a break away.
+    // next line), not show lyrics that are still a break away. During a
+    // long enough break, the already-sung lines get cleared too (after
+    // lingering for a bit) instead of sitting there for the whole break.
     let hide_upcoming = hide_upcoming_lines(&timed_lines[current_idx], t);
+    let blank_sung = blank_sung_lines(&timed_lines[current_idx], t);
 
     let line_height = h * 0.11;
     let font_size = h * 0.055;
@@ -423,31 +426,35 @@ fn render_frame(
         match slot.cmp(&slot_in_block) {
             std::cmp::Ordering::Less => {
                 // Already sung - shown fully in the highlight color.
-                draw_text_line_uniform(
-                    canvas,
-                    regular,
-                    font_size,
-                    w / 2.0,
-                    y,
-                    &text,
-                    highlight,
-                    max_width,
-                );
+                if !blank_sung {
+                    draw_text_line_uniform(
+                        canvas,
+                        regular,
+                        font_size,
+                        w / 2.0,
+                        y,
+                        &text,
+                        highlight,
+                        max_width,
+                    );
+                }
             }
             std::cmp::Ordering::Equal => {
-                let wipe_fraction = current_line_wipe_fraction(line, t);
-                draw_text_line_wipe(
-                    canvas,
-                    bold,
-                    font_size * 1.05,
-                    w / 2.0,
-                    y,
-                    &text,
-                    unsung,
-                    highlight,
-                    wipe_fraction,
-                    max_width,
-                );
+                if !blank_sung {
+                    let wipe_fraction = current_line_wipe_fraction(line, t);
+                    draw_text_line_wipe(
+                        canvas,
+                        bold,
+                        font_size * 1.05,
+                        w / 2.0,
+                        y,
+                        &text,
+                        unsung,
+                        highlight,
+                        wipe_fraction,
+                        max_width,
+                    );
+                }
             }
             std::cmp::Ordering::Greater => {
                 if !hide_upcoming {

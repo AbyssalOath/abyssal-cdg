@@ -25,7 +25,9 @@
 
 use crate::cdg::{CdgColor, CdgWriter, BLANK_TILE, SAFE_COLS};
 use crate::font;
-use crate::lyrics::{countdown_window, countdown_window_between, word_timings, Singer, TimedLine};
+use crate::lyrics::{
+    countdown_window, countdown_window_between, word_timings, Singer, TimedLine, SUNG_LINGER_SECS,
+};
 
 /// The current line gets a 2-row-tall band so it can use 2x-scaled text.
 const TITLE_ROW: u8 = 1;
@@ -391,6 +393,16 @@ pub fn render_cdg(
             // rather than showing a line that's still a break away.
             w.advance_to(line.sing_end);
             clear_row(&mut w, PREVIEW_ROW);
+
+            // Let the just-finished line linger fully highlighted for a
+            // bit, then clear it too (or immediately, if the break is short
+            // enough that the countdown starts before the linger would
+            // finish) - so a long break just shows a blank screen until the
+            // countdown appears, instead of sitting there the whole time.
+            let blank_at = (line.sing_end + SUNG_LINGER_SECS).min(cd_start);
+            w.advance_to(blank_at);
+            clear_band(&mut w, CURRENT_ROW, PREFERRED_SCALE);
+
             let next_singer = timed_lines
                 .get(i + 1)
                 .map(|l| l.singer)
