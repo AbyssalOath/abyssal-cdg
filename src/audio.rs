@@ -281,7 +281,14 @@ mod tests {
     use super::*;
     use std::thread::sleep;
 
-    const TOL: f64 = 0.05;
+    // Generous on purpose: these tests sleep a real wall-clock duration and
+    // then check the clock advanced by about that much. `thread::sleep` only
+    // guarantees *at least* the requested duration - on a loaded CI runner
+    // (macOS GitHub Actions runners in particular) scheduling jitter of a
+    // few hundred ms on a 100ms sleep is normal, not a bug. What these tests
+    // actually care about (stuck at start value, reset to 0, not resuming,
+    // etc.) would be off by whole seconds, so this still catches those.
+    const TOL: f64 = 0.3;
 
     #[test]
     fn starts_at_zero_not_running() {
@@ -295,23 +302,23 @@ mod tests {
         let mut clock = PlaybackClock::new();
         clock.play_from(5.0);
         assert!(clock.is_running());
-        sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(600));
         let pos = clock.position();
-        assert!((pos - 5.1).abs() < TOL, "expected ~5.1, got {pos}");
+        assert!((pos - 5.6).abs() < TOL, "expected ~5.6, got {pos}");
     }
 
     #[test]
     fn pause_freezes_position() {
         let mut clock = PlaybackClock::new();
         clock.play_from(0.0);
-        sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(600));
         clock.pause();
         assert!(!clock.is_running());
         let frozen = clock.position();
         sleep(Duration::from_millis(100));
         // Position must not advance further while paused.
         assert_eq!(clock.position(), frozen);
-        assert!((frozen - 0.1).abs() < TOL, "expected ~0.1, got {frozen}");
+        assert!((frozen - 0.6).abs() < TOL, "expected ~0.6, got {frozen}");
     }
 
     #[test]
