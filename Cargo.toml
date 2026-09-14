@@ -25,7 +25,12 @@ opt-level = 2
 product-name = "Abyssal CDG Creator"
 identifier = "com.lordsodomiser.abyssal-cdg"
 category = "Music"
-icons = ["assets/icons/abyssal-cdg-icon.png"]
+# The "@2x" suffix tells the packager this source is a high-density (retina)
+# asset - without it, the packager treats a 1024px-wide icon as a 1x asset,
+# which isn't a valid ICNS size (1024px only exists as the 512x512@2x icon
+# type) and macOS packaging fails with "No matching IconType". Named "@2x",
+# the same file is correctly read as the 512x512@2x icon instead.
+icons = ["assets/icons/abyssal-cdg-icon@2x.png"]
 
 # eframe (winit/glow) needs an X11 or Wayland stack plus xkbcommon, GTK3 is
 # needed for the native "load audio file" dialog (`rfd`), and ALSA is
