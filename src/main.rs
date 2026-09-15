@@ -2087,14 +2087,15 @@ impl eframe::App for KaraokeApp {
                 .id_source("timing_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // Current end (auto-estimated or overridden) per line,
-                    // keyed by original index - so the End field always
-                    // shows *some* number to edit, even before it's been
-                    // explicitly set.
+                    // Current auto-estimated end per line (used only as a
+                    // greyed-out placeholder hint in the End field, never as
+                    // its actual displayed/editable value - showing the
+                    // live estimate there made an untapped end look like it
+                    // had already been set).
                     let (timed_for_grid, indices_for_grid) = self.resolved_with_indices();
-                    let mut resolved_end = vec![None; self.lines.len()];
+                    let mut estimated_end = vec![None; self.lines.len()];
                     for (t, &orig_idx) in timed_for_grid.iter().zip(indices_for_grid.iter()) {
-                        resolved_end[orig_idx] = Some(t.sing_end);
+                        estimated_end[orig_idx] = Some(t.sing_end);
                     }
 
                     egui::Grid::new("lines_grid")
@@ -2110,8 +2111,8 @@ impl eframe::App for KaraokeApp {
                             let mut commit_end: Option<(usize, String)> = None;
 
                             ui.label(egui::RichText::new("Start").small().weak());
-                            ui.label(egui::RichText::new("End").small().weak());
                             ui.label(egui::RichText::new("Lyric").small().weak());
+                            ui.label(egui::RichText::new("End").small().weak());
                             ui.label(egui::RichText::new("Singer").small().weak());
                             ui.label("");
                             ui.label("");
@@ -2151,29 +2152,6 @@ impl eframe::App for KaraokeApp {
                                     self.start_edit = None;
                                 }
 
-                                // End field.
-                                let editing_end =
-                                    self.end_edit.as_ref().map(|(idx, _)| *idx) == Some(i);
-                                let mut end_buf = if editing_end {
-                                    self.end_edit.as_ref().unwrap().1.clone()
-                                } else {
-                                    match resolved_end[i] {
-                                        Some(e) => lyrics::format_timecode(e),
-                                        None => String::new(),
-                                    }
-                                };
-                                let end_resp = ui.add(
-                                    egui::TextEdit::singleline(&mut end_buf)
-                                        .desired_width(64.0)
-                                        .hint_text("00:00.00"),
-                                );
-                                if end_resp.has_focus() {
-                                    self.end_edit = Some((i, end_buf));
-                                } else if end_resp.lost_focus() {
-                                    commit_end = Some((i, end_buf));
-                                    self.end_edit = None;
-                                }
-
                                 ui.scope(|ui| {
                                     ui.set_max_width(220.0);
                                     let text_label = if is_next {
@@ -2183,6 +2161,37 @@ impl eframe::App for KaraokeApp {
                                     };
                                     ui.add(egui::Label::new(text_label).wrap());
                                 });
+
+                                // End field - stays empty (just like Start
+                                // does before its first tap) until this
+                                // line actually has an explicit end, so
+                                // tapping the start alone never makes it
+                                // look like the end was set too.
+                                let editing_end =
+                                    self.end_edit.as_ref().map(|(idx, _)| *idx) == Some(i);
+                                let mut end_buf = if editing_end {
+                                    self.end_edit.as_ref().unwrap().1.clone()
+                                } else {
+                                    match self.lines[i].sing_end_override {
+                                        Some(e) => lyrics::format_timecode(e),
+                                        None => String::new(),
+                                    }
+                                };
+                                let end_hint = match estimated_end[i] {
+                                    Some(e) => format!("auto {}", lyrics::format_timecode(e)),
+                                    None => "00:00.00".to_string(),
+                                };
+                                let end_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut end_buf)
+                                        .desired_width(64.0)
+                                        .hint_text(end_hint),
+                                );
+                                if end_resp.has_focus() {
+                                    self.end_edit = Some((i, end_buf));
+                                } else if end_resp.lost_focus() {
+                                    commit_end = Some((i, end_buf));
+                                    self.end_edit = None;
+                                }
 
                                 egui::ComboBox::from_id_source(("singer", i))
                                     .width(82.0)
