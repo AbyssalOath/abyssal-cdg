@@ -407,4 +407,42 @@ mod tests {
         let second = session.resolve(250.0, 40.0);
         assert_eq!(first, second);
     }
+
+    #[test]
+    fn word_body_drag_has_room_to_move_when_bounded_by_the_whole_line() {
+        // Regression test: word-level drag bounds used to be derived from
+        // the immediate neighbor word's position, which by default touches
+        // this word's own end exactly (words default to a continuous,
+        // gapless wipe) - leaving *zero* slack for a body-drag to move a
+        // word at all (`max_start` collapsed to `orig_start`). Bounding by
+        // the line's own `[start, sing_end]` window instead (what
+        // `main.rs`'s timeline now does) must leave real room to move.
+        use crate::lyrics::{resolve_timing, word_timings, LyricLine};
+
+        let mut lines = vec![LyricLine::new("one two three four five")];
+        lines[0].start = Some(0.0);
+        let timed = resolve_timing(&lines, Some(20.0)); // generous window past the estimate
+        let line = &timed[0];
+        let words = word_timings(line);
+        assert!(
+            line.sing_end < line.end,
+            "test needs slack in the line's own window"
+        );
+
+        // A middle word touches its neighbors exactly by default.
+        let w = 2;
+        assert_eq!(words[w].held_until, words[w + 1].highlight_at);
+
+        let bounds = DragBounds {
+            min_start: line.start,
+            max_sing_end: line.sing_end,
+        };
+        let (new_start, new_end) =
+            apply_body_drag(words[w].highlight_at, words[w].held_until, 0.1, bounds);
+        assert!(
+            new_start > words[w].highlight_at,
+            "body drag should have moved the word right"
+        );
+        assert!((new_end - new_start - (words[w].held_until - words[w].highlight_at)).abs() < 1e-9);
+    }
 }

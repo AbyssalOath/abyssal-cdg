@@ -1344,23 +1344,26 @@ impl KaraokeApp {
                         if let Some(pos) = bubble_response.interact_pointer_pos() {
                             let local_x = pos.x - bubble_rect.left();
                             let mode = timeline::classify_drag(local_x, bubble_rect.width());
-                            // Unlike a line's `sing_end`, a word's default
-                            // `held_until` is anchored to the *next* word's
-                            // start (or the line's `sing_end`), not derived
-                            // from this word's own start - so trimming the
-                            // left edge never needs to pin the end first.
-                            let min_start = if w > 0 {
-                                words[w - 1].held_until
-                            } else {
-                                line.start
-                            };
-                            let max_end = words
-                                .get(w + 1)
-                                .map(|nw| nw.highlight_at)
-                                .unwrap_or(line.sing_end);
+                            // Bound by the *line's* own singing window, not
+                            // the immediate neighbor's position - words
+                            // default to touching edge-to-edge with zero
+                            // gap, so bounding a drag by a neighbor's
+                            // current position would leave zero room to
+                            // move (a body-drag's available range is its
+                            // *current* span subtracted from the bound, and
+                            // that span already exactly fills the gap to a
+                            // touching neighbor). Letting a word's bubble
+                            // freely overlap a neighbor's default position is
+                            // harmless for the wipe rendering, which always
+                            // hands off at the *next* word's own start
+                            // regardless of a dragged word's start/end - the
+                            // one thing worth keeping in mind is that this
+                            // gives up automatic protection against
+                            // reordering words relative to each other if you
+                            // drag one very far past its neighbors.
                             let bounds = timeline::DragBounds {
-                                min_start,
-                                max_sing_end: max_end,
+                                min_start: line.start,
+                                max_sing_end: line.sing_end,
                             };
                             self.timeline_drag = Some(TimelineDrag {
                                 line_idx: sel_orig_idx,
