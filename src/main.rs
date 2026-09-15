@@ -1179,22 +1179,6 @@ impl KaraokeApp {
             return;
         }
 
-        // The word row always shows *some* line's words rather than sitting
-        // empty until you click a bubble: the explicitly selected line if
-        // there is one, else whichever line the playhead is currently in,
-        // else just the first timed line (guaranteed to exist - `timed` was
-        // already confirmed non-empty above).
-        let t_now = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
-        let selected_pos = self
-            .word_tap_line
-            .and_then(|orig_idx| indices.iter().position(|&i| i == orig_idx))
-            .or_else(|| {
-                timed
-                    .iter()
-                    .position(|tl| t_now >= tl.start && t_now < tl.end)
-            })
-            .unwrap_or(0);
-
         let ruler_h = 16.0;
         let line_row_h = 28.0;
         let row_gap = 6.0;
@@ -1364,17 +1348,25 @@ impl KaraokeApp {
             }
         }
 
-        // Word bubbles for the line found above - always drawn (see
-        // `selected_pos`'s fallback chain), so words are visible without
-        // first having to click a line's bubble.
+        // Word bubbles for *every* line, not just a selected one - drawn
+        // the whole time, aligned under each line's own span in the row
+        // below, so fine-tuning individual words never requires first
+        // clicking a line's bubble to "activate" it.
         let word_row_top = line_row_top + line_row_h + row_gap;
-        {
-            let pos = selected_pos;
-            let sel_orig_idx = indices[pos];
-            let line = &timed[pos];
+        for (i, line) in timed.iter().enumerate() {
+            let orig_idx = indices[i];
+            // Quick reject on the line's own [start, end) span (its words'
+            // `held_until` can extend as far as `end` - see the first/last
+            // word special-casing below) before bothering to compute word
+            // timings for a line that's entirely off-screen anyway.
+            let line_x0 = self.timeline_view.time_to_x(rect.left(), line.start);
+            let line_x1 = self.timeline_view.time_to_x(rect.left(), line.end);
+            if line_x1 < rect.left() || line_x0 > rect.right() {
+                continue;
+            }
             let words = lyrics::word_timings(line);
-            let prev_line_sing_end = if pos > 0 {
-                Some(timed[pos - 1].sing_end)
+            let prev_line_sing_end = if i > 0 {
+                Some(timed[i - 1].sing_end)
             } else {
                 None
             };
@@ -1393,7 +1385,7 @@ impl KaraokeApp {
                     ),
                 );
 
-                let id = ui.id().with(("timeline_word_bubble", sel_orig_idx, w));
+                let id = ui.id().with(("timeline_word_bubble", orig_idx, w));
                 let bubble_response = ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
 
                 let (_, highlight) = self.singer_colors(line.singer);
@@ -1418,7 +1410,7 @@ impl KaraokeApp {
                 let active_mode = self
                     .timeline_drag
                     .as_ref()
-                    .filter(|d| d.line_idx == sel_orig_idx && d.target == target)
+                    .filter(|d| d.line_idx == orig_idx && d.target == target)
                     .map(|d| d.session.mode);
                 if let Some(icon) = timeline_cursor_icon(active_mode, &bubble_response, bubble_rect)
                 {
@@ -1474,7 +1466,7 @@ impl KaraokeApp {
                             max_sing_end,
                         };
                         self.timeline_drag = Some(TimelineDrag {
-                            line_idx: sel_orig_idx,
+                            line_idx: orig_idx,
                             target,
                             session: timeline::DragSession::start(
                                 mode,
@@ -1492,10 +1484,10 @@ impl KaraokeApp {
                         let resolved = self
                             .timeline_drag
                             .as_ref()
-                            .filter(|d| d.line_idx == sel_orig_idx && d.target == target)
+                            .filter(|d| d.line_idx == orig_idx && d.target == target)
                             .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
                         if let Some((new_start, new_end)) = resolved {
-                            if let Some(l) = self.lines.get_mut(sel_orig_idx) {
+                            if let Some(l) = self.lines.get_mut(orig_idx) {
                                 if let Some(s) = new_start {
                                     if let Some(slot) = l.word_overrides.get_mut(w) {
                                         *slot = Some(s);
@@ -1525,7 +1517,7 @@ impl KaraokeApp {
 
                 if bubble_response.drag_stopped()
                     && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
-                        == Some((sel_orig_idx, target))
+                        == Some((orig_idx, target))
                 {
                     self.timeline_drag = None;
                 }
