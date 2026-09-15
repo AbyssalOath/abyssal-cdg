@@ -151,6 +151,113 @@ pub fn parse_pasted_lyrics(raw: &str) -> Vec<LyricLine> {
     result
 }
 
+/// Formats seconds as `MM:SS.CC` (centiseconds) for the editable start/end
+/// time fields - more precision than [`crate::format_time`]'s coarser
+/// deciseconds display used elsewhere, since these are meant to be typed
+/// back in. Negative/non-finite input formats as `00:00.00` rather than
+/// panicking or producing a nonsense string, since a partially-edited field
+/// can transiently hold one.
+pub fn format_timecode(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "00:00.00".to_string();
+    }
+    let total_cs = (secs * 100.0).round() as i64;
+    let m = total_cs / 6000;
+    let s = (total_cs / 100) % 60;
+    let c = total_cs % 100;
+    format!("{m:02}:{s:02}.{c:02}")
+}
+
+/// Parses a `[MM:]SS[.frac]` timestamp (as produced by [`format_timecode`],
+/// but tolerant of a missing minutes part, missing/extra fractional
+/// digits, and surrounding whitespace) back into seconds. Returns `None`
+/// for anything that doesn't look like a time (rather than a default of
+/// `0.0`, so callers can tell "invalid" apart from "typed zero").
+pub fn parse_timecode(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (mins, secs_part) = match s.rsplit_once(':') {
+        Some((m, rest)) => (m.trim().parse::<f64>().ok()?, rest),
+        None => (0.0, s),
+    };
+    let secs = secs_part.trim().parse::<f64>().ok()?;
+    if !mins.is_finite() || !secs.is_finite() || mins < 0.0 || secs < 0.0 {
+        return None;
+    }
+    Some(mins * 60.0 + secs)
+}
+
+/// Checks whether setting `lines[idx]`'s `start` to `new_start` is valid -
+/// non-negative, before this line's own explicit end (if any), and not
+/// before the previous line's explicit end (if any) - *without* applying
+/// it. Callers (tapping, dragging, or typing a new start) should only
+/// commit the change once this returns `Ok`, and show the message to the
+/// user otherwise.
+///
+/// Deliberately only checks against an explicit [`LyricLine::sing_end_override`]
+/// on either side, not the automatic estimate - the estimate shifts as
+/// timing fills in around it, so treating it as a hard wall would reject
+/// perfectly reasonable taps just because a neighboring line hasn't been
+/// fine-tuned yet.
+pub fn check_start_change(lines: &[LyricLine], idx: usize, new_start: f64) -> Result<(), String> {
+    if !new_start.is_finite() || new_start < 0.0 {
+        return Err("Start time can't be negative.".to_string());
+    }
+    if let Some(end) = lines[idx].sing_end_override {
+        if new_start >= end {
+            return Err(format!(
+                "Start ({}) must be before this line's own end ({}).",
+                format_timecode(new_start),
+                format_timecode(end)
+            ));
+        }
+    }
+    if idx > 0 {
+        if let Some(prev_end) = lines[idx - 1].sing_end_override {
+            if new_start < prev_end {
+                return Err(format!(
+                    "Start ({}) can't be before the previous line ends ({}).",
+                    format_timecode(new_start),
+                    format_timecode(prev_end)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks whether setting `lines[idx]`'s [`LyricLine::sing_end_override`] to
+/// `new_end` is valid - after this line's own start, and not after the
+/// next line's start (if that's already been set) - *without* applying it.
+/// See [`check_start_change`] for why only explicit neighboring times are
+/// checked, not automatic estimates.
+pub fn check_end_change(lines: &[LyricLine], idx: usize, new_end: f64) -> Result<(), String> {
+    let Some(start) = lines[idx].start else {
+        return Err("Set this line's start before its end.".to_string());
+    };
+    if !new_end.is_finite() || new_end <= start {
+        return Err(format!(
+            "End ({}) must be after this line's start ({}).",
+            format_timecode(new_end),
+            format_timecode(start)
+        ));
+    }
+    if let Some(next) = lines.get(idx + 1) {
+        if let Some(next_start) = next.start {
+            if new_end > next_start {
+                return Err(format!(
+                    "End ({}) can't be after the next line starts ({}).",
+                    format_timecode(new_end),
+                    format_timecode(next_start)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A line with its resolved [start, end) window, used at export/preview time.
 #[derive(Clone, Debug)]
 pub struct TimedLine {
@@ -688,5 +795,79 @@ mod tests {
             frac_at_end > frac_no_override,
             "should reach 'one' full sooner than the default"
         );
+    }
+
+    #[test]
+    fn timecode_format_and_parse_round_trip() {
+        assert_eq!(format_timecode(0.0), "00:00.00");
+        assert_eq!(format_timecode(65.5), "01:05.50");
+        assert_eq!(format_timecode(-1.0), "00:00.00");
+        assert_eq!(format_timecode(f64::NAN), "00:00.00");
+
+        assert_eq!(parse_timecode("01:05.50"), Some(65.5));
+        assert_eq!(parse_timecode("1:05.5"), Some(65.5));
+        assert_eq!(parse_timecode("5.5"), Some(5.5));
+        assert_eq!(parse_timecode("5"), Some(5.0));
+        assert_eq!(parse_timecode("  01:05.50  "), Some(65.5));
+        assert_eq!(parse_timecode(""), None);
+        assert_eq!(parse_timecode("abc"), None);
+        assert_eq!(parse_timecode("-1:00"), None);
+
+        for secs in [0.0, 1.23, 65.5, 3599.99] {
+            let formatted = format_timecode(secs);
+            let parsed = parse_timecode(&formatted).unwrap();
+            assert!(
+                (parsed - secs).abs() < 0.005,
+                "{secs} round-tripped to {parsed}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_start_change_rejects_negative_and_own_end_crossing() {
+        let mut lines = vec![LyricLine::new("a")];
+        lines[0].sing_end_override = Some(5.0);
+        assert!(check_start_change(&lines, 0, -1.0).is_err());
+        assert!(check_start_change(&lines, 0, 5.0).is_err()); // not strictly before own end
+        assert!(check_start_change(&lines, 0, 4.9).is_ok());
+    }
+
+    #[test]
+    fn check_start_change_rejects_overlap_with_previous_lines_explicit_end() {
+        let mut lines = vec![LyricLine::new("a"), LyricLine::new("b")];
+        lines[0].start = Some(0.0);
+        lines[0].sing_end_override = Some(3.0);
+        assert!(check_start_change(&lines, 1, 2.9).is_err());
+        assert!(check_start_change(&lines, 1, 3.0).is_ok());
+    }
+
+    #[test]
+    fn check_start_change_allows_anything_when_previous_end_is_only_estimated() {
+        // No explicit sing_end_override on the previous line - shouldn't be
+        // treated as a hard wall, since the estimate will keep shifting as
+        // more lines get timed.
+        let mut lines = vec![LyricLine::new("a"), LyricLine::new("b")];
+        lines[0].start = Some(0.0);
+        assert!(check_start_change(&lines, 1, 0.01).is_ok());
+    }
+
+    #[test]
+    fn check_end_change_requires_a_start_and_must_come_after_it() {
+        let lines = vec![LyricLine::new("a")];
+        assert!(check_end_change(&lines, 0, 5.0).is_err()); // no start yet
+
+        let mut lines = vec![LyricLine::new("a")];
+        lines[0].start = Some(5.0);
+        assert!(check_end_change(&lines, 0, 5.0).is_err()); // not strictly after
+        assert!(check_end_change(&lines, 0, 5.1).is_ok());
+    }
+
+    #[test]
+    fn check_end_change_rejects_overlap_with_next_lines_start() {
+        let mut lines = vec![LyricLine::new("a"), LyricLine::new("b")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(5.0);
+        assert!(check_end_change(&lines, 0, 5.1).is_err());
+        assert!(check_end_change(&lines, 0, 5.0).is_ok());
     }
 }
