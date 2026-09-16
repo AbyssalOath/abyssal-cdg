@@ -28,6 +28,8 @@ use crate::font;
 use crate::lyrics::{
     countdown_window, countdown_window_between, word_timings, Singer, TimedLine, SUNG_LINGER_SECS,
 };
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 /// The current line gets a 2-row-tall band so it can use 2x-scaled text.
 const TITLE_ROW: u8 = 1;
@@ -256,6 +258,38 @@ pub fn title_card_end(timed_lines: &[TimedLine]) -> f64 {
     }
 }
 
+/// Where a `.cdg`'s paired audio file needs to live for "MP3+G"-style
+/// pickup by karaoke players: the *same* directory and base filename as
+/// `cdg_path`, keeping `audio_path`'s own extension (despite the
+/// convention's name, most players accept whatever format the audio
+/// actually is - it doesn't have to literally be re-encoded to `.mp3`).
+pub fn paired_audio_path(audio_path: &Path, cdg_path: &Path) -> PathBuf {
+    let ext = audio_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp3");
+    cdg_path.with_extension(ext)
+}
+
+/// Copies `audio_path` to sit next to `cdg_path` (see [`paired_audio_path`])
+/// so the pair is ready for karaoke-player pickup without a manual copy or
+/// rename. A no-op (not an error) if the audio is already exactly there -
+/// e.g. re-exporting a `.cdg` into the same folder the audio already lives
+/// in, under a name that already matches.
+pub fn copy_paired_audio(audio_path: &Path, cdg_path: &Path) -> Result<PathBuf> {
+    let dest = paired_audio_path(audio_path, cdg_path);
+    let already_there = std::fs::canonicalize(audio_path)
+        .ok()
+        .zip(std::fs::canonicalize(&dest).ok())
+        .is_some_and(|(a, b)| a == b);
+    if already_there {
+        return Ok(dest);
+    }
+    std::fs::copy(audio_path, &dest)
+        .with_context(|| format!("failed to copy audio to {}", dest.display()))?;
+    Ok(dest)
+}
+
 /// Column positions for the 4 countdown markers, chosen for exact
 /// left-right symmetry around the canvas's true center (23.5 within the
 /// 0..47 safe-column span - an even number of columns has no single center
@@ -421,6 +455,65 @@ mod tests {
     use super::*;
     use crate::lyrics::resolve_timing;
     use crate::lyrics::LyricLine;
+
+    #[test]
+    fn paired_audio_path_keeps_the_audios_own_extension() {
+        let cdg = Path::new("/music/karaoke/My Song.cdg");
+        assert_eq!(
+            paired_audio_path(Path::new("/downloads/original.mp3"), cdg),
+            PathBuf::from("/music/karaoke/My Song.mp3")
+        );
+        assert_eq!(
+            paired_audio_path(Path::new("/downloads/original.flac"), cdg),
+            PathBuf::from("/music/karaoke/My Song.flac")
+        );
+        // No extension at all on the source - falls back to .mp3, matching
+        // the "MP3+G" convention's usual name.
+        assert_eq!(
+            paired_audio_path(Path::new("/downloads/original"), cdg),
+            PathBuf::from("/music/karaoke/My Song.mp3")
+        );
+    }
+
+    #[test]
+    fn copy_paired_audio_copies_to_the_expected_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-cdg-export-test-copy-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio_src = dir.join("source.wav");
+        std::fs::write(&audio_src, b"fake audio bytes").unwrap();
+        let cdg_path = dir.join("karaoke.cdg");
+
+        let dest = copy_paired_audio(&audio_src, &cdg_path).unwrap();
+        assert_eq!(dest, dir.join("karaoke.wav"));
+        assert!(dest.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"fake audio bytes");
+        // The source must be untouched (this is a copy, not a move).
+        assert!(audio_src.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_paired_audio_is_a_no_op_when_already_in_place() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-cdg-export-test-noop-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The audio is already sitting exactly where pairing would put it.
+        let audio_path = dir.join("karaoke.mp3");
+        std::fs::write(&audio_path, b"already here").unwrap();
+        let cdg_path = dir.join("karaoke.cdg");
+
+        let dest = copy_paired_audio(&audio_path, &cdg_path).unwrap();
+        assert_eq!(dest, audio_path);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"already here");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn renders_valid_packet_stream() {

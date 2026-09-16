@@ -1245,10 +1245,26 @@ impl KaraokeApp {
                 let r = std::fs::write(&cdg_path, &bytes)
                     .map(|()| cdg_path.clone())
                     .map_err(|e| e.to_string());
+                let cdg_written = r.is_ok();
                 outcomes.push(ExportOutcome {
                     label: "CDG file",
                     result: r,
                 });
+
+                // Auto-pair the loaded audio next to the .cdg (same base
+                // filename) so it's ready for "MP3+G"-style pickup by
+                // karaoke players, instead of a manual copy/rename step.
+                if cdg_written {
+                    if let Some(audio_path) = &audio_path {
+                        let paired = export::copy_paired_audio(audio_path, &cdg_path)
+                            .map_err(|e| e.to_string());
+                        outcomes.push(ExportOutcome {
+                            label: "Paired audio",
+                            result: paired,
+                        });
+                    }
+                }
+
                 phase_index += 1;
                 set_progress(phase_index, 0.0);
             }
