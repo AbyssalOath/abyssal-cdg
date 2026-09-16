@@ -12,6 +12,7 @@ mod font;
 mod formats;
 mod lyrics;
 mod project;
+mod recent;
 mod timeline;
 mod video;
 mod vocals;
@@ -189,6 +190,14 @@ struct KaraokeApp {
     color_artist: egui::Color32,
     color_screaming_unsung: egui::Color32,
     color_screaming_highlight: egui::Color32,
+    /// Which preset (if any) the current colors were last set from - purely
+    /// cosmetic (which option the dropdown shows selected); manually
+    /// tweaking an individual color afterward doesn't change or clear it.
+    color_preset: ColorPreset,
+
+    /// Recently opened/saved project and audio files, for the "Recent"
+    /// menu - persisted to disk (see `recent.rs`) so it survives restarts.
+    recent_files: recent::RecentFiles,
 
     status: String,
 
@@ -296,6 +305,47 @@ impl InstrumentalFormat {
     }
 }
 
+/// A named, curated set of all 12 colors, applied all at once - so a
+/// first-time user gets a good-looking result without ever opening the
+/// "Colors" section, and someone who does want to customize can start from
+/// a preset closer to what they want instead of the single hardcoded
+/// default. Picking one doesn't stick to future manual edits - it's a
+/// one-time "set all these colors now", not a persistent mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ColorPreset {
+    #[default]
+    Classic,
+    HighContrast,
+    Sunset,
+    Ocean,
+}
+
+impl ColorPreset {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::HighContrast => "High Contrast",
+            Self::Sunset => "Sunset",
+            Self::Ocean => "Ocean",
+        }
+    }
+
+    fn palette(self) -> Palette {
+        match self {
+            Self::Classic => Palette::default(),
+            Self::HighContrast => Palette::high_contrast(),
+            Self::Sunset => Palette::sunset(),
+            Self::Ocean => Palette::ocean(),
+        }
+    }
+}
+const ALL_COLOR_PRESETS: [ColorPreset; 4] = [
+    ColorPreset::Classic,
+    ColorPreset::HighContrast,
+    ColorPreset::Sunset,
+    ColorPreset::Ocean,
+];
+
 /// One output's result from a combined export - a combined export can
 /// partially succeed (e.g. ffmpeg missing but audio-separator present), so
 /// each requested output is tracked and reported independently.
@@ -380,6 +430,8 @@ impl KaraokeApp {
             color_artist: color32_from_cdg(p.artist),
             color_screaming_unsung: color32_from_cdg(p.screaming_unsung),
             color_screaming_highlight: color32_from_cdg(p.screaming_highlight),
+            color_preset: ColorPreset::default(),
+            recent_files: recent::load(APP_ID),
             status: String::new(),
             seek_drag_value: None,
             video_resolution: Resolution::Hd1080,
@@ -452,6 +504,24 @@ impl KaraokeApp {
             Singer::Duet => (self.color_duet_unsung, self.color_duet_highlight),
             Singer::Screaming => (self.color_screaming_unsung, self.color_screaming_highlight),
         }
+    }
+
+    /// Sets every color at once from a named preset - see [`ColorPreset`].
+    fn apply_color_preset(&mut self, preset: ColorPreset) {
+        let p = preset.palette();
+        self.color_bg = color32_from_cdg(p.background);
+        self.color_male_unsung = color32_from_cdg(p.male_unsung);
+        self.color_male_highlight = color32_from_cdg(p.male_highlight);
+        self.color_female_unsung = color32_from_cdg(p.female_unsung);
+        self.color_female_highlight = color32_from_cdg(p.female_highlight);
+        self.color_duet_unsung = color32_from_cdg(p.duet_unsung);
+        self.color_duet_highlight = color32_from_cdg(p.duet_highlight);
+        self.color_preview = color32_from_cdg(p.preview);
+        self.color_title = color32_from_cdg(p.title);
+        self.color_artist = color32_from_cdg(p.artist);
+        self.color_screaming_unsung = color32_from_cdg(p.screaming_unsung);
+        self.color_screaming_highlight = color32_from_cdg(p.screaming_highlight);
+        self.color_preset = preset;
     }
 
     /// Resolve current lyric timing into a `(timed_lines, total_duration)`
@@ -631,6 +701,10 @@ impl KaraokeApp {
         self.color_artist = color32_from_rgb_color(c.artist);
         self.color_screaming_unsung = color32_from_rgb_color(c.screaming_unsung);
         self.color_screaming_highlight = color32_from_rgb_color(c.screaming_highlight);
+        // A loaded project's colors may or may not match any preset - reset
+        // to the neutral default label rather than keep showing whatever
+        // preset happened to be selected before.
+        self.color_preset = ColorPreset::default();
 
         self.recompute_next_untimed();
         self.word_tap_line = None;
@@ -721,6 +795,8 @@ impl KaraokeApp {
                 self.current_project_path = Some(path.to_path_buf());
                 self.last_saved_snapshot = Some(project);
                 self.status = format!("Saved project to {}", path.display());
+                recent::record_project(APP_ID, path);
+                self.recent_files = recent::load(APP_ID);
             }
             Err(e) => {
                 self.status = format!("Couldn't save project: {e}");
@@ -745,6 +821,8 @@ impl KaraokeApp {
         match project::ProjectFile::load_from_file(&path) {
             Ok(loaded) => {
                 self.apply_project_file(loaded.clone());
+                recent::record_project(APP_ID, &path);
+                self.recent_files = recent::load(APP_ID);
                 self.current_project_path = Some(path);
                 // The live state now matches what's on disk - not "unsaved
                 // work" from `on_exit`'s point of view.
@@ -754,6 +832,57 @@ impl KaraokeApp {
                 self.status = format!("Couldn't load project {}: {e}", path.display());
             }
         }
+    }
+
+    /// Dropdown of recently opened/saved project and audio files - lets a
+    /// returning user pick up a previous session without hunting through a
+    /// file picker for something they already located once. Entries are
+    /// cloned out of `self.recent_files` before iterating so clicking one
+    /// (which needs `&mut self`) doesn't fight the borrow checker.
+    fn draw_recent_files_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("🕘 Recent", |ui| {
+            let file_label = |path: &Path| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string())
+            };
+            if self.recent_files.projects.is_empty() && self.recent_files.audio.is_empty() {
+                ui.label(egui::RichText::new("(nothing yet)").weak());
+                return;
+            }
+            if !self.recent_files.projects.is_empty() {
+                ui.label(egui::RichText::new("Projects").small().weak());
+                for path in self.recent_files.projects.clone() {
+                    if ui.button(file_label(&path)).clicked() {
+                        ui.close_menu();
+                        if !path.exists() {
+                            self.status = format!("\"{}\" no longer exists.", file_label(&path));
+                        } else if self.project_busy() {
+                            self.status =
+                                "Can't load a project while an export is running.".to_string();
+                        } else {
+                            self.load_project_file(path);
+                        }
+                    }
+                }
+            }
+            if !self.recent_files.audio.is_empty() {
+                if !self.recent_files.projects.is_empty() {
+                    ui.separator();
+                }
+                ui.label(egui::RichText::new("Audio").small().weak());
+                for path in self.recent_files.audio.clone() {
+                    if ui.button(file_label(&path)).clicked() {
+                        ui.close_menu();
+                        if !path.exists() {
+                            self.status = format!("\"{}\" no longer exists.", file_label(&path));
+                        } else {
+                            self.load_audio(path);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Draws the full-window "recover previous session?" prompt shown when
@@ -879,6 +1008,8 @@ impl KaraokeApp {
             match audio.load(path.clone()) {
                 Ok(()) => {
                     self.status = "Audio loaded.".to_string();
+                    recent::record_audio(APP_ID, &path);
+                    self.recent_files = recent::load(APP_ID);
                     self.start_waveform_job(path);
                 }
                 Err(e) => {
@@ -1012,6 +1143,75 @@ impl KaraokeApp {
         }
     }
 
+    /// Routes files dropped onto the window to whichever loader matches
+    /// their extension - audio, a lyrics file (any of the auto-detected
+    /// formats `load_lyrics_file` handles), or a `.abyzl` project - so
+    /// dragging a file in works as an alternative to every "Load…" button,
+    /// not just one of them. Multiple files dropped at once (e.g. an audio
+    /// file and a lyrics file together) are each routed independently.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            let Some(path) = file.path else {
+                let name = if file.name.is_empty() {
+                    "dropped file".to_string()
+                } else {
+                    file.name.clone()
+                };
+                self.status = format!("Couldn't read \"{name}\" - no file path was given.");
+                continue;
+            };
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            match ext.as_str() {
+                "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => self.load_audio(path),
+                "lrc" | "txt" | "kok" => self.load_lyrics_file(&path),
+                project::FILE_EXTENSION => {
+                    if self.project_busy() {
+                        self.status =
+                            "Can't load a project while an export is running.".to_string();
+                    } else {
+                        self.load_project_file(path);
+                    }
+                }
+                _ => {
+                    self.status = format!(
+                        "Dropped file \"{}\" isn't a recognized audio, lyrics, or .{} project \
+                         file.",
+                        path.display(),
+                        project::FILE_EXTENSION
+                    );
+                }
+            }
+        }
+    }
+
+    /// Full-window "drop it here" overlay shown while a file is being
+    /// dragged over the window (before it's actually dropped) - otherwise
+    /// drag-and-drop would be an invisible feature nothing on screen hints
+    /// at.
+    fn draw_drop_hint(&self, ctx: &egui::Context) {
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_hint_overlay"),
+        ));
+        let screen = ctx.screen_rect();
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
+        painter.text(
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            format!(
+                "Drop an audio, lyrics, or .{} project file",
+                project::FILE_EXTENSION
+            ),
+            egui::FontId::proportional(24.0),
+            egui::Color32::WHITE,
+        );
+    }
+
     /// Tap along: the first press for a line sets its start, the next
     /// press sets its end (see [`TapPhase`]), then advances to the next
     /// line's start - so both boundaries come from tapping in real time
@@ -1086,6 +1286,30 @@ impl KaraokeApp {
             Some(l) if l.start.is_some() => TapPhase::End,
             _ => TapPhase::Start,
         };
+    }
+
+    /// The line the M/F/D/S singer-assignment shortcuts apply to -
+    /// whichever line is still waiting to be tapped, if tapping isn't done
+    /// yet (so a voice can be set right before tapping its start without
+    /// touching the mouse), otherwise whichever line the fine-tune-words
+    /// panel is currently following.
+    fn current_singer_assignment_target(&self) -> Option<usize> {
+        if self.next_untimed < self.lines.len() {
+            Some(self.next_untimed)
+        } else {
+            self.word_tap_line
+        }
+    }
+
+    fn assign_singer_to_current_line(&mut self, singer: Singer) {
+        let Some(idx) = self.current_singer_assignment_target() else {
+            self.status = "No line to assign a singer to right now.".to_string();
+            return;
+        };
+        if let Some(line) = self.lines.get_mut(idx) {
+            line.singer = singer;
+            self.status = format!("Line {} set to {}.", idx + 1, singer.label());
+        }
     }
 
     /// While the fine-tune-words panel is open and the song is playing,
@@ -1260,6 +1484,33 @@ impl KaraokeApp {
     /// per-output settings (video resolution/vocal removal, instrumental
     /// format) - replaces three separate export buttons and three separate
     /// save dialogs with one folder pick and one click.
+    /// If exporting right now would silently drop content because the lyric
+    /// timing isn't complete, returns why - `resolve_timing` (used by both
+    /// the CDG encoder and the video renderer) simply skips any line
+    /// without a start timestamp, so a partially-timed song would export
+    /// "successfully" while quietly missing lines instead of failing
+    /// loudly. Instrumental-only exports never touch lyric timing at all,
+    /// so they're never blocked by this.
+    fn missing_timing_reason(&self) -> Option<String> {
+        if !(self.export_cdg || self.export_video) {
+            return None;
+        }
+        let total = self.lines.len();
+        let timed_count = self.lines.iter().filter(|l| l.start.is_some()).count();
+        if timed_count == 0 {
+            Some("No lines are timed yet - tap along with the song first.".to_string())
+        } else if timed_count < total {
+            Some(format!(
+                "{} of {total} line(s) don't have a timestamp yet - they'd be silently left \
+                 out of the .cdg/video otherwise. Tap along (or set times manually) for every \
+                 line before exporting.",
+                total - timed_count
+            ))
+        } else {
+            None
+        }
+    }
+
     fn draw_export_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_export_dialog {
             return;
@@ -1358,10 +1609,17 @@ impl KaraokeApp {
                     };
                 });
 
+                let missing_timing = self.missing_timing_reason();
+                if let Some(reason) = &missing_timing {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::from_rgb(230, 160, 40), format!("⚠ {reason}"));
+                }
+
                 ui.add_space(10.0);
                 let can_export = (self.export_cdg || self.export_video || self.export_instrumental)
                     && self.export_folder.is_some()
-                    && !self.export_base_name.trim().is_empty();
+                    && !self.export_base_name.trim().is_empty()
+                    && missing_timing.is_none();
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(can_export, |ui| {
                         if ui.button("Export").clicked() {
@@ -1383,9 +1641,8 @@ impl KaraokeApp {
             self.status = "An export is already in progress.".to_string();
             return;
         }
-        let timed_count = self.lines.iter().filter(|l| l.start.is_some()).count();
-        if timed_count == 0 {
-            self.status = "No lines are timed yet - tap along with the song first.".to_string();
+        if let Some(reason) = self.missing_timing_reason() {
+            self.status = reason;
             return;
         }
         let do_cdg = self.export_cdg;
@@ -2362,6 +2619,11 @@ impl eframe::App for KaraokeApp {
             return;
         }
 
+        self.handle_dropped_files(ctx);
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            self.draw_drop_hint(ctx);
+        }
+
         // Periodic crash-recovery autosave, while there's something worth
         // recovering. Cheap (a small JSON write), so it's fine to do
         // synchronously on the UI thread rather than a background one.
@@ -2449,6 +2711,26 @@ impl eframe::App for KaraokeApp {
                     self.redo();
                 }
             }
+            // Singer assignment - M/F/D/S set the voice of whichever line
+            // is next up to tap (mid-tapping) or, once everything's timed,
+            // whichever line the fine-tune-words panel is following - so a
+            // duet/multi-voice song's singer switches can be set with the
+            // same "hands stay on the keyboard while playing" flow as
+            // tapping itself, without reaching for each line's dropdown.
+            // Plain presses only (`!modifiers.command`), so this can't
+            // fire as a side effect of e.g. Ctrl+S.
+            if ctx.input(|i| i.key_pressed(egui::Key::M) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Male);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Female);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::D) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Duet);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Screaming);
+            }
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -2472,6 +2754,7 @@ impl eframe::App for KaraokeApp {
                 if ui.button("📂 Load Project…").clicked() {
                     self.load_project_dialog();
                 }
+                self.draw_recent_files_menu(ui);
                 ui.separator();
                 ui.add_enabled_ui(self.can_undo(), |ui| {
                     if ui.button("↶ Undo").clicked() {
@@ -2696,7 +2979,8 @@ impl eframe::App for KaraokeApp {
                      Lines fill in top to bottom automatically - missed one? Drag the seek \
                      bar back a few seconds and try again. (Skipping the end-tap is fine too - \
                      it'll just fall back to an automatic estimate until you set it, here or \
-                     in the table below.)",
+                     in the table below.) Press M/F/D/S to set that line's voice (Male/Female/\
+                     Duet/Screaming) without leaving the keyboard.",
                 );
                 let can_tap = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false)
                     && self.next_untimed < self.lines.len();
@@ -2739,6 +3023,32 @@ impl eframe::App for KaraokeApp {
                         egui::CollapsingHeader::new("Colors")
                             .default_open(false)
                             .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Preset:");
+                                    egui::ComboBox::from_id_source("color_preset")
+                                        .selected_text(self.color_preset.label())
+                                        .show_ui(ui, |ui| {
+                                            for preset in ALL_COLOR_PRESETS {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.color_preset == preset,
+                                                        preset.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.apply_color_preset(preset);
+                                                }
+                                            }
+                                        });
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Pick a look, or fine-tune individual colors below.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(6.0);
                                 egui::Grid::new("colors_grid")
                                     .num_columns(2)
                                     .spacing([8.0, 4.0])
@@ -3013,12 +3323,7 @@ impl eframe::App for KaraokeApp {
 
                                 egui::ComboBox::from_id_source(("singer", i))
                                     .width(82.0)
-                                    .selected_text(match self.lines[i].singer {
-                                        Singer::Male => "Male",
-                                        Singer::Female => "Female",
-                                        Singer::Duet => "Duet",
-                                        Singer::Screaming => "Screaming",
-                                    })
+                                    .selected_text(self.lines[i].singer.label())
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut self.lines[i].singer,

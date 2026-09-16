@@ -30,6 +30,17 @@ pub enum Singer {
     Screaming,
 }
 
+impl Singer {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Male => "Male",
+            Self::Female => "Female",
+            Self::Duet => "Duet",
+            Self::Screaming => "Screaming",
+        }
+    }
+}
+
 /// Rough estimate of how long it takes to sing `text`, used only to decide
 /// how much of a line's on-screen window is "still being sung" vs. "already
 /// finished, waiting for the next line" (see [`countdown_window`]). This is
@@ -126,20 +137,35 @@ impl LyricLine {
     }
 }
 
-/// Parse raw pasted lyrics text into lines, one [`LyricLine`] per non-empty
-/// input line. Blank lines are dropped (they'd otherwise become an empty,
-/// untimeable line) but their *position* is preserved: a line immediately
-/// following one or more blank lines is marked as starting a new verse
-/// block (see [`LyricLine::starts_new_block`]), which the video export uses
-/// to group lines into on-screen blocks - this is why leaving blank lines
-/// between verses/stanzas in your pasted lyrics is worth doing, even though
-/// the blank lines themselves don't become timeable entries.
+/// True for a line that's *entirely* wrapped in square brackets, like
+/// `[Verse 1]`, `[Chorus: Some Artist]`, or `[Instrumental Break]` - the
+/// convention lyrics sites (Genius and others) use for structural section
+/// annotations. These are never meant to be sung or displayed, so
+/// [`parse_pasted_lyrics`] drops them rather than turning each one into an
+/// extra "line" the user would otherwise have to tap a timestamp for.
+/// Deliberately narrow: a line with brackets *somewhere* in it (background
+/// vocals, ad-libs) is left alone - only a line that's nothing *but* a
+/// bracketed annotation counts.
+fn is_section_marker(line: &str) -> bool {
+    line.len() >= 2 && line.starts_with('[') && line.ends_with(']')
+}
+
+/// Parse raw pasted lyrics text into lines, one [`LyricLine`] per non-empty,
+/// non-section-marker input line (see [`is_section_marker`]). Blank lines
+/// and section markers are both dropped (they'd otherwise become an empty
+/// or untimeable-in-spirit line) but their *position* is preserved: a line
+/// immediately following one or more of them is marked as starting a new
+/// verse block (see [`LyricLine::starts_new_block`]), which the video
+/// export uses to group lines into on-screen blocks - this is why leaving
+/// blank lines (or a `[Chorus]`-style header) between verses/stanzas in
+/// your pasted lyrics is worth doing, even though neither becomes a
+/// timeable entry itself.
 pub fn parse_pasted_lyrics(raw: &str) -> Vec<LyricLine> {
     let mut result = Vec::new();
     let mut pending_blank = false;
     for raw_line in raw.lines() {
         let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || is_section_marker(trimmed) {
             pending_blank = true;
             continue;
         }
@@ -582,6 +608,36 @@ mod tests {
         // block), d(same block), e(same block), f(after 2 blanks, still
         // just starts a new block), g(same block).
         assert_eq!(flags, vec![true, false, true, false, false, true, false]);
+    }
+
+    #[test]
+    fn drops_genius_style_section_markers() {
+        let raw = "[Verse 1]\nFirst line\nSecond line\n[Chorus: Some Artist]\nThird line\n\
+                   [Instrumental Break]\n[Outro]\nFourth line";
+        let lines = parse_pasted_lyrics(raw);
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["First line", "Second line", "Third line", "Fourth line"]
+        );
+    }
+
+    #[test]
+    fn a_section_marker_starts_a_new_block_like_a_blank_line_would() {
+        let raw = "First line\n[Chorus]\nSecond line";
+        let lines = parse_pasted_lyrics(raw);
+        assert!(lines[0].starts_new_block);
+        assert!(lines[1].starts_new_block);
+    }
+
+    #[test]
+    fn only_a_line_that_is_entirely_bracketed_counts_as_a_marker() {
+        // Ad-libs/background vocals in brackets mid-lyric are real content,
+        // not a structural annotation, so they must not be dropped.
+        let raw = "Hey [background vocal] yeah\n[Verse 1]\nReal line";
+        let lines = parse_pasted_lyrics(raw);
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["Hey [background vocal] yeah", "Real line"]);
     }
 
     #[test]

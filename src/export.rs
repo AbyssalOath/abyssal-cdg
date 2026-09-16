@@ -97,6 +97,62 @@ impl Default for Palette {
 }
 
 impl Palette {
+    /// A high-visibility preset - near-black background, pure white/yellow
+    /// text - aimed at looking good on an older or washed-out TV/projector
+    /// rather than a nicer-looking monitor.
+    pub fn high_contrast() -> Self {
+        Self {
+            background: CdgColor::new(0, 0, 0),
+            male_unsung: CdgColor::new(7, 7, 7),
+            male_highlight: CdgColor::new(15, 15, 0),
+            female_unsung: CdgColor::new(6, 6, 9),
+            female_highlight: CdgColor::new(0, 15, 15),
+            duet_unsung: CdgColor::new(7, 9, 6),
+            duet_highlight: CdgColor::new(15, 8, 0),
+            preview: CdgColor::new(8, 8, 8),
+            title: CdgColor::new(15, 15, 15),
+            artist: CdgColor::new(11, 11, 11),
+            screaming_unsung: CdgColor::new(9, 2, 2),
+            screaming_highlight: CdgColor::new(15, 0, 0),
+        }
+    }
+
+    /// A warm preset - deep purple background, orange/pink/gold text.
+    pub fn sunset() -> Self {
+        Self {
+            background: CdgColor::new(2, 0, 3),
+            male_unsung: CdgColor::new(9, 6, 10),
+            male_highlight: CdgColor::new(15, 9, 2),
+            female_unsung: CdgColor::new(10, 6, 9),
+            female_highlight: CdgColor::new(15, 3, 8),
+            duet_unsung: CdgColor::new(10, 7, 6),
+            duet_highlight: CdgColor::new(15, 12, 0),
+            preview: CdgColor::new(7, 4, 8),
+            title: CdgColor::new(15, 10, 4),
+            artist: CdgColor::new(11, 7, 9),
+            screaming_unsung: CdgColor::new(8, 1, 2),
+            screaming_highlight: CdgColor::new(15, 2, 3),
+        }
+    }
+
+    /// A cool preset - deep navy background, cyan/blue/teal text.
+    pub fn ocean() -> Self {
+        Self {
+            background: CdgColor::new(0, 1, 3),
+            male_unsung: CdgColor::new(6, 9, 11),
+            male_highlight: CdgColor::new(0, 14, 15),
+            female_unsung: CdgColor::new(7, 8, 12),
+            female_highlight: CdgColor::new(4, 10, 15),
+            duet_unsung: CdgColor::new(6, 11, 9),
+            duet_highlight: CdgColor::new(0, 15, 9),
+            preview: CdgColor::new(5, 7, 9),
+            title: CdgColor::new(14, 15, 15),
+            artist: CdgColor::new(9, 11, 13),
+            screaming_unsung: CdgColor::new(2, 3, 8),
+            screaming_highlight: CdgColor::new(9, 0, 15),
+        }
+    }
+
     fn low_clut(&self) -> [CdgColor; 8] {
         [
             self.background,
