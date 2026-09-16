@@ -15,6 +15,7 @@ mod project;
 mod timeline;
 mod video;
 mod vocals;
+mod waveform;
 
 use audio::AudioPlayer;
 use eframe::egui;
@@ -221,6 +222,13 @@ struct KaraokeApp {
     /// Set while a bubble's body or an edge handle is being dragged on the
     /// timeline - `None` the rest of the time.
     timeline_drag: Option<TimelineDrag>,
+    /// Peaks for the currently loaded audio, once background extraction
+    /// finishes - `None` before that, if extraction failed, or no audio is
+    /// loaded. Drawn as a backdrop behind the timeline's bubbles.
+    waveform: Option<waveform::Waveform>,
+    /// Set while `waveform::build_waveform` is running in the background
+    /// for the most recently loaded audio file.
+    waveform_job: Option<WaveformJob>,
 
     /// Snapshots to restore on Ctrl+Z, oldest first - see
     /// [`Self::track_undo_history`] for how/when these get pushed.
@@ -323,6 +331,14 @@ struct UndoSnapshot {
 /// session without letting the history grow unbounded.
 const UNDO_HISTORY_LIMIT: usize = 100;
 
+/// Shared state for a background `waveform::build_waveform` call, kicked
+/// off whenever a new audio file is loaded - decoding a whole song can take
+/// a noticeable fraction of a second, so it happens off the UI thread the
+/// same way exports do.
+struct WaveformJob {
+    result: Arc<Mutex<Option<Result<waveform::Waveform, String>>>>,
+}
+
 impl KaraokeApp {
     fn new() -> Self {
         let (audio, audio_error) = match AudioPlayer::new() {
@@ -378,6 +394,8 @@ impl KaraokeApp {
             combined_export: None,
             timeline_view: timeline::View::default(),
             timeline_drag: None,
+            waveform: None,
+            waveform_job: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_last_observed: UndoSnapshot {
@@ -631,6 +649,12 @@ impl KaraokeApp {
         self.undo_pending_baseline = None;
         self.undo_last_observed = self.undo_snapshot();
 
+        // Cleared unconditionally (rather than left for `load_audio` to
+        // replace) so a project with no saved audio path doesn't keep
+        // showing whatever song's waveform happened to be loaded before.
+        self.waveform = None;
+        self.waveform_job = None;
+
         match project.audio_path {
             Some(path) if path.exists() => {
                 self.load_audio(path);
@@ -852,14 +876,50 @@ impl KaraokeApp {
 
     fn load_audio(&mut self, path: PathBuf) {
         if let Some(audio) = &mut self.audio {
-            match audio.load(path) {
+            match audio.load(path.clone()) {
                 Ok(()) => {
                     self.status = "Audio loaded.".to_string();
+                    self.start_waveform_job(path);
                 }
                 Err(e) => {
                     self.status = format!("Couldn't load audio: {e}");
                 }
             }
+        }
+    }
+
+    /// Kicks off waveform-peak extraction for `path` on a background
+    /// thread - see [`WaveformJob`]. Replaces any previous waveform/job
+    /// immediately, so switching audio files never briefly shows the old
+    /// file's waveform under the new one's bubbles.
+    fn start_waveform_job(&mut self, path: PathBuf) {
+        self.waveform = None;
+        let result: Arc<Mutex<Option<Result<waveform::Waveform, String>>>> =
+            Arc::new(Mutex::new(None));
+        let result_clone = result.clone();
+        self.waveform_job = Some(WaveformJob { result });
+        std::thread::spawn(move || {
+            let outcome = waveform::build_waveform(&path).map_err(|e| e.to_string());
+            *result_clone.lock().unwrap() = Some(outcome);
+        });
+    }
+
+    /// Checks on a running waveform job, if any. Returns true while still
+    /// in progress (so the caller knows to keep repainting). A failed
+    /// extraction is silently dropped - the timeline works exactly the
+    /// same without a waveform, just without the extra visual cue.
+    fn poll_waveform_job(&mut self) -> bool {
+        let Some(job) = &self.waveform_job else {
+            return false;
+        };
+        let finished = job.result.lock().unwrap().take();
+        match finished {
+            Some(outcome) => {
+                self.waveform = outcome.ok();
+                self.waveform_job = None;
+                false
+            }
+            None => true,
         }
     }
 
@@ -1802,6 +1862,9 @@ impl KaraokeApp {
                 "Drag a bubble to move it, its edges to trim start/end. Click or drag \
                  empty space to seek/scrub playback - scroll to zoom, shift+scroll to pan.",
             );
+            if self.waveform_job.is_some() {
+                ui.label(egui::RichText::new("(building waveform…)").weak());
+            }
         });
 
         if timed.is_empty() {
@@ -1862,8 +1925,35 @@ impl KaraokeApp {
             t += interval;
         }
 
-        // Line bubbles - one per timed line, in start-time order.
+        // Waveform backdrop, spanning both bubble rows - drawn before the
+        // bubbles (and behind their semi-transparent fill, see below) so a
+        // bubble's edge can be visually compared against an actual vocal
+        // onset instead of just trusting the tapped/estimated timestamp.
         let line_row_top = rect.top() + ruler_h + 4.0;
+        if let Some(waveform) = &self.waveform {
+            let wave_top = line_row_top;
+            let wave_bottom = line_row_top + line_row_h + row_gap + word_row_h;
+            let wave_center = (wave_top + wave_bottom) / 2.0;
+            let wave_half_h = (wave_bottom - wave_top) / 2.0 - 2.0;
+            let wc = ui.visuals().weak_text_color();
+            let wave_color = egui::Color32::from_rgba_unmultiplied(wc.r(), wc.g(), wc.b(), 150);
+            let mut x = rect.left();
+            while x < rect.right() {
+                let t0 = self.timeline_view.x_to_time(rect.left(), x);
+                let t1 = self.timeline_view.x_to_time(rect.left(), x + 1.0);
+                if let Some((lo, hi)) = waveform.peak_in_range(t0, t1) {
+                    let y0 = wave_center - hi.clamp(-1.0, 1.0) * wave_half_h;
+                    let y1 = wave_center - lo.clamp(-1.0, 1.0) * wave_half_h;
+                    painter.line_segment(
+                        [egui::pos2(x, y0.min(y1)), egui::pos2(x, y1.max(y0))],
+                        egui::Stroke::new(1.0_f32, wave_color),
+                    );
+                }
+                x += 1.0;
+            }
+        }
+
+        // Line bubbles - one per timed line, in start-time order.
         for (i, line) in timed.iter().enumerate() {
             let orig_idx = indices[i];
             let x0 = self.timeline_view.time_to_x(rect.left(), line.start);
@@ -1885,6 +1975,11 @@ impl KaraokeApp {
             let (_, highlight) = self.singer_colors(line.singer);
             let is_selected = self.word_tap_line == Some(orig_idx);
             let fill = highlight.gamma_multiply(if is_selected { 0.85 } else { 0.55 });
+            // Real alpha (not just a darker color) so the waveform drawn
+            // behind bubbles is still visible through them - otherwise a
+            // misaligned bubble would hide the very peak it should be
+            // lined up against.
+            let fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 205);
             let stroke = if is_selected {
                 egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
             } else {
@@ -2021,7 +2116,14 @@ impl KaraokeApp {
                 let bubble_response = ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
 
                 let (_, highlight) = self.singer_colors(line.singer);
-                painter.rect_filled(bubble_rect, 3.0, highlight.gamma_multiply(0.7));
+                let word_fill = highlight.gamma_multiply(0.7);
+                let word_fill = egui::Color32::from_rgba_unmultiplied(
+                    word_fill.r(),
+                    word_fill.g(),
+                    word_fill.b(),
+                    205,
+                );
+                painter.rect_filled(bubble_rect, 3.0, word_fill);
                 painter.rect_stroke(
                     bubble_rect,
                     3.0,
@@ -2291,6 +2393,9 @@ impl eframe::App for KaraokeApp {
             }
         }
         if self.poll_combined_export() {
+            ctx.request_repaint();
+        }
+        if self.poll_waveform_job() {
             ctx.request_repaint();
         }
         self.auto_follow_word_tap_line();
