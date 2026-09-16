@@ -23,6 +23,7 @@ use lyrics::{
     blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines,
     parse_pasted_lyrics, resolve_timing, LyricLine, Singer, TimedLine,
 };
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -220,6 +221,25 @@ struct KaraokeApp {
     /// Set while a bubble's body or an edge handle is being dragged on the
     /// timeline - `None` the rest of the time.
     timeline_drag: Option<TimelineDrag>,
+
+    /// Snapshots to restore on Ctrl+Z, oldest first - see
+    /// [`Self::track_undo_history`] for how/when these get pushed.
+    undo_stack: VecDeque<UndoSnapshot>,
+    /// Snapshots to restore on Ctrl+Shift+Z/Ctrl+Y, most-recently-undone
+    /// last - cleared whenever a fresh (non-undo/redo) edit is recorded.
+    redo_stack: VecDeque<UndoSnapshot>,
+    /// The undoable state as of the end of the last frame - compared
+    /// against the current state each frame to notice edits, so no
+    /// individual tap/drag/nudge/parse call site needs to explicitly record
+    /// undo history itself.
+    undo_last_observed: UndoSnapshot,
+    /// Set to the state from *before* the change currently under way, the
+    /// first time a frame's state differs from `undo_last_observed` while
+    /// no continuous gesture (a timeline drag, a focused text field) is in
+    /// progress yet - so a multi-frame drag or a typing session ends up as
+    /// one undo step instead of one per frame/keystroke. Finalized (pushed
+    /// onto `undo_stack`) once the gesture ends.
+    undo_pending_baseline: Option<UndoSnapshot>,
 }
 
 /// Which timeline bubble a [`TimelineDrag`] is dragging - a whole line, or
@@ -284,6 +304,25 @@ struct CombinedExportHandle {
     result: Arc<Mutex<Option<Vec<ExportOutcome>>>>,
 }
 
+/// A point-in-time copy of everything Ctrl+Z/Ctrl+Shift+Z can undo/redo -
+/// the lyrics text, every line's timing/overrides, and the song's title and
+/// artist. Deliberately narrower than a full `project::ProjectFile`: colors,
+/// video resolution, and the loaded audio path are easy to redo by hand if
+/// changed by mistake and aren't what "afraid to touch the timeline" is
+/// about, so leaving them out keeps undo focused on the content that's
+/// actually tedious to re-create (tapped/dragged timing).
+#[derive(Clone, PartialEq)]
+struct UndoSnapshot {
+    lyrics_raw: String,
+    lines: Vec<LyricLine>,
+    title: String,
+    artist: String,
+}
+
+/// Cap on how many undo steps are kept - generous for a single editing
+/// session without letting the history grow unbounded.
+const UNDO_HISTORY_LIMIT: usize = 100;
+
 impl KaraokeApp {
     fn new() -> Self {
         let (audio, audio_error) = match AudioPlayer::new() {
@@ -294,7 +333,7 @@ impl KaraokeApp {
             ),
         };
         let p = Palette::default();
-        Self {
+        let mut app = Self {
             audio,
             audio_error,
             lyrics_raw: String::new(),
@@ -339,7 +378,18 @@ impl KaraokeApp {
             combined_export: None,
             timeline_view: timeline::View::default(),
             timeline_drag: None,
-        }
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
+            undo_last_observed: UndoSnapshot {
+                lyrics_raw: String::new(),
+                lines: Vec::new(),
+                title: String::new(),
+                artist: String::new(),
+            },
+            undo_pending_baseline: None,
+        };
+        app.undo_last_observed = app.undo_snapshot();
+        app
     }
 
     fn palette(&self) -> Palette {
@@ -429,6 +479,103 @@ impl KaraokeApp {
         }
     }
 
+    /// Snapshots the subset of state Ctrl+Z/Ctrl+Shift+Z cover - see
+    /// [`UndoSnapshot`].
+    fn undo_snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot {
+            lyrics_raw: self.lyrics_raw.clone(),
+            lines: self.lines.clone(),
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+        }
+    }
+
+    /// Restores a previously-captured [`UndoSnapshot`] and resets whatever
+    /// session-only state could otherwise point at something that no longer
+    /// makes sense (a line that's gone, an in-progress edit on a line whose
+    /// text just changed underneath it).
+    fn apply_undo_snapshot(&mut self, snapshot: UndoSnapshot) {
+        self.lyrics_raw = snapshot.lyrics_raw;
+        self.lines = snapshot.lines;
+        self.title = snapshot.title;
+        self.artist = snapshot.artist;
+        self.recompute_next_untimed();
+        self.word_tap_line = None;
+        self.timeline_drag = None;
+        self.start_edit = None;
+        self.end_edit = None;
+        // Keep the "last observed" baseline in sync with what was just
+        // restored, so next frame's `track_undo_history` doesn't mistake
+        // this undo/redo itself for a fresh edit worth recording.
+        self.undo_last_observed = self.undo_snapshot();
+        self.undo_pending_baseline = None;
+    }
+
+    /// Pushes `snapshot` (the state from *before* an edit) onto the undo
+    /// stack, capping its length, and clears the redo stack - a fresh edit
+    /// invalidates whatever used to be ahead of it.
+    fn push_undo_snapshot(&mut self, snapshot: UndoSnapshot) {
+        self.undo_stack.push_back(snapshot);
+        while self.undo_stack.len() > UNDO_HISTORY_LIMIT {
+            self.undo_stack.pop_front();
+        }
+        self.redo_stack.clear();
+    }
+
+    /// Called once per frame (at the end of `update`) to notice edits and
+    /// record undo history without needing every individual tap/drag/nudge
+    /// call site to do it itself. `gesture_active` covers anything that
+    /// spans multiple frames for one logical action - a timeline drag, or a
+    /// focused text field being typed into - so that whole gesture
+    /// coalesces into a single undo step once it ends, instead of one step
+    /// per frame or per keystroke.
+    fn track_undo_history(&mut self, gesture_active: bool) {
+        let current = self.undo_snapshot();
+        if current != self.undo_last_observed {
+            if self.undo_pending_baseline.is_none() {
+                self.undo_pending_baseline = Some(self.undo_last_observed.clone());
+            }
+            self.undo_last_observed = current;
+        }
+        if !gesture_active {
+            if let Some(baseline) = self.undo_pending_baseline.take() {
+                if baseline != self.undo_last_observed {
+                    self.push_undo_snapshot(baseline);
+                }
+            }
+        }
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    fn undo(&mut self) {
+        let Some(prev) = self.undo_stack.pop_back() else {
+            self.status = "Nothing to undo.".to_string();
+            return;
+        };
+        let current = self.undo_snapshot();
+        self.redo_stack.push_back(current);
+        self.apply_undo_snapshot(prev);
+        self.status = "Undid last change.".to_string();
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop_back() else {
+            self.status = "Nothing to redo.".to_string();
+            return;
+        };
+        let current = self.undo_snapshot();
+        self.undo_stack.push_back(current);
+        self.apply_undo_snapshot(next);
+        self.status = "Redid change.".to_string();
+    }
+
     /// True if there's project content that isn't reflected in the last
     /// explicit save (or was never saved at all) - used both to decide
     /// whether the crash-recovery autosave should survive a clean exit
@@ -474,6 +621,15 @@ impl KaraokeApp {
         self.timeline_drag = None;
         self.timeline_view = timeline::View::default();
         self.seek_drag_value = None;
+
+        // Undoing back into a *different* project's content would be
+        // confusing (and could resurrect a previous project's lyrics after
+        // opening an unrelated one), so a load/recovery starts a fresh undo
+        // history rather than carrying the old one over.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_pending_baseline = None;
+        self.undo_last_observed = self.undo_snapshot();
 
         match project.audio_path {
             Some(path) if path.exists() => {
@@ -2169,6 +2325,25 @@ impl eframe::App for KaraokeApp {
                     let _ = a.seek(target);
                 }
             }
+            // Undo/redo - gated the same way as the shortcuts above (not
+            // while a text field has focus, so a field's own native
+            // undo/redo isn't stolen by this), and additionally not
+            // mid-drag on the timeline, where applying a snapshot from
+            // before the drag started would fight with the drag still
+            // updating state every frame.
+            if self.timeline_drag.is_none() {
+                if ctx.input(|i| {
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z)
+                }) {
+                    self.undo();
+                }
+                if ctx.input(|i| {
+                    (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
+                        || (i.modifiers.command && i.key_pressed(egui::Key::Y))
+                }) {
+                    self.redo();
+                }
+            }
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -2192,6 +2367,17 @@ impl eframe::App for KaraokeApp {
                 if ui.button("📂 Load Project…").clicked() {
                     self.load_project_dialog();
                 }
+                ui.separator();
+                ui.add_enabled_ui(self.can_undo(), |ui| {
+                    if ui.button("↶ Undo").clicked() {
+                        self.undo();
+                    }
+                });
+                ui.add_enabled_ui(self.can_redo(), |ui| {
+                    if ui.button("↷ Redo").clicked() {
+                        self.redo();
+                    }
+                });
                 match &self.current_project_path {
                     Some(path) => {
                         let name = path
@@ -2210,7 +2396,8 @@ impl eframe::App for KaraokeApp {
                     format!(
                         "Saves everything - lyrics, timing, colors, the audio file's path - \
                          to a .{} project file, so you can pick up where you left off. \
-                         Ctrl+S saves; Ctrl+Shift+S always asks for a location.",
+                         Ctrl+S saves; Ctrl+Shift+S always asks for a location. Ctrl+Z undoes \
+                         a tap/drag/nudge/edit; Ctrl+Shift+Z (or Ctrl+Y) redoes it.",
                         project::FILE_EXTENSION
                     ),
                 )
@@ -2833,6 +3020,12 @@ impl eframe::App for KaraokeApp {
                         });
                 });
         });
+
+        // Record undo history for whatever changed this frame - see
+        // `track_undo_history` for why a timeline drag or a focused text
+        // field counts as one gesture rather than a step per frame.
+        let gesture_active = self.timeline_drag.is_some() || ctx.memory(|m| m.focused().is_some());
+        self.track_undo_history(gesture_active);
     }
 
     /// Called once on a clean shutdown (window closed, app quit normally -
