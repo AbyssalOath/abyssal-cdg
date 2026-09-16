@@ -27,15 +27,18 @@ an old Rust toolchain, not a bug in this project.
   like `too_many_arguments` on the video-frame drawing helpers, are known and accepted -
   no need to go fix unrelated ones as part of your change).
 - If you touched `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`, `formats.rs`,
-  `video.rs`, `timeline.rs`, or `vocals.rs`'s output-resolution logic, add or update a
-  unit test alongside the change - these modules are pure logic with no GUI/audio
-  dependency, so there's no excuse not to. `main.rs` (GUI wiring, including the
-  timeline widget's painting/interaction code) has no automated tests; changes there
-  are verified by running the app. The actual `ffmpeg`/`audio-separator` subprocess
-  invocations aren't exercised in the test suite either, since they need the external
-  tool installed - verify those manually.
-- If your change affects `export.rs` (`.cdg`), `video.rs` (`.mp4`), the live preview,
-  or the fine-tuning timeline in `main.rs`, make sure they still agree - see
+  `video.rs`, `timeline.rs`, `project.rs`, `recent.rs`, `waveform.rs`, `align.rs`'s
+  sync-map parsing, or `vocals.rs`'s output-resolution logic, add or update a unit
+  test alongside the change - these modules are pure logic with no GUI dependency,
+  so there's no excuse not to. `main.rs` (GUI wiring, including the timeline
+  widget's painting/interaction code and the undo/redo frame-diffing) has no
+  automated tests; changes there are verified by running the app. The actual
+  `ffmpeg`/`audio-separator`/`aeneas` subprocess invocations aren't exercised in the
+  test suite either, since they need the external tool installed - verify those
+  manually.
+- If your change affects `export.rs` (`.cdg`), `video.rs` (`.mp4`), `formats.rs`'s
+  LRC/UltraStar export, the live preview, or the fine-tuning timeline in `main.rs`,
+  make sure they still agree - see
   [ARCHITECTURE.md](ARCHITECTURE.md#data-flow) for why that matters and which shared
   functions in `lyrics.rs` are supposed to be the single source of truth for timing
   decisions. The timeline in particular is also a *writer*, not just a display - a

@@ -9,6 +9,65 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Added
 
+- **Save/load project files** (`.abyzl`, JSON): captures the loaded audio's path,
+  raw lyrics text, every line's timing/overrides, title/artist, colors, and video
+  resolution. Ctrl+S saves (to the current file, or "Save Project As…" if there
+  isn't one yet); Ctrl+Shift+S always asks for a location.
+- **Crash-recovery autosave**: while there's anything worth recovering, the current
+  project is written to a fixed slot in the OS's per-user data directory every 30s
+  and on every clean exit that still has unsaved changes (including an accidental
+  close, not just a crash). If that slot is still there next launch, a "Recover
+  previous session?" prompt offers to restore it before anything else is drawn.
+- **"Quit without saving?" confirmation**: closing the window with unsaved changes
+  intercepts the close and offers Save and Quit / Quit Without Saving / Cancel,
+  instead of silently discarding (or silently relying on the autosave) either way.
+- **Auto-pair audio on export**: the loaded audio is automatically copied next to
+  whichever of `.cdg`/`.lrc`/UltraStar's `.txt` gets exported (same base filename),
+  ready for "MP3+G"-style pickup by karaoke players/games without a manual copy or
+  rename.
+- **Undo/redo**: Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) undo/redo lyrics text, timing,
+  word overrides, and singer changes - a capped history of up to 100 steps. A whole
+  multi-frame gesture (a drag, a text-field edit, a typing session) coalesces into
+  one undo step rather than one per frame/keystroke; a whole "Auto-align words" run
+  also undoes in one step.
+- **Waveform on the timeline**: peaks extracted from the loaded audio (on a
+  background thread) are drawn behind the timeline's bubbles, which now have real
+  alpha transparency so the waveform stays visible through them - lets you line a
+  bubble up against an actual vocal onset instead of positioning by time alone.
+- **Drag-and-drop**: dropping an audio, lyrics, or `.abyzl` project file onto the
+  window loads it, the same as the corresponding "Load…" button - each recognized
+  by extension, with a full-window "drop it here" overlay while a file is being
+  dragged over. Multiple files dropped together are each routed independently.
+- **Color presets**: a "Preset" dropdown (Classic/High Contrast/Sunset/Ocean) sets
+  all 12 colors at once, so a first-time user never has to touch the individual
+  color pickers to get a good-looking result.
+- **Singer keyboard shortcuts**: M/F/D/S set the voice (Male/Female/Duet/Screaming)
+  of whichever line is next up to tap, or, once everything's timed, whichever line
+  the fine-tune-words panel is following - no need to reach for each line's dropdown.
+- **Recent files menu**: a "🕘 Recent" dropdown lists recently opened/saved project
+  and audio files (persisted across restarts), so returning to a previous session
+  doesn't mean re-locating the file in a picker.
+- **Automatic section-marker stripping**: pasted/imported plain-text lyrics that
+  include Genius-style `[Verse 1]`/`[Chorus]`/`[Instrumental Break]`-style headers
+  (a line that's *entirely* wrapped in square brackets) have them dropped
+  automatically, the same as a blank line - so copy-pasting straight from a lyrics
+  site doesn't turn each section header into an extra line you'd have to time.
+- **Automatic word-level timing via forced alignment**: "🪄 Auto-align words" shells
+  out to `aeneas` (a separate, non-bundled Python package) once per already-timed
+  line, restricted to that line's own tapped window, to fill in real word-level
+  timing for every word - instead of tapping each one by hand. Runs on a background
+  thread with a progress bar; one bad line doesn't stop the rest, and the whole run
+  undoes in one Ctrl+Z. See the README for an important early accuracy caveat
+  (results against a full music mix have been inconsistent so far).
+- **Auto-rewind on edit**: correcting a timestamp (typing a new value, nudging, or
+  dragging a timeline bubble) automatically seeks playback a couple seconds before
+  the edited point, so you can immediately hear whether the correction landed right
+  without manually scrubbing back.
+- **LRC / UltraStar export**: the "Export…" dialog can now produce a portable
+  `.lrc` (word-level LRC2 by default, with a plain-LRC1 option) and/or an UltraStar
+  `.txt` note file - the direct inverse of this app's existing importers for both -
+  for using the tapping/timeline/auto-align workflow to time a song without needing
+  a karaoke video or disc at all.
 - **Fine-tuning timeline**: a kdenlive/karaodeo-style widget at the bottom of the
   window showing one draggable/resizable bubble per lyric line (drag the body to move
   it, an edge to trim start/end independently), plus a row of individual word bubbles
@@ -52,6 +111,9 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
   distinction wasn't meaningful to a viewer and looked like a rendering glitch;
   precisely-timed words are just held out for their duration like any other word.
 - The timing table's columns are now ordered Start / Lyric / End / Singer / ...
+- Three separate export buttons/save dialogs (`.cdg`, `.mp4`, instrumental audio)
+  are now one combined "Export…" dialog: pick any combination of outputs (now also
+  including `.lrc`/UltraStar), one shared folder/base filename, one progress bar.
 
 ### Fixed
 
@@ -59,6 +121,12 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
   bounds used to be pinned to its immediate neighbor's position, which by default
   touches exactly where the word itself already sits (no gap), leaving nothing to
   drag. Word bubbles are now bounded by the whole line's own window instead.
+- Exporting with some (but not all) lines timed used to silently leave the untimed
+  ones out of the `.cdg`/video/LRC/UltraStar output with no warning. Export now
+  shows a clear message (and disables the Export button) until every line is timed,
+  for any output format that actually uses lyric timing.
+- The timing table's Start/End fields were slightly too narrow to show a full
+  `00:00.00` value without clipping it.
 
 ## [0.1.0] - 2026-09-13
 

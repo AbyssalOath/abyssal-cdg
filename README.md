@@ -6,17 +6,21 @@ used by karaoke machines and "MP3+G" karaoke software.
 
 ## What it does
 
-1. **Load an audio file** (mp3, wav, flac, ogg, m4a, aac).
+1. **Load an audio file** (mp3, wav, flac, ogg, m4a, aac) - via **"Load
+   Audio…"**, or just drag the file onto the window.
 2. **Enter a song title / artist** (optional) - shown as an intro card for
    the first few seconds, like a real karaoke video.
 3. **Paste your lyrics** (one line per line of text) and click "Parse
-   lyrics" - or click **"Load lyrics file…"** to import an existing `.lrc`
-   (LRC1/LRC2), UltraStar `.txt`, or KOK file instead. The format is
-   auto-detected. If the file already carries real timing (all of these
-   do), imported lines land pre-timed - LRC2/UltraStar/KOK word-level tags
-   even populate per-word timing directly, and UltraStar's `P1`/`P2`/`P3`
-   duet markers map onto this app's Male/Female/Duet voices automatically.
-   You can still fine-tune anything afterward the normal way.
+   lyrics" - or **"Load lyrics file…"** (or drag the file onto the window)
+   to import an existing `.lrc` (LRC1/LRC2), UltraStar `.txt`, or KOK file
+   instead. The format is auto-detected, and `[Verse 1]`/`[Chorus]`-style
+   section headers (the kind lyrics sites like Genius add) are stripped
+   automatically rather than becoming lines you'd have to time. If the
+   file already carries real timing (LRC/UltraStar/KOK all do), imported
+   lines land pre-timed - LRC2/UltraStar/KOK word-level tags even populate
+   per-word timing directly, and UltraStar's `P1`/`P2`/`P3` duet markers
+   map onto this app's Male/Female/Duet voices automatically. You can
+   still fine-tune anything afterward the normal way.
 4. **Play the song and tap along** - press **Space** (or click the big
    button) the instant a lyric line starts, then press it again the instant
    that line finishes being sung - two taps per line, start then end. Lines
@@ -24,6 +28,8 @@ used by karaoke machines and "MP3+G" karaoke software.
    says which one (start or end, and which line) the next press will set.
    Skipping the end-tap is fine too - it just falls back to an automatic
    estimate until you set it, either later or via the timeline/table below.
+   Press **M/F/D/S** at any point to set the current line's voice
+   (Male/Female/Duet/Screaming) without reaching for the mouse.
 5. **Missed a line, or the song's fast?** Drag the seek bar (or use the
    ⏪5s/5s⏩ buttons, or the left/right arrow keys) to jump straight back to any
    point in the song and pick up tapping again from there - no need to
@@ -38,7 +44,7 @@ used by karaoke machines and "MP3+G" karaoke software.
 7. **Assign a voice per line** (Male / Female / Duet / Screaming) for duet
    songs or intense sections - each gets its own color pair so singers can
    tell whose line is whose (or when to belt it) at a glance.
-8. **Fine-tune individual words** two ways:
+8. **Fine-tune individual words** a few ways:
    - Click "Words" next to any line to open a strip of clickable word
      buttons, and a Start/End toggle above them. In Start mode (the
      default), clicking a word sets when its highlight begins; switch to
@@ -47,13 +53,32 @@ used by karaoke machines and "MP3+G" karaoke software.
      followed by a pause). Green = start set, blue = end set, teal = both.
      Once every line has a start time (step 4), this panel opens
      automatically and **follows along with the song** as it plays.
-   - Or fine-tune visually on the **timeline** at the bottom of the window
-     (see below) - drag bubbles around directly instead of tapping.
+   - Fine-tune visually on the **timeline** at the bottom of the window
+     (see below) - a waveform of the loaded audio is drawn behind the
+     bubbles, so you can drag one to line up with an actual vocal onset
+     instead of guessing. Correcting a value (typing, nudging, or
+     dragging) automatically rewinds playback a couple seconds so you can
+     immediately hear whether it landed right.
+   - Or skip tapping every word by hand entirely: **"🪄 Auto-align
+     words"** shells out to a forced-alignment tool to fill in real,
+     audio-derived word timing for every already-timed line in one click
+     (see "Auto-aligning word timing" below - it's the closest thing this
+     app has to a "wow, it just did it" feature, with the caveats that
+     come with that).
 9. **Customize colors** for every element (background, each voice's
    upcoming/already-sung colors, the next-line preview, and the title
-   card) via the color pickers.
-10. **Export** a `.cdg` file, a real **MP4 video**, and/or an **instrumental
-    copy of the audio** (see below) - any combination.
+   card) via the color pickers, or pick a built-in preset to skip the
+   pickers entirely.
+10. **Export** a `.cdg` file, a real **MP4 video**, an **instrumental copy
+    of the audio**, and/or **LRC/UltraStar lyrics files** (see below) - any
+    combination, from one dialog with one shared progress bar.
+
+Along the way: **Ctrl+Z/Ctrl+Shift+Z** undo/redo almost anything (tapping,
+nudging, dragging, auto-align, parsing), so there's no need to be careful
+about experimenting; **Save Project**/**Load Project…** (`.abyzl` files, a
+"Recent" menu for quick reopening) let you pick up exactly where you left
+off, with autosave and a recovery prompt protecting against a crash or an
+accidental close.
 
 ### Two very different export formats
 
@@ -201,6 +226,31 @@ rest). Forced alignment is good, not perfect - review the result and
 fine-tune anything that's off the same way you would manually-tapped
 timing; Ctrl+Z undoes the whole run in one step if it doesn't help.
 
+**Real-world accuracy caveat:** early testing against a normal mixed
+track (vocals + full instrumentation) has been inconsistent - `aeneas` is
+a general speech-alignment tool, not something built or trained for
+singing over music, and it seems to want a clean, speech-like audio
+sample rather than a produced song with a beat and instruments sitting on
+top of the vocal. If you try it and the result is spotty, that matches
+what we've seen so far too - it's not just you. A more promising setup we
+haven't confirmed yet: run it against an *isolated vocal stem* instead of
+the full mix. This app already shells out to `audio-separator` elsewhere
+(see "Removing vocals" above) to pull an instrumental stem out of a song -
+the same tool can extract the *opposite* stem (vocals-only, via its
+`--single_stem Vocals` option), which in principle should look a lot more
+like the kind of clean, single-voice audio `aeneas` is meant for. Auto-align
+doesn't do this automatically yet - it aligns whichever audio file is
+currently loaded, as-is, with no separate "alignment source" option. As a
+manual workaround today, you could extract a vocals-only file yourself
+(e.g. with `audio-separator` directly, or another tool), temporarily
+**Load Audio…** that file instead of the full mix, run auto-align, then
+switch back to the original mixed audio for playback/export - your
+tapped/aligned timing stays on the lines, since it's independent of which
+audio file happens to be loaded. If that turns out to noticeably improve
+results, automating that swap (extract vocals, align, discard the
+temporary file) as part of auto-align itself would be a reasonable next
+step.
+
 ### Live preview vs. the exported file
 
 The in-app preview isn't a literal decoder for either export format - it's
@@ -260,6 +310,35 @@ file to verify against, rather than guess and risk silently wrong timing).
 "PowerKaraoke" isn't a distinct file format at all - that software's import
 is a configurable wizard over generic delimited text, not a fixed grammar,
 so there's no single format to target there either.
+
+### Exporting to LRC / UltraStar
+
+The "Export…" dialog can also produce a portable lyrics file alongside (or
+instead of) `.cdg`/`.mp4` - useful if you just want to use this app's
+tapping/timeline/auto-align workflow to time a song, without needing a
+karaoke video or disc at all:
+
+- **Lyrics (.lrc)** - word-level "enhanced" LRC2 by default (one
+  `<mm:ss.xx>` tag per word, from the same timing the color-wipe uses),
+  with a plain line-level LRC1 option for older/simpler LRC readers.
+  Includes `[ti:]`/`[ar:]` tags when your Title/Artist fields are filled
+  in.
+- **Lyrics (UltraStar .txt)** - beat-based notes at a fixed high notional
+  BPM (chosen for round-trip precision, not a claim about the song's real
+  tempo), with `P1`-`P4` player markers written wherever the singer
+  actually changes (a single-voice song exports as a plain, non-duet
+  file). There's no pitch data - this app doesn't track melody - so every
+  note gets a constant placeholder pitch; a game that scores pitch
+  accuracy will treat the whole song as one fixed note, but the lyrics and
+  timing are real.
+
+Both are the direct inverse of their importers above, and both need every
+line to actually be timed first (same requirement, and same warning if
+it's not, as `.cdg`/`.mp4` export) - a line with no start/end has nothing
+to convert into LRC timestamps or UltraStar beats. Like `.cdg`'s "MP3+G"
+pairing, the loaded audio is copied alongside either one under the
+matching base filename if you have it loaded, ready to drop into a
+folder-based player/game library.
 
 ## Building
 
@@ -419,11 +498,13 @@ cargo test
   bubbles against actual vocal onsets, not a preview of anything in the
   output files themselves.
 - Forced alignment (`aeneas`) is a real speech-alignment tool, not
-  something written for singing specifically - it can still misfire on
-  heavily melismatic/stylized vocals, overlapping voices, or a line whose
-  tapped window doesn't actually contain all of its words. Treat its
-  result the same as an estimate: worth reviewing, easy to fix by hand
-  (or re-tap the line and run it again) where it's off.
+  something written or trained for singing over music - results against a
+  normal full mix have been inconsistent in our own testing so far (see
+  the accuracy caveat under "Auto-aligning word timing" above). It can
+  also misfire on heavily melismatic/stylized vocals, overlapping voices,
+  or a line whose tapped window doesn't actually contain all of its
+  words. Treat its result the same as an estimate: worth reviewing, easy
+  to fix by hand (or re-tap the line and run it again) where it's off.
 - Seeking rebuilds the playback pipeline and fast-forwards (decodes and
   discards audio) to the target position, rather than using the audio
   container's built-in seek tables - this is slightly heavier per seek but

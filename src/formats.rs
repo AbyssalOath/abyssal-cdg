@@ -123,11 +123,6 @@ fn is_new_block(prev_start: f64, cur_start: f64) -> bool {
     (cur_start - prev_start) > IMPORTED_BLOCK_GAP_THRESHOLD
 }
 
-// Not called from the app yet (no "export as LRC" menu item), only from
-// `export_lrc` below and its tests - kept and tested since it's a cheap,
-// already-correct counterpart to `import_lrc` that a future export feature
-// can wire straight up.
-#[allow(dead_code)]
 fn split_mmss(secs: f64) -> (u64, f64) {
     let secs = secs.max(0.0);
     let mm = (secs / 60.0).floor() as u64;
@@ -241,12 +236,23 @@ pub fn import_lrc(text: &str) -> Vec<LyricLine> {
     result
 }
 
-/// Exports timed lines back to LRC text. `enhanced = true` writes LRC2
-/// inline word tags (from [`crate::lyrics::word_timings`]); `false` writes
-/// plain line-level LRC1.
-#[allow(dead_code)]
-pub fn export_lrc(timed: &[TimedLine], enhanced: bool) -> String {
+/// Exports timed lines back to LRC text, the inverse of [`import_lrc`] -
+/// with `[ti:]`/`[ar:]` metadata tags when `title`/`artist` are given.
+/// `enhanced = true` writes LRC2 inline word tags (from
+/// [`crate::lyrics::word_timings`]); `false` writes plain line-level LRC1.
+pub fn export_lrc(
+    timed: &[TimedLine],
+    enhanced: bool,
+    title: Option<&str>,
+    artist: Option<&str>,
+) -> String {
     let mut out = String::new();
+    if let Some(t) = title {
+        out.push_str(&format!("[ti:{t}]\n"));
+    }
+    if let Some(a) = artist {
+        out.push_str(&format!("[ar:{a}]\n"));
+    }
     for line in timed {
         let (mm, ss) = split_mmss(line.start);
         out.push_str(&format!("[{mm:02}:{ss:05.2}]"));
@@ -420,6 +426,103 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
         result.push(line);
     }
     Ok(result)
+}
+
+/// Notional BPM used to encode our own second-based timing into
+/// UltraStar's beat format on export - chosen purely for beat-resolution
+/// precision (37.5ms/beat at this value), not as a claim about the song's
+/// actual musical tempo (this app has no tempo-detection feature). Real
+/// UltraStar files are normally authored against the song's real BPM, but
+/// nothing about the format *requires* that - a game only ever converts
+/// beats back to seconds using the file's own declared BPM/GAP, exactly
+/// the inverse of [`ultrastar_beat_to_secs`], so any fixed BPM round-trips
+/// correctly as long as we're consistent about it.
+const EXPORT_ULTRASTAR_BPM: f64 = 400.0;
+
+/// Inverse of [`ultrastar_beat_to_secs`], rounded to the nearest whole beat
+/// (UltraStar beats are always integers) and clamped to non-negative -
+/// `gap_secs` is subtracted first so beat 0 lines up with whatever moment
+/// the caller chose as the file's `#GAP:`.
+fn secs_to_beat(secs: f64, gap_secs: f64, bpm: f64) -> i64 {
+    (((secs - gap_secs) * bpm * 4.0 / 60.0).round() as i64).max(0)
+}
+
+fn singer_to_player_marker(singer: Singer) -> &'static str {
+    match singer {
+        Singer::Male => "P1",
+        Singer::Female => "P2",
+        Singer::Duet => "P3",
+        // Not part of the base UltraStar spec, but the same reasonable
+        // extension `import_ultrastar` already accepts on the way in.
+        Singer::Screaming => "P4",
+    }
+}
+
+/// Exports timed lines to an UltraStar `.txt` note file - the inverse of
+/// [`import_ultrastar`]. `mp3_filename` (a bare filename, not a path - see
+/// [`crate::export::paired_audio_path`]) is written as the `#MP3:` header
+/// when given.
+///
+/// Pitch has no equivalent in this app's data model (no melody/pitch-
+/// tracking feature), so every note is written with a constant placeholder
+/// pitch (`0`) - a game that scores pitch accuracy would treat every note
+/// as exactly on-pitch or exactly off, but the lyrics and their timing are
+/// real. Player markers (`P1`-`P4`) are only written where the singer
+/// actually changes from the previous line (and never before a leading
+/// `Male` line, `import_ultrastar`'s own default), so a single-voice song
+/// exports as a plain, non-duet file rather than one needlessly marked up
+/// with a redundant `P1` on every line.
+pub fn export_ultrastar(
+    timed: &[TimedLine],
+    title: Option<&str>,
+    artist: Option<&str>,
+    mp3_filename: Option<&str>,
+) -> String {
+    let bpm = EXPORT_ULTRASTAR_BPM;
+    let gap_secs = timed.first().map(|l| l.start).unwrap_or(0.0);
+
+    let mut out = String::new();
+    out.push_str("#ENCODING:UTF8\n");
+    out.push_str(&format!("#TITLE:{}\n", title.unwrap_or("Untitled")));
+    out.push_str(&format!("#ARTIST:{}\n", artist.unwrap_or("Unknown")));
+    if let Some(mp3) = mp3_filename {
+        out.push_str(&format!("#MP3:{mp3}\n"));
+    }
+    out.push_str(&format!("#GAP:{:.0}\n", gap_secs * 1000.0));
+    out.push_str(&format!("#BPM:{bpm:.2}\n"));
+
+    let mut last_singer: Option<Singer> = None;
+    for (i, line) in timed.iter().enumerate() {
+        let changed = last_singer != Some(line.singer);
+        if changed && !(i == 0 && line.singer == Singer::Male) {
+            out.push_str(singer_to_player_marker(line.singer));
+            out.push('\n');
+        }
+        last_singer = Some(line.singer);
+
+        let words = crate::lyrics::word_timings(line);
+        let last_word = words.len().saturating_sub(1);
+        for (w, word) in words.iter().enumerate() {
+            let start_beat = secs_to_beat(word.highlight_at, gap_secs, bpm);
+            let end_beat = secs_to_beat(word.held_until, gap_secs, bpm);
+            let length_beats = (end_beat - start_beat).max(1);
+            // A trailing space on every syllable but a line's last is how
+            // UltraStar marks "a word boundary follows" when syllables are
+            // concatenated - see `import_ultrastar`'s own `at_word_start`.
+            let suffix = if w == last_word { "" } else { " " };
+            out.push_str(&format!(
+                ": {start_beat} {length_beats} 0 {}{suffix}\n",
+                word.text
+            ));
+        }
+
+        if let Some(next) = timed.get(i + 1) {
+            let break_beat = secs_to_beat(next.start, gap_secs, bpm);
+            out.push_str(&format!("- {break_beat}\n"));
+        }
+    }
+    out.push_str("E\n");
+    out
 }
 
 // ---------------------------------------------------------------------
@@ -598,7 +701,7 @@ mod tests {
         lines[0].start = Some(12.0);
         lines[1].start = Some(15.5);
         let timed = crate::lyrics::resolve_timing(&lines, Some(20.0));
-        let out = export_lrc(&timed, false);
+        let out = export_lrc(&timed, false, None, None);
         assert!(out.contains("[00:12.00]Hello"));
         assert!(out.contains("[00:15.50]World"));
     }
@@ -608,11 +711,117 @@ mod tests {
         let mut lines = vec![LyricLine::new("one two")];
         lines[0].start = Some(0.0);
         let timed = crate::lyrics::resolve_timing(&lines, Some(4.0));
-        let out = export_lrc(&timed, true);
+        let out = export_lrc(&timed, true, None, None);
         assert!(out.starts_with("[00:00.00]"));
         assert!(out.contains('<'));
         assert!(out.contains("one"));
         assert!(out.contains("two"));
+    }
+
+    #[test]
+    fn export_lrc_writes_title_and_artist_tags_when_given() {
+        let mut lines = vec![LyricLine::new("Hello")];
+        lines[0].start = Some(1.0);
+        let timed = crate::lyrics::resolve_timing(&lines, Some(4.0));
+        let out = export_lrc(&timed, false, Some("A Song"), Some("Someone"));
+        assert!(out.starts_with("[ti:A Song]\n[ar:Someone]\n"));
+    }
+
+    #[test]
+    fn export_lrc_omits_title_artist_tags_when_absent() {
+        let mut lines = vec![LyricLine::new("Hello")];
+        lines[0].start = Some(1.0);
+        let timed = crate::lyrics::resolve_timing(&lines, Some(4.0));
+        let out = export_lrc(&timed, false, None, None);
+        assert!(!out.contains("[ti:"));
+        assert!(!out.contains("[ar:"));
+    }
+
+    #[test]
+    fn export_ultrastar_writes_expected_headers_and_terminator() {
+        let mut lines = vec![LyricLine::new("Hello world")];
+        lines[0].start = Some(2.0);
+        let timed = crate::lyrics::resolve_timing(&lines, Some(6.0));
+        let out = export_ultrastar(&timed, Some("A Song"), Some("Someone"), Some("song.mp3"));
+        assert!(out.contains("#ENCODING:UTF8\n"));
+        assert!(out.contains("#TITLE:A Song\n"));
+        assert!(out.contains("#ARTIST:Someone\n"));
+        assert!(out.contains("#MP3:song.mp3\n"));
+        assert!(out.contains("#GAP:2000\n"));
+        assert!(out.trim_end().ends_with('E'));
+    }
+
+    #[test]
+    fn export_ultrastar_uses_placeholder_headers_when_title_artist_missing() {
+        let mut lines = vec![LyricLine::new("Hello")];
+        lines[0].start = Some(0.0);
+        let timed = crate::lyrics::resolve_timing(&lines, Some(4.0));
+        let out = export_ultrastar(&timed, None, None, None);
+        assert!(out.contains("#TITLE:Untitled\n"));
+        assert!(out.contains("#ARTIST:Unknown\n"));
+        assert!(!out.contains("#MP3:"));
+    }
+
+    #[test]
+    fn export_ultrastar_omits_player_markers_for_an_all_male_song() {
+        let mut lines = vec![LyricLine::new("a"), LyricLine::new("b")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(2.0);
+        let timed = crate::lyrics::resolve_timing(&lines, Some(4.0));
+        let out = export_ultrastar(&timed, None, None, None);
+        assert!(!out.contains("P1"));
+    }
+
+    #[test]
+    fn export_ultrastar_marks_singer_changes_but_not_repeats() {
+        let mut lines = vec![
+            LyricLine::new("a"),
+            LyricLine::new("b"),
+            LyricLine::new("c"),
+        ];
+        lines[0].start = Some(0.0);
+        lines[0].singer = Singer::Female;
+        lines[1].start = Some(2.0);
+        lines[1].singer = Singer::Female;
+        lines[2].start = Some(4.0);
+        lines[2].singer = Singer::Male;
+        let timed = crate::lyrics::resolve_timing(&lines, Some(6.0));
+        let out = export_ultrastar(&timed, None, None, None);
+        assert_eq!(out.matches("P2").count(), 1);
+        assert_eq!(out.matches("P1").count(), 1);
+    }
+
+    #[test]
+    fn export_ultrastar_inserts_a_linebreak_between_lines() {
+        let mut lines = vec![LyricLine::new("a"), LyricLine::new("b")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(2.0);
+        let timed = crate::lyrics::resolve_timing(&lines, Some(4.0));
+        let out = export_ultrastar(&timed, None, None, None);
+        assert!(out.lines().any(|l| l.starts_with("- ")));
+    }
+
+    #[test]
+    fn export_ultrastar_round_trips_through_import() {
+        let mut lines = vec![LyricLine::new("hello world"), LyricLine::new("second line")];
+        lines[0].start = Some(3.0);
+        lines[0].word_overrides = vec![Some(3.0), Some(3.6)];
+        lines[1].start = Some(8.0);
+        let timed = crate::lyrics::resolve_timing(&lines, Some(12.0));
+
+        let out = export_ultrastar(&timed, Some("T"), Some("A"), None);
+        let imported = import_ultrastar(&out).unwrap();
+
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].text, "hello world");
+        assert_eq!(imported[1].text, "second line");
+        // Beat quantization at EXPORT_ULTRASTAR_BPM introduces at most
+        // ~1/2 beat (~18.75ms) of rounding error.
+        const TOL: f64 = 0.02;
+        assert!((imported[0].start.unwrap() - 3.0).abs() < TOL);
+        assert!((imported[1].start.unwrap() - 8.0).abs() < TOL);
+        assert!((imported[0].word_overrides[0].unwrap() - 3.0).abs() < TOL);
+        assert!((imported[0].word_overrides[1].unwrap() - 3.6).abs() < TOL);
     }
 
     #[test]

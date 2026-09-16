@@ -314,26 +314,28 @@ pub fn title_card_end(timed_lines: &[TimedLine]) -> f64 {
     }
 }
 
-/// Where a `.cdg`'s paired audio file needs to live for "MP3+G"-style
-/// pickup by karaoke players: the *same* directory and base filename as
-/// `cdg_path`, keeping `audio_path`'s own extension (despite the
-/// convention's name, most players accept whatever format the audio
-/// actually is - it doesn't have to literally be re-encoded to `.mp3`).
-pub fn paired_audio_path(audio_path: &Path, cdg_path: &Path) -> PathBuf {
+/// Where a lyrics/CDG file's paired audio file needs to live for
+/// "MP3+G"-style pickup by karaoke players (also the convention LRC and
+/// UltraStar players/games expect - a same-named audio file in the same
+/// folder): the *same* directory and base filename as `sibling_path`,
+/// keeping `audio_path`'s own extension (despite the "MP3+G" convention's
+/// name, most players accept whatever format the audio actually is - it
+/// doesn't have to literally be re-encoded to `.mp3`).
+pub fn paired_audio_path(audio_path: &Path, sibling_path: &Path) -> PathBuf {
     let ext = audio_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("mp3");
-    cdg_path.with_extension(ext)
+    sibling_path.with_extension(ext)
 }
 
-/// Copies `audio_path` to sit next to `cdg_path` (see [`paired_audio_path`])
-/// so the pair is ready for karaoke-player pickup without a manual copy or
-/// rename. A no-op (not an error) if the audio is already exactly there -
-/// e.g. re-exporting a `.cdg` into the same folder the audio already lives
-/// in, under a name that already matches.
-pub fn copy_paired_audio(audio_path: &Path, cdg_path: &Path) -> Result<PathBuf> {
-    let dest = paired_audio_path(audio_path, cdg_path);
+/// Copies `audio_path` to sit next to `sibling_path` (see
+/// [`paired_audio_path`]) so the pair is ready for pickup by a karaoke
+/// player/game without a manual copy or rename. A no-op (not an error) if
+/// the audio is already exactly there - e.g. re-exporting into the same
+/// folder the audio already lives in, under a name that already matches.
+pub fn copy_paired_audio(audio_path: &Path, sibling_path: &Path) -> Result<PathBuf> {
+    let dest = paired_audio_path(audio_path, sibling_path);
     let already_there = std::fs::canonicalize(audio_path)
         .ok()
         .zip(std::fs::canonicalize(&dest).ok())

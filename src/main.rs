@@ -215,15 +215,22 @@ struct KaraokeApp {
     /// Whether the "Export…" options window is open.
     show_export_dialog: bool,
     export_cdg: bool,
+    export_lrc: bool,
+    export_ultrastar: bool,
     export_video: bool,
     export_instrumental: bool,
+    /// Whether an LRC export writes LRC2 word-level tags (from
+    /// [`lyrics::word_timings`]) or plain line-level LRC1 - word-level is
+    /// more precise but some older/simpler LRC readers only handle LRC1.
+    lrc_enhanced_words: bool,
     /// Folder chosen (once) in the export dialog for all selected outputs.
     export_folder: Option<PathBuf>,
     /// Base filename (no extension) shared by all selected outputs -
-    /// `{base}.cdg`, `{base}.mp4`, `{base}-instrumental.{mp3,wav}`.
+    /// `{base}.cdg`, `{base}.lrc`, `{base}.txt` (UltraStar), `{base}.mp4`,
+    /// `{base}-instrumental.{mp3,wav}`.
     export_base_name: String,
     instrumental_format: InstrumentalFormat,
-    /// Set while a combined export (any mix of .cdg/.mp4/instrumental) is
+    /// Set while a combined export (any mix of the outputs above) is
     /// running in a background thread.
     combined_export: Option<CombinedExportHandle>,
 
@@ -388,6 +395,12 @@ struct UndoSnapshot {
 /// session without letting the history grow unbounded.
 const UNDO_HISTORY_LIMIT: usize = 100;
 
+/// How far before a corrected timestamp `audition_seek` rewinds playback,
+/// so you land a little before the edited point rather than exactly on it -
+/// enough lead-in to hear the transition, not so much that you're waiting
+/// through unrelated audio to get back to what you just changed.
+const AUDITION_REWIND_SECS: f64 = 2.0;
+
 /// Shared state for a background `waveform::build_waveform` call, kicked
 /// off whenever a new audio file is loaded - decoding a whole song can take
 /// a noticeable fraction of a second, so it happens off the UI thread the
@@ -482,8 +495,11 @@ impl KaraokeApp {
             remove_vocals_for_video: false,
             show_export_dialog: false,
             export_cdg: true,
+            export_lrc: false,
+            export_ultrastar: false,
             export_video: false,
             export_instrumental: false,
+            lrc_enhanced_words: true,
             export_folder: None,
             export_base_name: String::new(),
             instrumental_format: InstrumentalFormat::default(),
@@ -1568,6 +1584,19 @@ impl KaraokeApp {
         (timed, indices)
     }
 
+    /// Seeks playback to [`AUDITION_REWIND_SECS`] before `near_time`,
+    /// preserving whether it's currently playing or paused (see
+    /// `AudioPlayer::seek`) - so correcting a timestamp (typing a new
+    /// value, nudging, or dragging a timeline bubble) immediately lands
+    /// you just before it, ready to hear whether the correction landed
+    /// right without manually scrubbing back yourself. No-op if no audio
+    /// is loaded.
+    fn audition_seek(&mut self, near_time: f64) {
+        if let Some(audio) = &mut self.audio {
+            let _ = audio.seek((near_time - AUDITION_REWIND_SECS).max(0.0));
+        }
+    }
+
     fn retap_line(&mut self, idx: usize) {
         let Some(audio) = &self.audio else { return };
         if !audio.is_playing() {
@@ -1694,7 +1723,7 @@ impl KaraokeApp {
     /// loudly. Instrumental-only exports never touch lyric timing at all,
     /// so they're never blocked by this.
     fn missing_timing_reason(&self) -> Option<String> {
-        if !(self.export_cdg || self.export_video) {
+        if !(self.export_cdg || self.export_video || self.export_lrc || self.export_ultrastar) {
             return None;
         }
         let total = self.lines.len();
@@ -1704,7 +1733,7 @@ impl KaraokeApp {
         } else if timed_count < total {
             Some(format!(
                 "{} of {total} line(s) don't have a timestamp yet - they'd be silently left \
-                 out of the .cdg/video otherwise. Tap along (or set times manually) for every \
+                 out of the output(s) otherwise. Tap along (or set times manually) for every \
                  line before exporting.",
                 total - timed_count
             ))
@@ -1727,6 +1756,18 @@ impl KaraokeApp {
                 ui.add_space(6.0);
 
                 ui.checkbox(&mut self.export_cdg, "CD+Graphics (.cdg)");
+
+                ui.checkbox(&mut self.export_lrc, "Lyrics (.lrc)");
+                ui.add_enabled_ui(self.export_lrc, |ui| {
+                    ui.indent("lrc_opts", |ui| {
+                        ui.checkbox(
+                            &mut self.lrc_enhanced_words,
+                            "Word-level (LRC2) - uncheck for plain line-level LRC1",
+                        );
+                    });
+                });
+
+                ui.checkbox(&mut self.export_ultrastar, "Lyrics (UltraStar .txt)");
 
                 ui.checkbox(&mut self.export_video, "Video (.mp4)");
                 ui.add_enabled_ui(self.export_video, |ui| {
@@ -1787,6 +1828,32 @@ impl KaraokeApp {
                         .weak(),
                     );
                 }
+                if self.export_ultrastar {
+                    ui.label(
+                        egui::RichText::new(
+                            "UltraStar export has no pitch data (this app doesn't track \
+                             melody) - every note is written at a constant placeholder pitch, \
+                             so a game that scores pitch accuracy will treat the whole song as \
+                             one fixed note. Lyrics and timing are real.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                if self.export_lrc || self.export_ultrastar {
+                    if let Some(audio) = &self.audio {
+                        if audio.is_loaded() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "The loaded audio is copied alongside lyrics exports too \
+                                     (same base filename), same as the .cdg pairing.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    }
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -1818,7 +1885,11 @@ impl KaraokeApp {
                 }
 
                 ui.add_space(10.0);
-                let can_export = (self.export_cdg || self.export_video || self.export_instrumental)
+                let can_export = (self.export_cdg
+                    || self.export_lrc
+                    || self.export_ultrastar
+                    || self.export_video
+                    || self.export_instrumental)
                     && self.export_folder.is_some()
                     && !self.export_base_name.trim().is_empty()
                     && missing_timing.is_none();
@@ -1848,9 +1919,11 @@ impl KaraokeApp {
             return;
         }
         let do_cdg = self.export_cdg;
+        let do_lrc = self.export_lrc;
+        let do_ultrastar = self.export_ultrastar;
         let do_video = self.export_video;
         let do_instrumental = self.export_instrumental;
-        if !do_cdg && !do_video && !do_instrumental {
+        if !do_cdg && !do_lrc && !do_ultrastar && !do_video && !do_instrumental {
             self.status = "Choose at least one output to export.".to_string();
             return;
         }
@@ -1880,8 +1953,11 @@ impl KaraokeApp {
         let resolution = self.video_resolution;
         let remove_vocals_for_video = self.remove_vocals_for_video;
         let instrumental_ext = self.instrumental_format.extension();
+        let lrc_enhanced = self.lrc_enhanced_words;
 
         let cdg_path = folder.join(format!("{base}.cdg"));
+        let lrc_path = folder.join(format!("{base}.lrc"));
+        let ultrastar_path = folder.join(format!("{base}.txt"));
         let video_path = folder.join(format!("{base}.mp4"));
         let instrumental_path = folder.join(format!("{base}-instrumental.{instrumental_ext}"));
 
@@ -1901,13 +1977,26 @@ impl KaraokeApp {
             // reports its own fine-grained sub-progress within its slice
             // (usually the slowest step by far), the others just jump from
             // 0% to 100% of their slice on completion.
-            let phase_count = do_cdg as u32 + do_video as u32 + do_instrumental as u32;
+            let phase_count = do_cdg as u32
+                + do_lrc as u32
+                + do_ultrastar as u32
+                + do_video as u32
+                + do_instrumental as u32;
             let phase_count = phase_count.max(1);
             let mut phase_index = 0u32;
             let set_progress = move |idx: u32, frac_within: f32| {
                 let overall = (idx as f32 + frac_within.clamp(0.0, 1.0)) / phase_count as f32;
                 progress_clone.store((overall * 1000.0) as u32, Ordering::Relaxed);
             };
+
+            // Auto-pair the loaded audio next to whichever of .cdg/.lrc/
+            // UltraStar's .txt actually gets written (same base filename,
+            // in the same folder) so it's ready for pickup by a karaoke
+            // player/game without a manual copy or rename - all of these
+            // resolve to the *same* paired-audio destination for a given
+            // base name/folder, so this only needs to run once even if
+            // several of them are selected together.
+            let mut paired_audio_sibling: Option<PathBuf> = None;
 
             if do_cdg {
                 let bytes = export::render_cdg(
@@ -1920,28 +2009,76 @@ impl KaraokeApp {
                 let r = std::fs::write(&cdg_path, &bytes)
                     .map(|()| cdg_path.clone())
                     .map_err(|e| e.to_string());
-                let cdg_written = r.is_ok();
+                if r.is_ok() {
+                    paired_audio_sibling.get_or_insert_with(|| cdg_path.clone());
+                }
                 outcomes.push(ExportOutcome {
                     label: "CDG file",
                     result: r,
                 });
 
-                // Auto-pair the loaded audio next to the .cdg (same base
-                // filename) so it's ready for "MP3+G"-style pickup by
-                // karaoke players, instead of a manual copy/rename step.
-                if cdg_written {
-                    if let Some(audio_path) = &audio_path {
-                        let paired = export::copy_paired_audio(audio_path, &cdg_path)
-                            .map_err(|e| e.to_string());
-                        outcomes.push(ExportOutcome {
-                            label: "Paired audio",
-                            result: paired,
-                        });
-                    }
+                phase_index += 1;
+                set_progress(phase_index, 0.0);
+            }
+
+            if do_lrc {
+                let text =
+                    formats::export_lrc(&timed, lrc_enhanced, title.as_deref(), artist.as_deref());
+                let r = std::fs::write(&lrc_path, text)
+                    .map(|()| lrc_path.clone())
+                    .map_err(|e| e.to_string());
+                if r.is_ok() {
+                    paired_audio_sibling.get_or_insert_with(|| lrc_path.clone());
                 }
+                outcomes.push(ExportOutcome {
+                    label: "LRC lyrics",
+                    result: r,
+                });
 
                 phase_index += 1;
                 set_progress(phase_index, 0.0);
+            }
+
+            if do_ultrastar {
+                // UltraStar's `#MP3:` header is a bare filename relative to
+                // the note file's own folder, not a path - it needs to
+                // match whatever the paired-audio copy below actually ends
+                // up named as.
+                let mp3_filename = audio_path.as_ref().and_then(|a| {
+                    export::paired_audio_path(a, &ultrastar_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                });
+                let text = formats::export_ultrastar(
+                    &timed,
+                    title.as_deref(),
+                    artist.as_deref(),
+                    mp3_filename.as_deref(),
+                );
+                let r = std::fs::write(&ultrastar_path, text)
+                    .map(|()| ultrastar_path.clone())
+                    .map_err(|e| e.to_string());
+                if r.is_ok() {
+                    paired_audio_sibling.get_or_insert_with(|| ultrastar_path.clone());
+                }
+                outcomes.push(ExportOutcome {
+                    label: "UltraStar lyrics",
+                    result: r,
+                });
+
+                phase_index += 1;
+                set_progress(phase_index, 0.0);
+            }
+
+            if let Some(sibling) = &paired_audio_sibling {
+                if let Some(audio_path) = &audio_path {
+                    let paired =
+                        export::copy_paired_audio(audio_path, sibling).map_err(|e| e.to_string());
+                    outcomes.push(ExportOutcome {
+                        label: "Paired audio",
+                        result: paired,
+                    });
+                }
             }
 
             // Vocal separation is shared: if both the instrumental export
@@ -2530,6 +2667,17 @@ impl KaraokeApp {
                 && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
                     == Some((orig_idx, TimelineDragTarget::Line))
             {
+                if let Some(mode) = self.timeline_drag.as_ref().map(|d| d.session.mode) {
+                    let seek_near = match mode {
+                        timeline::DragMode::RightEdge => self.lines[orig_idx]
+                            .sing_end_override
+                            .unwrap_or(line.sing_end),
+                        timeline::DragMode::Body | timeline::DragMode::LeftEdge => {
+                            self.lines[orig_idx].start.unwrap_or(line.start)
+                        }
+                    };
+                    self.audition_seek(seek_near);
+                }
                 self.timeline_drag = None;
             }
         }
@@ -2712,6 +2860,24 @@ impl KaraokeApp {
                     && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
                         == Some((orig_idx, target))
                 {
+                    if let Some(mode) = self.timeline_drag.as_ref().map(|d| d.session.mode) {
+                        let seek_near = match mode {
+                            timeline::DragMode::RightEdge => self.lines[orig_idx]
+                                .word_end_overrides
+                                .get(w)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(word.held_until),
+                            timeline::DragMode::Body | timeline::DragMode::LeftEdge => self.lines
+                                [orig_idx]
+                                .word_overrides
+                                .get(w)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(word.highlight_at),
+                        };
+                        self.audition_seek(seek_near);
+                    }
                     self.timeline_drag = None;
                 }
             }
@@ -3506,7 +3672,7 @@ impl eframe::App for KaraokeApp {
                                 };
                                 let start_resp = ui.add(
                                     egui::TextEdit::singleline(&mut start_buf)
-                                        .desired_width(64.0)
+                                        .desired_width(78.0)
                                         .hint_text("00:00.00"),
                                 );
                                 if start_resp.has_focus() {
@@ -3547,7 +3713,7 @@ impl eframe::App for KaraokeApp {
                                 };
                                 let end_resp = ui.add(
                                     egui::TextEdit::singleline(&mut end_buf)
-                                        .desired_width(64.0)
+                                        .desired_width(78.0)
                                         .hint_text(end_hint),
                                 );
                                 if end_resp.has_focus() {
@@ -3615,6 +3781,9 @@ impl eframe::App for KaraokeApp {
                                 if let Some(s) = &mut self.lines[i].start {
                                     *s = (*s + delta).max(0.0);
                                 }
+                                if let Some(new_start) = self.lines[i].start {
+                                    self.audition_seek(new_start);
+                                }
                             }
                             if let Some(i) = clear_idx {
                                 self.lines[i].start = None;
@@ -3628,6 +3797,7 @@ impl eframe::App for KaraokeApp {
                                             Ok(()) => {
                                                 self.lines[i].start = Some(v);
                                                 self.recompute_next_untimed();
+                                                self.audition_seek(v);
                                             }
                                             Err(e) => self.status = e,
                                         }
@@ -3649,6 +3819,7 @@ impl eframe::App for KaraokeApp {
                                         Ok(()) => {
                                             self.lines[i].sing_end_override = Some(v);
                                             self.recompute_next_untimed();
+                                            self.audition_seek(v);
                                         }
                                         Err(e) => self.status = e,
                                     },
