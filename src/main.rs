@@ -196,15 +196,24 @@ struct KaraokeApp {
     seek_drag_value: Option<f64>,
 
     video_resolution: Resolution,
-    /// Set while a video export is running in a background thread.
-    video_export: Option<VideoExportHandle>,
-    /// Whether "Export video (.mp4)…" should mux in a vocals-reduced copy
-    /// of the audio (via [`vocals::remove_vocals_to_file`]) instead of the
+    /// Whether a video export should mux in a vocals-reduced copy of the
+    /// audio (via [`vocals::remove_vocals_to_file`]) instead of the
     /// original.
     remove_vocals_for_video: bool,
-    /// Set while a standalone instrumental-audio export is running in a
-    /// background thread.
-    vocal_removal_export: Option<VocalRemovalExportHandle>,
+    /// Whether the "Export…" options window is open.
+    show_export_dialog: bool,
+    export_cdg: bool,
+    export_video: bool,
+    export_instrumental: bool,
+    /// Folder chosen (once) in the export dialog for all selected outputs.
+    export_folder: Option<PathBuf>,
+    /// Base filename (no extension) shared by all selected outputs -
+    /// `{base}.cdg`, `{base}.mp4`, `{base}-instrumental.{mp3,wav}`.
+    export_base_name: String,
+    instrumental_format: InstrumentalFormat,
+    /// Set while a combined export (any mix of .cdg/.mp4/instrumental) is
+    /// running in a background thread.
+    combined_export: Option<CombinedExportHandle>,
 
     /// Zoom/scroll state for the fine-tuning timeline.
     timeline_view: timeline::View,
@@ -235,19 +244,44 @@ struct TimelineDrag {
     session: timeline::DragSession,
 }
 
-/// Shared state for a video export running on a background thread, so the
-/// GUI stays responsive and can show a progress bar (encoding a full song
-/// can take anywhere from several seconds to a couple of minutes).
-struct VideoExportHandle {
-    progress: Arc<AtomicU32>, // 0..=1000 (tenths of a percent)
-    result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+/// Audio format for the standalone instrumental export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum InstrumentalFormat {
+    #[default]
+    Mp3,
+    Wav,
 }
 
-/// Shared state for a standalone instrumental-audio export running on a
-/// background thread. No progress fraction - a single ffmpeg filter pass
-/// over audio is usually quick enough that a busy indicator is enough.
-struct VocalRemovalExportHandle {
-    result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+impl InstrumentalFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Mp3 => "mp3",
+            Self::Wav => "wav",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mp3 => "MP3",
+            Self::Wav => "WAV",
+        }
+    }
+}
+
+/// One output's result from a combined export - a combined export can
+/// partially succeed (e.g. ffmpeg missing but audio-separator present), so
+/// each requested output is tracked and reported independently.
+struct ExportOutcome {
+    label: &'static str,
+    result: Result<PathBuf, String>,
+}
+
+/// Shared state for a combined export (any mix of .cdg/.mp4/instrumental
+/// audio) running on a background thread, so the GUI stays responsive and
+/// can show one progress bar spanning every selected output.
+struct CombinedExportHandle {
+    progress: Arc<AtomicU32>, // 0..=1000 (tenths of a percent), across all selected outputs
+    result: Arc<Mutex<Option<Vec<ExportOutcome>>>>,
 }
 
 impl KaraokeApp {
@@ -294,9 +328,15 @@ impl KaraokeApp {
             status: String::new(),
             seek_drag_value: None,
             video_resolution: Resolution::Hd1080,
-            video_export: None,
             remove_vocals_for_video: false,
-            vocal_removal_export: None,
+            show_export_dialog: false,
+            export_cdg: true,
+            export_video: false,
+            export_instrumental: false,
+            export_folder: None,
+            export_base_name: String::new(),
+            instrumental_format: InstrumentalFormat::default(),
+            combined_export: None,
             timeline_view: timeline::View::default(),
             timeline_drag: None,
         }
@@ -453,7 +493,7 @@ impl KaraokeApp {
     }
 
     fn project_busy(&self) -> bool {
-        self.video_export.is_some() || self.vocal_removal_export.is_some()
+        self.combined_export.is_some()
     }
 
     fn default_project_file_name(&self) -> String {
@@ -979,267 +1019,350 @@ impl KaraokeApp {
         self.recompute_next_untimed();
     }
 
-    fn start_video_export(&mut self) {
-        if self.video_export.is_some() {
-            self.status = "A video export is already in progress.".to_string();
-            return;
+    /// Opens the combined "Export…" dialog, pre-filling the base filename
+    /// (if it's still empty) from the loaded audio's name or the song
+    /// title, so there's usually nothing to type before exporting.
+    fn open_export_dialog(&mut self) {
+        if self.export_base_name.trim().is_empty() {
+            self.export_base_name = self
+                .audio
+                .as_ref()
+                .and_then(|a| a.file_name())
+                .map(|n| n.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(n))
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let t = self.title.trim();
+                    (!t.is_empty()).then(|| t.to_string())
+                })
+                .unwrap_or_else(|| "karaoke".to_string());
         }
-        let timed_count = self.lines.iter().filter(|l| l.start.is_some()).count();
-        if timed_count == 0 {
-            self.status = "No lines are timed yet - tap along with the song first.".to_string();
-            return;
-        }
-        let Some(audio_path) = self
-            .audio
-            .as_ref()
-            .and_then(|a| a.path())
-            .map(|p| p.to_path_buf())
-        else {
-            self.status = "Load an audio file first - the video needs it for sound.".to_string();
-            return;
-        };
-
-        let (timed, total_duration) = self.resolved();
-        let palette = self.video_palette();
-        let title = if self.title.trim().is_empty() {
-            None
-        } else {
-            Some(self.title.trim().to_string())
-        };
-        let artist = if self.artist.trim().is_empty() {
-            None
-        } else {
-            Some(self.artist.trim().to_string())
-        };
-        let resolution = self.video_resolution;
-
-        let default_name = self
-            .audio
-            .as_ref()
-            .and_then(|a| a.file_name())
-            .map(|n| {
-                let stem = n.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(n);
-                format!("{stem}.mp4")
-            })
-            .unwrap_or_else(|| "karaoke.mp4".to_string());
-
-        let Some(output_path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .add_filter("MP4 video", &["mp4"])
-            .save_file()
-        else {
-            return;
-        };
-
-        let progress = Arc::new(AtomicU32::new(0));
-        let result = Arc::new(Mutex::new(None));
-        let progress_clone = progress.clone();
-        let result_clone = result.clone();
-        let remove_vocals = self.remove_vocals_for_video;
-
-        self.status = "Rendering video… this can take a while for longer songs.".to_string();
-        self.video_export = Some(VideoExportHandle { progress, result });
-
-        std::thread::spawn(move || {
-            // Remove vocals first (into a throwaway temp file) if asked -
-            // render_video just needs *some* audio file path to mux in, so
-            // swapping it for the instrumental copy is all that's needed to
-            // carry the same "remove vocals" option into the exported video.
-            let instrumental_path = if remove_vocals {
-                let tmp = std::env::temp_dir().join(format!(
-                    "abyssal-cdg-instrumental-{}.wav",
-                    std::process::id()
-                ));
-                if let Err(e) = vocals::remove_vocals_to_file(&audio_path, &tmp) {
-                    *result_clone.lock().unwrap() = Some(Err(format!("Vocal removal failed: {e}")));
-                    return;
-                }
-                Some(tmp)
-            } else {
-                None
-            };
-            let render_audio_path = instrumental_path.as_deref().unwrap_or(&audio_path);
-
-            let r = video::render_video(
-                &timed,
-                total_duration,
-                &palette,
-                title.as_deref(),
-                artist.as_deref(),
-                resolution,
-                30,
-                render_audio_path,
-                &output_path,
-                |p| {
-                    progress_clone.store((p * 1000.0) as u32, Ordering::Relaxed);
-                },
-            );
-            if let Some(tmp) = &instrumental_path {
-                let _ = std::fs::remove_file(tmp);
-            }
-            let mapped = r.map(|()| output_path).map_err(|e| e.to_string());
-            *result_clone.lock().unwrap() = Some(mapped);
-        });
+        self.show_export_dialog = true;
     }
 
-    fn start_vocal_removal_export(&mut self) {
-        if self.vocal_removal_export.is_some() {
-            self.status = "An instrumental export is already in progress.".to_string();
+    /// Draws the combined export options window: which output(s) to
+    /// produce, their shared output folder/base filename, and any
+    /// per-output settings (video resolution/vocal removal, instrumental
+    /// format) - replaces three separate export buttons and three separate
+    /// save dialogs with one folder pick and one click.
+    fn draw_export_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_export_dialog {
             return;
         }
-        let Some(audio_path) = self
-            .audio
-            .as_ref()
-            .and_then(|a| a.path())
-            .map(|p| p.to_path_buf())
-        else {
-            self.status = "Load an audio file first.".to_string();
-            return;
-        };
+        let mut open = true;
+        egui::Window::new("Export…")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Choose what to export - all selected outputs share one folder and base filename:");
+                ui.add_space(6.0);
 
-        let default_name = self
-            .audio
-            .as_ref()
-            .and_then(|a| a.file_name())
-            .map(|n| {
-                let stem = n.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(n);
-                format!("{stem}-instrumental.mp3")
-            })
-            .unwrap_or_else(|| "instrumental.mp3".to_string());
+                ui.checkbox(&mut self.export_cdg, "CD+Graphics (.cdg)");
 
-        let Some(output_path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .add_filter("MP3 audio", &["mp3"])
-            .add_filter("WAV audio", &["wav"])
-            .save_file()
-        else {
-            return;
-        };
+                ui.checkbox(&mut self.export_video, "Video (.mp4)");
+                ui.add_enabled_ui(self.export_video, |ui| {
+                    ui.indent("video_opts", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Resolution:");
+                            egui::ComboBox::from_id_source("export_video_res")
+                                .selected_text(self.video_resolution.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.video_resolution,
+                                        Resolution::Hd1080,
+                                        "1080p",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.video_resolution,
+                                        Resolution::Uhd4k,
+                                        "4K",
+                                    );
+                                });
+                        });
+                        ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals (slow)");
+                    });
+                });
 
-        let result = Arc::new(Mutex::new(None));
-        let result_clone = result.clone();
+                ui.checkbox(&mut self.export_instrumental, "Instrumental audio");
+                ui.add_enabled_ui(self.export_instrumental, |ui| {
+                    ui.indent("instrumental_opts", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Format:");
+                            egui::ComboBox::from_id_source("export_instrumental_format")
+                                .selected_text(self.instrumental_format.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.instrumental_format,
+                                        InstrumentalFormat::Mp3,
+                                        "MP3",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.instrumental_format,
+                                        InstrumentalFormat::Wav,
+                                        "WAV",
+                                    );
+                                });
+                        });
+                    });
+                });
 
-        self.status = "Removing vocals… this runs a real separation model and can take a \
-                       while (longer on CPU than GPU)."
-            .to_string();
-        self.vocal_removal_export = Some(VocalRemovalExportHandle { result });
-
-        std::thread::spawn(move || {
-            let r = vocals::remove_vocals_to_file(&audio_path, &output_path);
-            let mapped = r.map(|()| output_path).map_err(|e| e.to_string());
-            *result_clone.lock().unwrap() = Some(mapped);
-        });
-    }
-
-    /// Checks on a running instrumental-audio export, if any, updating
-    /// status when it finishes. Returns true while still in progress (so
-    /// the caller knows to keep repainting for the busy indicator).
-    fn poll_vocal_removal_export(&mut self) -> bool {
-        let Some(handle) = &self.vocal_removal_export else {
-            return false;
-        };
-        let finished = handle.result.lock().unwrap().take();
-        if let Some(result) = finished {
-            match result {
-                Ok(path) => {
-                    self.status = format!("Saved {} - instrumental separated.", path.display());
-                }
-                Err(e) => {
-                    self.status = format!("Instrumental export failed: {e}");
-                }
-            }
-            self.vocal_removal_export = None;
-            false
-        } else {
-            true
-        }
-    }
-
-    /// Checks on a running video export, if any, updating status when it
-    /// finishes. Returns true while an export is still in progress (so the
-    /// caller knows to keep repainting for the progress bar).
-    fn poll_video_export(&mut self) -> bool {
-        let Some(handle) = &self.video_export else {
-            return false;
-        };
-        let finished = handle.result.lock().unwrap().take();
-        if let Some(result) = finished {
-            match result {
-                Ok(path) => {
-                    self.status = format!(
-                        "Saved {} - a complete standalone video, ready to share or upload.",
-                        path.display()
+                if self.export_video || self.export_instrumental {
+                    ui.label(
+                        egui::RichText::new(
+                            "Vocal removal runs a real ML separation model (UVR-MDX-NET, via \
+                             the audio-separator command-line tool) - needs audio-separator \
+                             installed separately (pip install audio-separator) and can take \
+                             a while, especially without a GPU.",
+                        )
+                        .small()
+                        .weak(),
                     );
                 }
-                Err(e) => {
-                    self.status = format!("Video export failed: {e}");
-                }
-            }
-            self.video_export = None;
-            false
-        } else {
-            true
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Base filename:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.export_base_name)
+                            .desired_width(180.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Choose folder…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            self.export_folder = Some(dir);
+                        }
+                    }
+                    match &self.export_folder {
+                        Some(dir) => ui.label(dir.display().to_string()),
+                        None => ui.label(egui::RichText::new("(no folder chosen)").weak()),
+                    };
+                });
+
+                ui.add_space(10.0);
+                let can_export = (self.export_cdg || self.export_video || self.export_instrumental)
+                    && self.export_folder.is_some()
+                    && !self.export_base_name.trim().is_empty();
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(can_export, |ui| {
+                        if ui.button("Export").clicked() {
+                            self.start_combined_export();
+                        }
+                    });
+                    if ui.button("Cancel").clicked() {
+                        self.show_export_dialog = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_export_dialog = false;
         }
     }
 
-    fn export(&mut self) {
+    fn start_combined_export(&mut self) {
+        if self.combined_export.is_some() {
+            self.status = "An export is already in progress.".to_string();
+            return;
+        }
         let timed_count = self.lines.iter().filter(|l| l.start.is_some()).count();
         if timed_count == 0 {
             self.status = "No lines are timed yet - tap along with the song first.".to_string();
             return;
         }
-
-        let (timed, total_duration) = self.resolved();
-
-        let default_name = self
-            .audio
-            .as_ref()
-            .and_then(|a| a.file_name())
-            .map(|n| {
-                let stem = n.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(n);
-                format!("{stem}.cdg")
-            })
-            .unwrap_or_else(|| "karaoke.cdg".to_string());
-
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .add_filter("CD+Graphics", &["cdg"])
-            .save_file()
-        else {
+        let do_cdg = self.export_cdg;
+        let do_video = self.export_video;
+        let do_instrumental = self.export_instrumental;
+        if !do_cdg && !do_video && !do_instrumental {
+            self.status = "Choose at least one output to export.".to_string();
+            return;
+        }
+        let Some(folder) = self.export_folder.clone() else {
+            self.status = "Choose an output folder first.".to_string();
             return;
         };
+        let base = self.export_base_name.trim();
+        let base = if base.is_empty() { "karaoke" } else { base }.to_string();
 
-        let title = if self.title.trim().is_empty() {
-            None
-        } else {
-            Some(self.title.trim())
-        };
-        let artist = if self.artist.trim().is_empty() {
-            None
-        } else {
-            Some(self.artist.trim())
-        };
+        let audio_path = self
+            .audio
+            .as_ref()
+            .and_then(|a| a.path())
+            .map(|p| p.to_path_buf());
+        if (do_video || do_instrumental) && audio_path.is_none() {
+            self.status =
+                "Load an audio file first - video/instrumental export need it.".to_string();
+            return;
+        }
 
-        let bytes = export::render_cdg(&timed, total_duration, &self.palette(), title, artist);
-        match std::fs::write(&path, &bytes) {
-            Ok(()) => {
-                self.status = format!(
-                    "Saved {} ({:.1}s of graphics). To play it, put an audio file with the \
-                     SAME name next to it (e.g. {}.mp3 alongside {}) - most karaoke players \
-                     look for that pair automatically.",
-                    path.display(),
+        let (timed, total_duration) = self.resolved();
+        let cdg_palette = self.palette();
+        let video_palette = self.video_palette();
+        let title = (!self.title.trim().is_empty()).then(|| self.title.trim().to_string());
+        let artist = (!self.artist.trim().is_empty()).then(|| self.artist.trim().to_string());
+        let resolution = self.video_resolution;
+        let remove_vocals_for_video = self.remove_vocals_for_video;
+        let instrumental_ext = self.instrumental_format.extension();
+
+        let cdg_path = folder.join(format!("{base}.cdg"));
+        let video_path = folder.join(format!("{base}.mp4"));
+        let instrumental_path = folder.join(format!("{base}-instrumental.{instrumental_ext}"));
+
+        let progress = Arc::new(AtomicU32::new(0));
+        let result: Arc<Mutex<Option<Vec<ExportOutcome>>>> = Arc::new(Mutex::new(None));
+        let progress_clone = progress.clone();
+        let result_clone = result.clone();
+
+        self.status = "Exporting…".to_string();
+        self.show_export_dialog = false;
+        self.combined_export = Some(CombinedExportHandle { progress, result });
+
+        std::thread::spawn(move || {
+            let mut outcomes = Vec::new();
+
+            // Equal-weighted phases across whatever was selected - video
+            // reports its own fine-grained sub-progress within its slice
+            // (usually the slowest step by far), the others just jump from
+            // 0% to 100% of their slice on completion.
+            let phase_count = do_cdg as u32 + do_video as u32 + do_instrumental as u32;
+            let phase_count = phase_count.max(1);
+            let mut phase_index = 0u32;
+            let set_progress = move |idx: u32, frac_within: f32| {
+                let overall = (idx as f32 + frac_within.clamp(0.0, 1.0)) / phase_count as f32;
+                progress_clone.store((overall * 1000.0) as u32, Ordering::Relaxed);
+            };
+
+            if do_cdg {
+                let bytes = export::render_cdg(
+                    &timed,
                     total_duration,
-                    path.file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    path.file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default(),
+                    &cdg_palette,
+                    title.as_deref(),
+                    artist.as_deref(),
                 );
+                let r = std::fs::write(&cdg_path, &bytes)
+                    .map(|()| cdg_path.clone())
+                    .map_err(|e| e.to_string());
+                outcomes.push(ExportOutcome {
+                    label: "CDG file",
+                    result: r,
+                });
+                phase_index += 1;
+                set_progress(phase_index, 0.0);
             }
-            Err(e) => {
-                self.status = format!("Couldn't write file: {e}");
+
+            // Vocal separation is shared: if both the instrumental export
+            // and the video's "remove vocals" are requested, run the
+            // (slow) separation model once and reuse it for both, instead
+            // of separating the same song twice.
+            let mut shared_instrumental: Option<PathBuf> = None;
+
+            if do_instrumental {
+                if let Some(audio_path) = &audio_path {
+                    let r = vocals::remove_vocals_to_file(audio_path, &instrumental_path);
+                    if r.is_ok() {
+                        shared_instrumental = Some(instrumental_path.clone());
+                    }
+                    outcomes.push(ExportOutcome {
+                        label: "Instrumental audio",
+                        result: r
+                            .map(|()| instrumental_path.clone())
+                            .map_err(|e| e.to_string()),
+                    });
+                }
+                phase_index += 1;
+                set_progress(phase_index, 0.0);
             }
+
+            if do_video {
+                let video_result: Result<PathBuf, String> = (|| {
+                    let audio_path = audio_path
+                        .as_ref()
+                        .ok_or_else(|| "no audio loaded".to_string())?;
+
+                    let mut own_temp: Option<PathBuf> = None;
+                    let render_audio_path: PathBuf = if remove_vocals_for_video {
+                        if let Some(shared) = &shared_instrumental {
+                            shared.clone()
+                        } else {
+                            let tmp = std::env::temp_dir().join(format!(
+                                "abyssal-cdg-instrumental-{}.wav",
+                                std::process::id()
+                            ));
+                            vocals::remove_vocals_to_file(audio_path, &tmp)
+                                .map_err(|e| format!("Vocal removal failed: {e}"))?;
+                            own_temp = Some(tmp.clone());
+                            tmp
+                        }
+                    } else {
+                        audio_path.clone()
+                    };
+
+                    let video_phase = phase_index;
+                    let r = video::render_video(
+                        &timed,
+                        total_duration,
+                        &video_palette,
+                        title.as_deref(),
+                        artist.as_deref(),
+                        resolution,
+                        30,
+                        &render_audio_path,
+                        &video_path,
+                        |p| set_progress(video_phase, p),
+                    );
+
+                    if let Some(tmp) = &own_temp {
+                        let _ = std::fs::remove_file(tmp);
+                    }
+
+                    r.map(|()| video_path.clone()).map_err(|e| e.to_string())
+                })();
+
+                outcomes.push(ExportOutcome {
+                    label: "Video",
+                    result: video_result,
+                });
+                phase_index += 1;
+                set_progress(phase_index, 0.0);
+            }
+
+            *result_clone.lock().unwrap() = Some(outcomes);
+        });
+    }
+
+    /// Checks on a running combined export, if any, updating status when
+    /// it finishes. Returns true while still in progress (so the caller
+    /// knows to keep repainting for the progress bar).
+    fn poll_combined_export(&mut self) -> bool {
+        let Some(handle) = &self.combined_export else {
+            return false;
+        };
+        let finished = handle.result.lock().unwrap().take();
+        if let Some(outcomes) = finished {
+            let any_err = outcomes.iter().any(|o| o.result.is_err());
+            let any_ok = outcomes.iter().any(|o| o.result.is_ok());
+            let lines: Vec<String> = outcomes
+                .iter()
+                .map(|o| match &o.result {
+                    Ok(path) => format!("{}: saved to {}", o.label, path.display()),
+                    Err(e) => format!("{}: failed - {e}", o.label),
+                })
+                .collect();
+            let heading = if any_err && any_ok {
+                "Export finished with some errors:"
+            } else if any_err {
+                "Export failed:"
+            } else {
+                "Export complete!"
+            };
+            self.status = format!("{heading}\n{}", lines.join("\n"));
+            self.combined_export = None;
+            false
+        } else {
+            true
         }
     }
 
@@ -1995,10 +2118,7 @@ impl eframe::App for KaraokeApp {
                 self.audio.as_mut().unwrap().stop();
             }
         }
-        if self.poll_video_export() {
-            ctx.request_repaint();
-        }
-        if self.poll_vocal_removal_export() {
+        if self.poll_combined_export() {
             ctx.request_repaint();
         }
         self.auto_follow_word_tap_line();
@@ -2190,65 +2310,31 @@ impl eframe::App for KaraokeApp {
             });
         });
 
+        self.draw_export_dialog(ctx);
+
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.add_space(4.0);
-            let exporting_video = self.video_export.is_some();
-            let exporting_instrumental = self.vocal_removal_export.is_some();
-            let busy = exporting_video || exporting_instrumental;
+            let busy = self.project_busy();
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!busy, |ui| {
-                    if ui.button("Export .cdg…").clicked() {
-                        self.export();
+                    if ui
+                        .add_sized([120.0, 28.0], egui::Button::new("Export…"))
+                        .clicked()
+                    {
+                        self.open_export_dialog();
                     }
                     if ui.button("Reset all timing").clicked() {
                         self.reset_timing();
                     }
-                    ui.separator();
-                    egui::ComboBox::from_id_source("video_res")
-                        .selected_text(self.video_resolution.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.video_resolution,
-                                Resolution::Hd1080,
-                                "1080p",
-                            );
-                            ui.selectable_value(
-                                &mut self.video_resolution,
-                                Resolution::Uhd4k,
-                                "4K",
-                            );
-                        });
-                    ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals (slow)");
-                    if ui.button("Export video (.mp4)…").clicked() {
-                        self.start_video_export();
-                    }
                 });
-            });
-            if let Some(handle) = &self.video_export {
-                let frac = handle.progress.load(Ordering::Relaxed) as f32 / 1000.0;
-                ui.add(egui::ProgressBar::new(frac).show_percentage());
-            }
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    if ui.button("Export instrumental audio…").clicked() {
-                        self.start_vocal_removal_export();
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "Both vocal-removal options run a real ML separation model (UVR-MDX-NET, \
-                         via the audio-separator command-line tool) - genuinely separates the \
-                         instrumental instead of just cancelling centered audio, but needs \
-                         audio-separator installed separately (pip install audio-separator) and \
-                         can take a while to run, especially without a GPU.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                if exporting_instrumental {
+                if busy {
                     ui.spinner();
                 }
             });
+            if let Some(handle) = &self.combined_export {
+                let frac = handle.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+                ui.add(egui::ProgressBar::new(frac).show_percentage());
+            }
             if !self.status.is_empty() {
                 ui.label(&self.status);
             }
