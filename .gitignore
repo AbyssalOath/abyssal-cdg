@@ -24,3 +24,8 @@ Desktop.ini
 # Likely-accidental exports if you run/test from the repo root
 /*.cdg
 /*.mp4
+# Project files (.abyzl) saved while testing from the repo root - the real
+# crash-recovery autosave lives in the OS per-user data directory (see
+# project::autosave_path), not here, but a "Save Project"/"Save Project
+# As…" during local testing can easily default into the working directory.
+/*.abyzl

@@ -18,7 +18,7 @@
 
 /// Which voice sings a line - lets duet songs color each singer's lines
 /// differently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Singer {
     #[default]
     Male,
@@ -60,7 +60,7 @@ fn estimate_sing_duration(text: &str, window: f64) -> f64 {
     est.min(window.max(0.0))
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LyricLine {
     pub text: String,
     /// Start time in seconds. `None` means "not yet timed".

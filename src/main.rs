@@ -11,6 +11,7 @@ mod export;
 mod font;
 mod formats;
 mod lyrics;
+mod project;
 mod timeline;
 mod video;
 mod vocals;
@@ -22,7 +23,7 @@ use lyrics::{
     blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines,
     parse_pasted_lyrics, resolve_timing, LyricLine, Singer, TimedLine,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use video::{Resolution, VideoPalette};
@@ -51,6 +52,21 @@ fn cdg_from_color32(c: egui::Color32) -> cdg::CdgColor {
         (c.g() as u16 * 15 / 255) as u8,
         (c.b() as u16 * 15 / 255) as u8,
     )
+}
+
+/// Convert a full-range egui color to the plain RGB struct project files are
+/// saved with (kept independent of `egui` so `project.rs` doesn't need
+/// `egui`'s `serde` feature enabled just for this one struct).
+fn rgb_color_from_color32(c: egui::Color32) -> project::RgbColor {
+    project::RgbColor {
+        r: c.r(),
+        g: c.g(),
+        b: c.b(),
+    }
+}
+
+fn color32_from_rgb_color(c: project::RgbColor) -> egui::Color32 {
+    egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
 /// Which timestamp clicking a word in the fine-tune panel sets.
@@ -108,6 +124,16 @@ struct KaraokeApp {
 
     lyrics_raw: String,
     lines: Vec<LyricLine>,
+    /// Path this project was last saved to or loaded from - Ctrl+S / "Save
+    /// Project" writes straight back here without a dialog; `None` means
+    /// there's no file yet, so saving falls back to "Save Project As…".
+    current_project_path: Option<PathBuf>,
+    /// A crash-recovery autosave found at startup, waiting on a yes/no
+    /// prompt before anything else is drawn - see `draw_recovery_prompt`.
+    pending_recovery: Option<project::ProjectFile>,
+    /// Last time the crash-recovery autosave was written, so it only
+    /// happens every [`AUTOSAVE_INTERVAL`] rather than every frame.
+    last_autosave: Option<std::time::Instant>,
     /// Index of the next line "Tap next line"/Space will assign a
     /// timestamp to.
     next_untimed: usize,
@@ -218,6 +244,9 @@ impl KaraokeApp {
             audio,
             audio_error,
             lyrics_raw: String::new(),
+            current_project_path: None,
+            pending_recovery: project::read_autosave(APP_ID),
+            last_autosave: None,
             lines: Vec::new(),
             next_untimed: 0,
             tap_phase: TapPhase::default(),
@@ -303,6 +332,233 @@ impl KaraokeApp {
             .unwrap_or(0.0)
             .max(timed.last().map(|t| t.end).unwrap_or(0.0));
         (timed, total)
+    }
+
+    /// Snapshots everything a project file needs to capture from the
+    /// current session - see `project.rs` for what's included and why.
+    fn to_project_file(&self) -> project::ProjectFile {
+        project::ProjectFile {
+            version: project::CURRENT_VERSION,
+            audio_path: self
+                .audio
+                .as_ref()
+                .and_then(|a| a.path())
+                .map(|p| p.to_path_buf()),
+            lyrics_raw: self.lyrics_raw.clone(),
+            lines: self.lines.clone(),
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            colors: project::ProjectColors {
+                background: rgb_color_from_color32(self.color_bg),
+                male_unsung: rgb_color_from_color32(self.color_male_unsung),
+                male_highlight: rgb_color_from_color32(self.color_male_highlight),
+                female_unsung: rgb_color_from_color32(self.color_female_unsung),
+                female_highlight: rgb_color_from_color32(self.color_female_highlight),
+                duet_unsung: rgb_color_from_color32(self.color_duet_unsung),
+                duet_highlight: rgb_color_from_color32(self.color_duet_highlight),
+                preview: rgb_color_from_color32(self.color_preview),
+                title: rgb_color_from_color32(self.color_title),
+                artist: rgb_color_from_color32(self.color_artist),
+                screaming_unsung: rgb_color_from_color32(self.color_screaming_unsung),
+                screaming_highlight: rgb_color_from_color32(self.color_screaming_highlight),
+            },
+            video_resolution: self.video_resolution,
+        }
+    }
+
+    /// Replaces all project-level state (lyrics, timing, colors, title,
+    /// resolution) with what's in `project`, and tries to load the audio
+    /// file it references if the path still exists. Session-only state
+    /// (timeline zoom, in-progress text-field edits, the fine-tune panel
+    /// selection, ...) is reset rather than carried over, since none of it
+    /// makes sense carried into a different project's content.
+    fn apply_project_file(&mut self, project: project::ProjectFile) {
+        self.lyrics_raw = project.lyrics_raw;
+        self.lines = project.lines;
+        self.title = project.title;
+        self.artist = project.artist;
+        self.video_resolution = project.video_resolution;
+
+        let c = project.colors;
+        self.color_bg = color32_from_rgb_color(c.background);
+        self.color_male_unsung = color32_from_rgb_color(c.male_unsung);
+        self.color_male_highlight = color32_from_rgb_color(c.male_highlight);
+        self.color_female_unsung = color32_from_rgb_color(c.female_unsung);
+        self.color_female_highlight = color32_from_rgb_color(c.female_highlight);
+        self.color_duet_unsung = color32_from_rgb_color(c.duet_unsung);
+        self.color_duet_highlight = color32_from_rgb_color(c.duet_highlight);
+        self.color_preview = color32_from_rgb_color(c.preview);
+        self.color_title = color32_from_rgb_color(c.title);
+        self.color_artist = color32_from_rgb_color(c.artist);
+        self.color_screaming_unsung = color32_from_rgb_color(c.screaming_unsung);
+        self.color_screaming_highlight = color32_from_rgb_color(c.screaming_highlight);
+
+        self.recompute_next_untimed();
+        self.word_tap_line = None;
+        self.start_edit = None;
+        self.end_edit = None;
+        self.timeline_drag = None;
+        self.timeline_view = timeline::View::default();
+        self.seek_drag_value = None;
+
+        match project.audio_path {
+            Some(path) if path.exists() => {
+                self.load_audio(path);
+                self.status = format!("Loaded project - {}", self.status);
+            }
+            Some(path) => {
+                self.status = format!(
+                    "Loaded project, but its audio file wasn't found at {} - load it manually.",
+                    path.display()
+                );
+            }
+            None => {
+                self.status = "Loaded project (no audio file was saved with it).".to_string();
+            }
+        }
+    }
+
+    fn project_busy(&self) -> bool {
+        self.video_export.is_some() || self.vocal_removal_export.is_some()
+    }
+
+    fn default_project_file_name(&self) -> String {
+        let stem = self
+            .audio
+            .as_ref()
+            .and_then(|a| a.file_name())
+            .map(|n| n.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(n))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let t = self.title.trim();
+                (!t.is_empty()).then(|| t.to_string())
+            })
+            .unwrap_or_else(|| "karaoke-project".to_string());
+        format!("{stem}.{}", project::FILE_EXTENSION)
+    }
+
+    /// Ctrl+S / "Save Project" - writes straight back to
+    /// `current_project_path` if there is one, else falls back to the
+    /// "Save Project As…" dialog (there's nowhere to write to yet).
+    fn save_project(&mut self) {
+        if let Some(path) = self.current_project_path.clone() {
+            self.write_project_to(&path);
+        } else {
+            self.save_project_as_dialog();
+        }
+    }
+
+    fn save_project_as_dialog(&mut self) {
+        let default_name = self.default_project_file_name();
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("Abyssal CDG project", &[project::FILE_EXTENSION])
+            .save_file()
+        {
+            let path = project::ensure_project_extension(path);
+            self.write_project_to(&path);
+        }
+    }
+
+    fn write_project_to(&mut self, path: &Path) {
+        let project = self.to_project_file();
+        match project.save_to_file(path) {
+            Ok(()) => {
+                self.current_project_path = Some(path.to_path_buf());
+                self.status = format!("Saved project to {}", path.display());
+            }
+            Err(e) => {
+                self.status = format!("Couldn't save project: {e}");
+            }
+        }
+    }
+
+    fn load_project_dialog(&mut self) {
+        if self.project_busy() {
+            self.status = "Can't load a project while an export is running.".to_string();
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Abyssal CDG project", &[project::FILE_EXTENSION])
+            .pick_file()
+        {
+            self.load_project_file(path);
+        }
+    }
+
+    fn load_project_file(&mut self, path: PathBuf) {
+        match project::ProjectFile::load_from_file(&path) {
+            Ok(loaded) => {
+                self.apply_project_file(loaded);
+                self.current_project_path = Some(path);
+            }
+            Err(e) => {
+                self.status = format!("Couldn't load project {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Draws the full-window "recover previous session?" prompt shown when
+    /// `pending_recovery` is set, in place of the rest of the UI until the
+    /// user decides - see `AUTOSAVE_INTERVAL`/`on_exit` for how an autosave
+    /// does (or doesn't) end up there in the first place.
+    fn draw_recovery_prompt(&mut self, ctx: &egui::Context) {
+        let Some(recovered) = self.pending_recovery.clone() else {
+            return;
+        };
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("Recover previous session?");
+                ui.add_space(8.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(480.0);
+                    ui.label(
+                        "Abyssal CDG Creator didn't close normally last time (a crash, a \
+                         force-quit, or a system shutdown) - there's an autosaved session \
+                         from partway through your work that was never explicitly saved.",
+                    );
+                });
+                ui.add_space(12.0);
+
+                ui.group(|ui| {
+                    let timed_count = recovered.lines.iter().filter(|l| l.start.is_some()).count();
+                    if !recovered.title.trim().is_empty() {
+                        ui.label(format!("Title: {}", recovered.title));
+                    }
+                    if !recovered.artist.trim().is_empty() {
+                        ui.label(format!("Artist: {}", recovered.artist));
+                    }
+                    ui.label(format!(
+                        "{} line(s), {} timed",
+                        recovered.lines.len(),
+                        timed_count
+                    ));
+                    if let Some(path) = &recovered.audio_path {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        ui.label(format!("Audio: {name}"));
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.available_width() / 2.0 - 90.0);
+                    if ui.button("Recover").clicked() {
+                        self.apply_project_file(recovered.clone());
+                        self.status = "Recovered your previous session.".to_string();
+                        self.pending_recovery = None;
+                        project::clear_autosave(APP_ID);
+                    }
+                    if ui.button("Discard").clicked() {
+                        self.pending_recovery = None;
+                        project::clear_autosave(APP_ID);
+                    }
+                });
+            });
+        });
     }
 
     fn load_audio_dialog(&mut self) {
@@ -1592,8 +1848,39 @@ impl KaraokeApp {
     }
 }
 
+/// How often the crash-recovery autosave is rewritten while there's
+/// something worth recovering - frequent enough that a crash doesn't lose
+/// much, infrequent enough not to matter for disk I/O.
+const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl eframe::App for KaraokeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // An autosave found at startup means the last run didn't shut down
+        // cleanly - ask before drawing anything else, rather than silently
+        // discarding or silently resuming into it.
+        if self.pending_recovery.is_some() {
+            self.draw_recovery_prompt(ctx);
+            return;
+        }
+
+        // Periodic crash-recovery autosave, while there's something worth
+        // recovering. Cheap (a small JSON write), so it's fine to do
+        // synchronously on the UI thread rather than a background one.
+        let has_recoverable_content =
+            !self.lines.is_empty() || self.audio.as_ref().map(|a| a.is_loaded()).unwrap_or(false);
+        if has_recoverable_content {
+            let now = std::time::Instant::now();
+            let due = self
+                .last_autosave
+                .map(|t| now.duration_since(t) >= AUTOSAVE_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                self.last_autosave = Some(now);
+                let snapshot = self.to_project_file();
+                let _ = project::write_autosave(APP_ID, &snapshot);
+            }
+        }
+
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         if playing {
             ctx.request_repaint();
@@ -1613,6 +1900,16 @@ impl eframe::App for KaraokeApp {
             ctx.request_repaint();
         }
         self.auto_follow_word_tap_line();
+
+        // Ctrl+S / Ctrl+Shift+S save the project - unlike the shortcuts
+        // below, these are safe to fire even while a text field has focus,
+        // the same way most apps let Ctrl+S through while you're typing.
+        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+            self.save_project();
+        }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+            self.save_project_as_dialog();
+        }
 
         // Keyboard shortcuts - only when no text field etc. has focus, so
         // typing a space in the lyrics box or title/artist fields doesn't
@@ -1646,6 +1943,42 @@ impl eframe::App for KaraokeApp {
             if let Some(err) = &self.audio_error {
                 ui.colored_label(egui::Color32::RED, err);
             }
+
+            ui.horizontal(|ui| {
+                if ui.button("💾 Save Project").clicked() {
+                    self.save_project();
+                }
+                if ui.button("Save Project As…").clicked() {
+                    self.save_project_as_dialog();
+                }
+                if ui.button("📂 Load Project…").clicked() {
+                    self.load_project_dialog();
+                }
+                match &self.current_project_path {
+                    Some(path) => {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        ui.label(format!("({name})"));
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("(unsaved project)").weak());
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    format!(
+                        "Saves everything - lyrics, timing, colors, the audio file's path - \
+                         to a .{} project file, so you can pick up where you left off. \
+                         Ctrl+S saves; Ctrl+Shift+S always asks for a location.",
+                        project::FILE_EXTENSION
+                    ),
+                )
+                .small()
+                .weak(),
+            );
 
             ui.horizontal(|ui| {
                 if ui.button("Load Audio…").clicked() {
@@ -2297,7 +2630,22 @@ impl eframe::App for KaraokeApp {
                 });
         });
     }
+
+    /// Called once on a clean shutdown (window closed, app quit normally) -
+    /// clears the crash-recovery autosave, since a clean exit isn't a crash
+    /// and shouldn't prompt for recovery next launch. If this never runs
+    /// (a crash, a force-quit, a system shutdown), the autosave is left in
+    /// place for `KaraokeApp::new` to find and offer to recover.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        project::clear_autosave(APP_ID);
+    }
 }
+
+/// Passed to `eframe::run_native` as both the window title and (absent an
+/// explicit `ViewportBuilder::app_id`) the id `eframe::storage_dir` uses to
+/// find this app's per-user data directory - kept as one constant so the
+/// autosave path and the window title can never drift apart.
+const APP_ID: &str = "Abyssal CDG Creator";
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -2305,7 +2653,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Abyssal CDG Creator",
+        APP_ID,
         options,
         Box::new(|_cc| Ok(Box::new(KaraokeApp::new()))),
     )

@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 static DEJAVU_REGULAR: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 static DEJAVU_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Resolution {
     Hd1080,
     Uhd4k,
