@@ -165,6 +165,42 @@ from several seconds to a few minutes depending on song length and whether
 GPU acceleration is available - since it's running an actual neural network
 over the audio, not a quick filter pass.
 
+### Auto-aligning word timing
+
+Tapping along sets each line's start/end (two taps), but the word-by-word
+wipe *within* that window is otherwise just an estimate (word count x
+~0.45s/word) until you fine-tune it. "🪄 Auto-align words" (next to "Reset
+all timing") replaces that estimate - and any earlier manual per-word
+taps - with real, audio-derived timing for every word in every
+already-timed line, in one click.
+
+It works by shelling out to
+[`aeneas`](https://github.com/readbeyond/aeneas), a forced-alignment tool,
+once per already-timed line - each call is restricted to that line's own
+tapped `[start, end)` window (with a little padding), so it only has to
+figure out *where within a few seconds of audio* each of that line's own
+words falls, rather than aligning an entire song at once. This means
+**auto-align builds directly on line-level tapping** - a line with no
+timing, or badly mistimed timing, has no window to search and won't get
+useful word-level results, so tap along first.
+
+This requires `aeneas` installed separately - it is not bundled with this
+app:
+
+```bash
+# aeneas also needs eSpeak (or eSpeak NG) and ffmpeg on the system
+pip install aeneas
+```
+
+See the [aeneas repo](https://github.com/readbeyond/aeneas) for
+OS-specific setup notes (eSpeak's Windows situation in particular is a bit
+more involved). A run shells out once per timed multi-word line, so it can
+take a while for a long song - there's a progress bar, and each line
+either succeeds or fails independently (one bad line doesn't stop the
+rest). Forced alignment is good, not perfect - review the result and
+fine-tune anything that's off the same way you would manually-tapped
+timing; Ctrl+Z undoes the whole run in one step if it doesn't help.
+
 ### Live preview vs. the exported file
 
 The in-app preview isn't a literal decoder for either export format - it's
@@ -248,10 +284,16 @@ you clearly if it's missing, rather than failing silently.
 **For vocal removal** ("Export instrumental audio…" and the video export's
 "Remove vocals" checkbox), you'll also need
 [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator)
-installed and on your PATH - see "Removing vocals" above. Neither `ffmpeg`
-nor `audio-separator` is a *build*-time dependency (`cargo build`/
-`cargo test` don't need either); they're only checked at runtime, right
-before the feature that needs them actually runs.
+installed and on your PATH - see "Removing vocals" above.
+
+**For auto-aligning word timing** ("🪄 Auto-align words"), you'll also need
+[`aeneas`](https://github.com/readbeyond/aeneas) importable by `python3` -
+see "Auto-aligning word timing" above.
+
+None of `ffmpeg`, `audio-separator`, or `aeneas` is a *build*-time
+dependency (`cargo build`/`cargo test` don't need any of them); they're
+only checked at runtime, right before the feature that needs them actually
+runs.
 
 The fonts used for video export (DejaVu Sans / DejaVu Sans Bold) are
 bundled in `assets/` under the permissive Bitstream Vera license (see
@@ -343,6 +385,10 @@ cargo test
   without a running GUI.
 - `src/vocals.rs` shells out to the `audio-separator` CLI to produce an
   instrumental copy of the loaded audio (see "Removing vocals" above).
+- `src/align.rs` shells out to `aeneas` once per already-timed line,
+  restricted to that line's own tapped window, to fill in real word-level
+  timing instead of the character-count estimate (see "Auto-aligning word
+  timing" above).
 - `src/main.rs` is the GUI: it also has a **live preview** panel that reads
   the same timing data as `export.rs`/`video.rs` to show a real-time
   mockup of what the exported files will look like as the song plays, the
@@ -359,19 +405,25 @@ cargo test
 - Tapping sets both the start and end of each line (two taps), but the
   word-by-word wipe *within* that window is still an *estimate* by default
   (word count x ~0.45s/word) unless you fine-tune specific words via the
-  "Words" panel or the timeline's word bubbles. The estimate's constants
-  live at the top of `src/lyrics.rs` (`SECONDS_PER_WORD`,
-  `MIN_SING_DURATION`) if you want to tune the default instead.
+  "Words" panel or the timeline's word bubbles, or run "🪄 Auto-align
+  words" (see "Auto-aligning word timing" above) to fill it in from real
+  audio instead of guessing. The estimate's constants live at the top of
+  `src/lyrics.rs` (`SECONDS_PER_WORD`, `MIN_SING_DURATION`) if you want to
+  tune the default instead.
 - The countdown indicator triggers automatically whenever the estimated
   leftover gap before the next line is at least 5 seconds
   (`COUNTDOWN_GAP_THRESHOLD` in `src/lyrics.rs`); there's no manual override
   if you want it to show up on a shorter gap.
-- There's no actual waveform display on the timeline (bubbles are
-  positioned by time only, not by audio content) - timing still relies on
-  your ear + reaction time, or the timeline's visual drag/trim for
-  after-the-fact adjustment. The +0.1s/-0.1s nudge buttons next to each
-  line, the seek bar/⏪5s/5s⏩/arrow keys, and the timeline's click/drag-to-seek
-  all help redo a line without replaying the whole song.
+- The timeline's waveform backdrop is drawn from the *loaded audio file*,
+  not the exported `.cdg`/`.mp4` - it's purely a visual aid for aligning
+  bubbles against actual vocal onsets, not a preview of anything in the
+  output files themselves.
+- Forced alignment (`aeneas`) is a real speech-alignment tool, not
+  something written for singing specifically - it can still misfire on
+  heavily melismatic/stylized vocals, overlapping voices, or a line whose
+  tapped window doesn't actually contain all of its words. Treat its
+  result the same as an estimate: worth reviewing, easy to fix by hand
+  (or re-tap the line and run it again) where it's off.
 - Seeking rebuilds the playback pipeline and fast-forwards (decodes and
   discards audio) to the target position, rather than using the audio
   container's built-in seek tables - this is slightly heavier per seek but

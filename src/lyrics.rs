@@ -131,7 +131,6 @@ impl LyricLine {
         }
     }
 
-    #[allow(dead_code)]
     pub fn words(&self) -> Vec<&str> {
         self.text.split_whitespace().collect()
     }

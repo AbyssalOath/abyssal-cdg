@@ -5,6 +5,7 @@
 // is still visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod align;
 mod audio;
 mod cdg;
 mod export;
@@ -239,6 +240,12 @@ struct KaraokeApp {
     /// for the most recently loaded audio file.
     waveform_job: Option<WaveformJob>,
 
+    /// Language code passed to aeneas for auto-align (see `align.rs`) -
+    /// defaults to English since the app has no other language-awareness.
+    align_language: String,
+    /// Set while a background "Auto-align words" run is in progress.
+    align_job: Option<AlignJob>,
+
     /// Snapshots to restore on Ctrl+Z, oldest first - see
     /// [`Self::track_undo_history`] for how/when these get pushed.
     undo_stack: VecDeque<UndoSnapshot>,
@@ -389,6 +396,43 @@ struct WaveformJob {
     result: Arc<Mutex<Option<Result<waveform::Waveform, String>>>>,
 }
 
+/// Common language presets for the auto-align language picker - aeneas
+/// (via eSpeak/eSpeak NG) supports many more than this by code alone; this
+/// is just a convenient shortlist, not an exhaustive/validated list. The
+/// text field next to it accepts any code directly.
+const ALIGN_LANGUAGES: [(&str, &str); 9] = [
+    ("eng", "English"),
+    ("spa", "Spanish"),
+    ("fra", "French"),
+    ("deu", "German"),
+    ("ita", "Italian"),
+    ("por", "Portuguese"),
+    ("jpn", "Japanese"),
+    ("kor", "Korean"),
+    ("cmn", "Mandarin"),
+];
+
+/// One already-timed line's forced-alignment result, as reported back from
+/// the background thread [`KaraokeApp::start_word_alignment`] spawns - see
+/// [`AlignJob`].
+struct AlignOutcome {
+    line_idx: usize,
+    result: Result<Vec<align::WordAlignment>, String>,
+}
+
+/// A whole-job-level `Err` for something that stopped an auto-align run
+/// before it could even attempt any line (aeneas not installed, no audio
+/// loaded), or `Ok` with one [`AlignOutcome`] per line it tried (which can
+/// still individually fail without taking down the rest of the run).
+type AlignJobResult = Result<Vec<AlignOutcome>, String>;
+
+/// Shared state for a background "auto-align words" run - see
+/// [`AlignJobResult`].
+struct AlignJob {
+    progress: Arc<AtomicU32>, // 0..=1000 (tenths of a percent) across all lines being aligned
+    result: Arc<Mutex<Option<AlignJobResult>>>,
+}
+
 impl KaraokeApp {
     fn new() -> Self {
         let (audio, audio_error) = match AudioPlayer::new() {
@@ -448,6 +492,8 @@ impl KaraokeApp {
             timeline_drag: None,
             waveform: None,
             waveform_job: None,
+            align_language: "eng".to_string(),
+            align_job: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_last_observed: UndoSnapshot {
@@ -747,7 +793,7 @@ impl KaraokeApp {
     }
 
     fn project_busy(&self) -> bool {
-        self.combined_export.is_some()
+        self.combined_export.is_some() || self.align_job.is_some()
     }
 
     fn default_project_file_name(&self) -> String {
@@ -1052,6 +1098,162 @@ impl KaraokeApp {
             }
             None => true,
         }
+    }
+
+    /// Kicks off a background "auto-align words" run: one `align::align_line`
+    /// call per already-timed line with more than one word, each restricted
+    /// to that line's own tapped window (see `align.rs` for why per-line
+    /// rather than one whole-song call). Populates every word's start *and*
+    /// end from the result, overwriting any existing manual/estimated word
+    /// timing for lines it successfully aligns - Ctrl+Z undoes the whole
+    /// run in one step if the result isn't an improvement.
+    fn start_word_alignment(&mut self) {
+        if self.project_busy() {
+            self.status = "Can't auto-align while another operation is running.".to_string();
+            return;
+        }
+        let Some(audio_path) = self.audio.as_ref().and_then(|a| a.path()) else {
+            self.status = "Load audio first - auto-align needs it.".to_string();
+            return;
+        };
+        let audio_path = audio_path.to_path_buf();
+
+        let (timed, indices) = self.resolved_with_indices();
+        let total_duration = self.resolved().1;
+        let mut requests: Vec<(usize, Vec<String>, f64, f64)> = Vec::new();
+        for (i, timed_line) in timed.iter().enumerate() {
+            let orig_idx = indices[i];
+            let words: Vec<String> = self.lines[orig_idx]
+                .words()
+                .into_iter()
+                .map(|w| w.to_string())
+                .collect();
+            if words.len() < 2 {
+                continue; // nothing to split within a single-word line
+            }
+            let prev_bound = if i > 0 { timed[i - 1].sing_end } else { 0.0 };
+            let next_bound = timed.get(i + 1).map(|t| t.start).unwrap_or(total_duration);
+            let window_start = (timed_line.start - align::WINDOW_PAD_SECS).max(prev_bound);
+            let window_end = (timed_line.sing_end + align::WINDOW_PAD_SECS).min(next_bound);
+            requests.push((orig_idx, words, window_start, window_end));
+        }
+        if requests.is_empty() {
+            self.status =
+                "No timed line has more than one word to align - nothing to do.".to_string();
+            return;
+        }
+
+        let language = self.align_language.trim();
+        let language = if language.is_empty() { "eng" } else { language }.to_string();
+        let total = requests.len();
+
+        let progress = Arc::new(AtomicU32::new(0));
+        let result: Arc<Mutex<Option<AlignJobResult>>> = Arc::new(Mutex::new(None));
+        let progress_clone = progress.clone();
+        let result_clone = result.clone();
+
+        self.status = format!(
+            "Auto-aligning {total} line(s)… this shells out to aeneas once per line and can \
+             take a while."
+        );
+        self.align_job = Some(AlignJob { progress, result });
+
+        std::thread::spawn(move || {
+            if let Err(e) = align::check_aligner_available() {
+                *result_clone.lock().unwrap() = Some(Err(e.to_string()));
+                return;
+            }
+            let mut outcomes = Vec::with_capacity(total);
+            for (i, (line_idx, words, window_start, window_end)) in requests.into_iter().enumerate()
+            {
+                let word_refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+                let outcome =
+                    align::align_line(&audio_path, &word_refs, window_start, window_end, &language)
+                        .map_err(|e| e.to_string());
+                outcomes.push(AlignOutcome {
+                    line_idx,
+                    result: outcome,
+                });
+                progress_clone.store(
+                    (((i + 1) as f32 / total as f32) * 1000.0) as u32,
+                    Ordering::Relaxed,
+                );
+            }
+            *result_clone.lock().unwrap() = Some(Ok(outcomes));
+        });
+    }
+
+    /// Checks on a running auto-align job, if any, applying successful
+    /// per-line results to `self.lines` and summarizing into `self.status`
+    /// once it finishes. Returns true while still in progress.
+    fn poll_align_job(&mut self) -> bool {
+        let Some(job) = &self.align_job else {
+            return false;
+        };
+        let finished = job.result.lock().unwrap().take();
+        let Some(outcome) = finished else {
+            return true;
+        };
+        self.align_job = None;
+
+        match outcome {
+            Err(e) => {
+                self.status = format!("Auto-align failed: {e}");
+            }
+            Ok(outcomes) => {
+                let mut aligned_lines = 0usize;
+                let mut aligned_words = 0usize;
+                let mut failures: Vec<String> = Vec::new();
+                for o in outcomes {
+                    match o.result {
+                        Ok(words) => {
+                            if let Some(line) = self.lines.get_mut(o.line_idx) {
+                                for (i, w) in words.iter().enumerate() {
+                                    if let Some(slot) = line.word_overrides.get_mut(i) {
+                                        *slot = Some(w.start);
+                                    }
+                                    if let Some(slot) = line.word_end_overrides.get_mut(i) {
+                                        *slot = Some(w.end);
+                                    }
+                                }
+                                aligned_lines += 1;
+                                aligned_words += words.len();
+                            }
+                        }
+                        Err(e) => {
+                            let text = self
+                                .lines
+                                .get(o.line_idx)
+                                .map(|l| l.text.clone())
+                                .unwrap_or_default();
+                            failures.push(format!("\"{text}\": {e}"));
+                        }
+                    }
+                }
+                let mut msg =
+                    format!("Auto-aligned {aligned_words} word(s) across {aligned_lines} line(s).");
+                if !failures.is_empty() {
+                    let shown = failures
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let more = failures.len().saturating_sub(3);
+                    let more_note = if more > 0 {
+                        format!(" (and {more} more)")
+                    } else {
+                        String::new()
+                    };
+                    msg.push_str(&format!(
+                        " {} line(s) failed: {shown}{more_note}",
+                        failures.len()
+                    ));
+                }
+                self.status = msg;
+            }
+        }
+        false
     }
 
     fn parse_lyrics(&mut self) {
@@ -2660,6 +2862,9 @@ impl eframe::App for KaraokeApp {
         if self.poll_waveform_job() {
             ctx.request_repaint();
         }
+        if self.poll_align_job() {
+            ctx.request_repaint();
+        }
         self.auto_follow_word_tap_line();
 
         // Ctrl+S / Ctrl+Shift+S save the project - unlike the shortcuts
@@ -2917,12 +3122,43 @@ impl eframe::App for KaraokeApp {
                     if ui.button("Reset all timing").clicked() {
                         self.reset_timing();
                     }
+                    if ui.button("🪄 Auto-align words").clicked() {
+                        self.start_word_alignment();
+                    }
+                    ui.label("Language:");
+                    egui::ComboBox::from_id_source("align_language")
+                        .selected_text(self.align_language.clone())
+                        .show_ui(ui, |ui| {
+                            for (code, label) in ALIGN_LANGUAGES {
+                                ui.selectable_value(
+                                    &mut self.align_language,
+                                    code.to_string(),
+                                    format!("{label} ({code})"),
+                                );
+                            }
+                        });
                 });
                 if busy {
                     ui.spinner();
                 }
             });
+            ui.label(
+                egui::RichText::new(
+                    "Auto-align uses forced alignment (aeneas, run once per already-timed \
+                     line) to fill in every word's timing automatically, replacing any \
+                     existing word timing (estimated or manually tapped) for lines it \
+                     successfully aligns. Needs aeneas installed separately \
+                     (pip install aeneas - see the README). Undo (Ctrl+Z) if a result \
+                     doesn't look right.",
+                )
+                .small()
+                .weak(),
+            );
             if let Some(handle) = &self.combined_export {
+                let frac = handle.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+                ui.add(egui::ProgressBar::new(frac).show_percentage());
+            }
+            if let Some(handle) = &self.align_job {
                 let frac = handle.progress.load(Ordering::Relaxed) as f32 / 1000.0;
                 ui.add(egui::ProgressBar::new(frac).show_percentage());
             }
