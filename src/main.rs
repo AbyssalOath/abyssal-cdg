@@ -134,6 +134,26 @@ struct KaraokeApp {
     /// Last time the crash-recovery autosave was written, so it only
     /// happens every [`AUTOSAVE_INTERVAL`] rather than every frame.
     last_autosave: Option<std::time::Instant>,
+    /// The project state as of the last successful explicit save this
+    /// session (`None` if never saved). Compared against the live state on
+    /// exit to decide whether the crash-recovery autosave should be kept
+    /// around for next launch - if they differ, there's unsaved work, so
+    /// the autosave stays *regardless of whether this was a clean exit or
+    /// a crash* - an accidental window close with unsaved changes deserves
+    /// the same recovery prompt a crash would get, not just intentional
+    /// crashes. Deliberately *not* updated by "Recover" on the
+    /// crash-recovery prompt - recovered content is exactly the kind of
+    /// unsaved work this exists to protect, so it stays flagged as such
+    /// until explicitly saved.
+    last_saved_snapshot: Option<project::ProjectFile>,
+    /// Set while the "quit without saving?" confirmation is showing (in
+    /// place of the rest of the UI) - triggered by intercepting a window
+    /// close request when there are unsaved changes.
+    show_quit_confirm: bool,
+    /// Set once the user has explicitly chosen to quit (with or without
+    /// saving first) from that confirmation - the next close request is
+    /// let through instead of being intercepted again.
+    quit_confirmed: bool,
     /// Index of the next line "Tap next line"/Space will assign a
     /// timestamp to.
     next_untimed: usize,
@@ -247,6 +267,9 @@ impl KaraokeApp {
             current_project_path: None,
             pending_recovery: project::read_autosave(APP_ID),
             last_autosave: None,
+            last_saved_snapshot: None,
+            show_quit_confirm: false,
+            quit_confirmed: false,
             lines: Vec::new(),
             next_untimed: 0,
             tap_phase: TapPhase::default(),
@@ -366,6 +389,17 @@ impl KaraokeApp {
         }
     }
 
+    /// True if there's project content that isn't reflected in the last
+    /// explicit save (or was never saved at all) - used both to decide
+    /// whether the crash-recovery autosave should survive a clean exit
+    /// (`on_exit`) and whether to intercept a window-close request with a
+    /// "quit without saving?" prompt.
+    fn has_unsaved_changes(&self) -> bool {
+        let has_content =
+            !self.lines.is_empty() || self.audio.as_ref().map(|a| a.is_loaded()).unwrap_or(false);
+        has_content && self.last_saved_snapshot.as_ref() != Some(&self.to_project_file())
+    }
+
     /// Replaces all project-level state (lyrics, timing, colors, title,
     /// resolution) with what's in `project`, and tries to load the audio
     /// file it references if the path still exists. Session-only state
@@ -465,6 +499,7 @@ impl KaraokeApp {
         match project.save_to_file(path) {
             Ok(()) => {
                 self.current_project_path = Some(path.to_path_buf());
+                self.last_saved_snapshot = Some(project);
                 self.status = format!("Saved project to {}", path.display());
             }
             Err(e) => {
@@ -489,8 +524,11 @@ impl KaraokeApp {
     fn load_project_file(&mut self, path: PathBuf) {
         match project::ProjectFile::load_from_file(&path) {
             Ok(loaded) => {
-                self.apply_project_file(loaded);
+                self.apply_project_file(loaded.clone());
                 self.current_project_path = Some(path);
+                // The live state now matches what's on disk - not "unsaved
+                // work" from `on_exit`'s point of view.
+                self.last_saved_snapshot = Some(loaded);
             }
             Err(e) => {
                 self.status = format!("Couldn't load project {}: {e}", path.display());
@@ -514,9 +552,10 @@ impl KaraokeApp {
                 ui.scope(|ui| {
                     ui.set_max_width(480.0);
                     ui.label(
-                        "Abyssal CDG Creator didn't close normally last time (a crash, a \
-                         force-quit, or a system shutdown) - there's an autosaved session \
-                         from partway through your work that was never explicitly saved.",
+                        "There's autosaved work from your last session that was never \
+                         explicitly saved - whether that's because the app closed \
+                         unexpectedly (a crash, a force-quit, a system shutdown) or it was \
+                         just closed before you got a chance to save.",
                     );
                 });
                 ui.add_space(12.0);
@@ -555,6 +594,51 @@ impl KaraokeApp {
                     if ui.button("Discard").clicked() {
                         self.pending_recovery = None;
                         project::clear_autosave(APP_ID);
+                    }
+                });
+            });
+        });
+    }
+
+    /// Draws the "quit without saving?" prompt shown when a window-close
+    /// request was intercepted because of unsaved changes - see the
+    /// `close_requested()` check in `update`.
+    fn draw_quit_confirm_prompt(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("Quit without saving?");
+                ui.add_space(8.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(480.0);
+                    ui.label(
+                        "You have changes that haven't been saved to a project file yet. \
+                         They're protected by autosave and can be recovered next time you \
+                         open the app, but you can also save for real right now.",
+                    );
+                });
+                ui.add_space(16.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.available_width() / 2.0 - 150.0);
+                    if ui.button("Save and Quit").clicked() {
+                        self.save_project();
+                        if !self.has_unsaved_changes() {
+                            self.show_quit_confirm = false;
+                            self.quit_confirmed = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        // Else the save was cancelled (e.g. the "Save
+                        // Project As…" dialog was dismissed) or failed -
+                        // stay on this screen rather than quitting anyway.
+                    }
+                    if ui.button("Quit Without Saving").clicked() {
+                        self.show_quit_confirm = false;
+                        self.quit_confirmed = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_quit_confirm = false;
                     }
                 });
             });
@@ -1863,6 +1947,24 @@ impl eframe::App for KaraokeApp {
             return;
         }
 
+        // Intercept a window-close request while there are unsaved
+        // changes, so an accidental close (or a deliberate one before
+        // remembering to save) gets a chance to reconsider - the
+        // crash-recovery autosave already protects the *data* either way,
+        // but catching it before the app actually exits is worth doing
+        // too, not just after the fact.
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quit_confirmed
+            && self.has_unsaved_changes()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_quit_confirm = true;
+        }
+        if self.show_quit_confirm {
+            self.draw_quit_confirm_prompt(ctx);
+            return;
+        }
+
         // Periodic crash-recovery autosave, while there's something worth
         // recovering. Cheap (a small JSON write), so it's fine to do
         // synchronously on the UI thread rather than a background one.
@@ -2631,13 +2733,27 @@ impl eframe::App for KaraokeApp {
         });
     }
 
-    /// Called once on a clean shutdown (window closed, app quit normally) -
-    /// clears the crash-recovery autosave, since a clean exit isn't a crash
-    /// and shouldn't prompt for recovery next launch. If this never runs
-    /// (a crash, a force-quit, a system shutdown), the autosave is left in
-    /// place for `KaraokeApp::new` to find and offer to recover.
+    /// Called once on a clean shutdown (window closed, app quit normally -
+    /// including an *accidental* close, which looks identical to a
+    /// deliberate one from here, and a deliberate "Quit Without Saving"
+    /// from the confirmation prompt). Only clears the crash-recovery
+    /// autosave if there's nothing it would be protecting - see
+    /// `has_unsaved_changes`. Otherwise the autosave is left in place, the
+    /// same as if this had never run at all (a crash, a force-quit, a
+    /// system shutdown) - so `KaraokeApp::new` finds it and offers to
+    /// recover next launch regardless of *why* the work never got saved.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        project::clear_autosave(APP_ID);
+        if self.pending_recovery.is_some() {
+            // The recovery prompt itself was never answered (the window
+            // was closed while it was still showing) - leave the autosave
+            // exactly as found rather than evaluating it against the
+            // still-empty live state, which would otherwise look "clean"
+            // and wrongly delete the very data being offered for recovery.
+            return;
+        }
+        if !self.has_unsaved_changes() {
+            project::clear_autosave(APP_ID);
+        }
     }
 }
 
