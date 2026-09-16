@@ -18,35 +18,42 @@ used by karaoke machines and "MP3+G" karaoke software.
    duet markers map onto this app's Male/Female/Duet voices automatically.
    You can still fine-tune anything afterward the normal way.
 4. **Play the song and tap along** - press **Space** (or click the big
-   button) the instant each new lyric line starts. That's it; no per-word
-   tapping needed, and lines fill in top to bottom automatically.
+   button) the instant a lyric line starts, then press it again the instant
+   that line finishes being sung - two taps per line, start then end. Lines
+   fill in top to bottom automatically, and the button/status text always
+   says which one (start or end, and which line) the next press will set.
+   Skipping the end-tap is fine too - it just falls back to an automatic
+   estimate until you set it, either later or via the timeline/table below.
 5. **Missed a line, or the song's fast?** Drag the seek bar (or use the
    ⏪5s/5s⏩ buttons, or the left/right arrow keys) to jump straight back to any
    point in the song and pick up tapping again from there - no need to
    replay from the start.
 6. **Watch the live preview** update in real time as the song plays, so you
    can see exactly how the exported file will look *before* you export -
-   word-by-word color wipe, next-line preview, countdown dots during long
-   instrumental breaks, all rendered live from the same logic used to
-   generate the actual `.cdg` file.
+   word-by-word color wipe, verse-style multi-line blocks, countdown dots
+   during long instrumental breaks (with the finished lines clearing off
+   screen partway through a long one, not sitting there the whole time),
+   all rendered live from the same logic used to generate the actual
+   exported file.
 7. **Assign a voice per line** (Male / Female / Duet / Screaming) for duet
    songs or intense sections - each gets its own color pair so singers can
    tell whose line is whose (or when to belt it) at a glance.
-8. **Fine-tune individual words** - click "Words" next to any line to open
-   a strip of clickable word buttons; click each one the instant it's sung
-   to override that word's timing precisely (green = manually set). Words
-   you don't touch keep using the automatic per-line estimate, so you only
-   need to fine-tune the specific words that are noticeably off (a word
-   held longer, a fast run of syllables, etc.) rather than re-timing an
-   entire line word-by-word. Once you've tapped every line's start time
-   (step 4), this panel opens automatically and **follows along with the
-   song** as it plays - no need to reselect a line each time; just keep
-   playing and click words as they come up.
+8. **Fine-tune individual words** two ways:
+   - Click "Words" next to any line to open a strip of clickable word
+     buttons, and a Start/End toggle above them. In Start mode (the
+     default), clicking a word sets when its highlight begins; switch to
+     End mode to set when it should stop advancing and freeze instead of
+     always running until the next word starts (useful for a held note
+     followed by a pause). Green = start set, blue = end set, teal = both.
+     Once every line has a start time (step 4), this panel opens
+     automatically and **follows along with the song** as it plays.
+   - Or fine-tune visually on the **timeline** at the bottom of the window
+     (see below) - drag bubbles around directly instead of tapping.
 9. **Customize colors** for every element (background, each voice's
    upcoming/already-sung colors, the next-line preview, and the title
    card) via the color pickers.
-10. **Export** a `.cdg` file, and/or a real **MP4 video** (see below) - your
-    choice, or both.
+10. **Export** a `.cdg` file, a real **MP4 video**, and/or an **instrumental
+    copy of the audio** (see below) - any combination.
 
 ### Two very different export formats
 
@@ -92,26 +99,88 @@ right as the line changes. The same indicator also appears if there's a
 long instrumental intro before the very first line (after the title card
 fades), so a long intro doesn't just sit on a blank screen with no clue
 when the singing starts. This is based on an estimate of how long each
-line takes to sing (word count x a rough seconds-per-word figure), not on
-anything you have to tap separately.
+line takes to sing (word count x a rough seconds-per-word figure), unless
+you've tapped/set that line's end explicitly (see below).
+
+During a break long enough to trigger the countdown, the already-sung
+line(s) also clear off screen partway through instead of sitting there for
+the whole gap: they linger briefly after singing ends, then the screen
+goes blank until the countdown dots appear, then the next line - rather
+than leaving finished lyrics on screen the entire time. Lines still queued
+up further ahead in the same verse block are hidden the moment the current
+line finishes too, for the same reason - they're still a break away.
+
+### The fine-tuning timeline
+
+Below the lyrics table is a kdenlive/karaodeo-style timeline: one draggable
+"bubble" per lyric line, positioned and sized by its start/end time, with a
+row of individual word bubbles underneath (shown for every line at once,
+not just a selected one). This is a second way to time things - everything
+it does, it does by writing the exact same `start`/`sing_end_override`/
+per-word fields that tapping and the timing table set, so all three stay in
+sync automatically, however you choose to work:
+
+- **Drag a bubble's body** to move it (start and end shift together, same
+  duration) - dragging the first or last word of a line past its line's own
+  boundary stretches the line's bubble to match, so you're never blocked
+  from extending a line just because you started at its edge.
+- **Drag an edge** to trim just that side (start or end) independently.
+- **Click empty space** (or the time ruler) to jump playback there; **drag**
+  empty space to scrub continuously, same as the seek bar up top but right
+  on the timeline.
+- **Scroll to zoom** (in/out, centered on the cursor); **shift+scroll to
+  pan** across a long song.
+- The cursor changes to a grab/resize hand depending on whether a drag
+  would move or trim a bubble, so it's clear what a click-and-drag will do
+  before you commit to it.
+- While playing, the view auto-scrolls to keep the playhead in frame
+  instead of running off the edge of a zoomed-in window.
+
+### Removing vocals
+
+Two export options produce a vocals-reduced copy of the loaded audio, for
+singing/timing against an instrumental instead of the original track
+without having to build a second project:
+
+- **"Export instrumental audio…"** saves a standalone `.mp3`/`.wav`.
+- **"Remove vocals" checkbox** on the video export mixes the instrumental
+  copy into the exported `.mp4` instead of the original audio.
+
+Both run real ML source separation (the UVR-MDX-NET-Inst_HQ_3 model via the
+[`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator)
+command-line tool) rather than a crude filter trick, but **this requires
+`audio-separator` installed separately - it is not bundled with this app**:
+
+```bash
+pip install audio-separator          # CPU
+pip install "audio-separator[gpu]"   # faster, needs a compatible Nvidia GPU
+```
+
+The app checks for `audio-separator` before starting and gives a clear
+install message if it's missing, the same way it does for `ffmpeg`. The
+separation model file (~100+MB) downloads automatically on first use
+(needs internet once) and is cached by `audio-separator` itself for later
+runs. Separation is much slower than the app's other exports - anywhere
+from several seconds to a few minutes depending on song length and whether
+GPU acceleration is available - since it's running an actual neural network
+over the audio, not a quick filter pass.
 
 ### Live preview vs. the exported file
 
-The in-app preview isn't a literal decoder for the `.cdg` binary format -
-it's a second renderer that draws the *same* timing/color/layout data live,
+The in-app preview isn't a literal decoder for either export format - it's
+a second renderer that draws the *same* timing/color/layout data live,
 using the same underlying timing math (word highlight times, countdown
-windows, title card duration) that the CDG exporter uses. In practice they
-match, since they're driven by the same shared functions in `lyrics.rs` and
-`export.rs`; treat it as "here's what your choices produce," and always
-worth a final look on an actual karaoke player after export since that's
-the real target format.
+windows, title card duration, block grouping) shared with both exporters.
 
-**Note:** the live preview reflects the `.cdg`-style layout (one current
-line + a one-line preview) - it does *not* show the video export's
-multi-line verse blocks or its smooth continuous wipe, which only exist in
-`video.rs`. If you want to check the video's look before committing to a
-full export, the most direct way is to just export it - a short song
-encodes quickly - and skim the result.
+**Note:** the live preview shows the `.mp4` video's layout - multi-line
+verse blocks (up to 5 lines, split on blank lines in your pasted lyrics)
+with a continuous pixel-level wipe - since that's the richer of the two and
+the one most people are timing against. The `.cdg` export is more
+constrained (one current line + a single dim preview line underneath, per
+the format's tiny 300x216 canvas - see below) and won't look identical to
+the preview even though the *timing* is identical. If you're targeting
+`.cdg` specifically, the most direct way to check its exact look is to just
+export it - a short song encodes quickly - and skim the result.
 
 The exported `.cdg` file contains only the graphics track - CDG never
 contains audio itself. To play it back, put an audio file with the **same
@@ -176,6 +245,14 @@ brew install ffmpeg
 The app checks for `ffmpeg` before starting a video export and will tell
 you clearly if it's missing, rather than failing silently.
 
+**For vocal removal** ("Export instrumental audio…" and the video export's
+"Remove vocals" checkbox), you'll also need
+[`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator)
+installed and on your PATH - see "Removing vocals" above. Neither `ffmpeg`
+nor `audio-separator` is a *build*-time dependency (`cargo build`/
+`cargo test` don't need either); they're only checked at runtime, right
+before the feature that needs them actually runs.
+
 The fonts used for video export (DejaVu Sans / DejaVu Sans Bold) are
 bundled in `assets/` under the permissive Bitstream Vera license (see
 `assets/DEJAVU-LICENSE.txt`) - no extra download needed.
@@ -236,11 +313,16 @@ cargo test
   future addition.
 - `src/font.rs` renders text using the `font8x8` crate's bitmap font,
   repacked into CDG's 6x12 tile format.
-- `src/lyrics.rs` holds your lyric lines (each with a start time and a
+- `src/lyrics.rs` holds your lyric lines (each with a start time, an
+  optional explicit end time, per-word start/end overrides, and a
   `Singer` - Male/Female/Duet) and derives, for each line: per-word
   highlight timestamps (from word lengths and an estimated singing
-  duration), and whether the leftover time before the next line is long
-  enough to warrant a "get ready" countdown.
+  duration, unless overridden), whether the leftover time before the next
+  line is long enough to warrant a "get ready" countdown, and whether
+  already-sung lines should be cleared during a long break. It also owns
+  timecode formatting/parsing (`MM:SS.CC`) and the overlap validation
+  (start/end can't cross a neighboring line's explicitly-set time) shared
+  by tapping, the timeline, and manual entry.
 - `src/export.rs` is the actual "karaoke renderer" - it lays out each line
   centered on screen in that line's voice color, draws a dimmed preview of
   the next line underneath, draws the title/artist intro card, re-draws
@@ -255,10 +337,17 @@ cargo test
   pipes frames into an `ffmpeg` subprocess (muxed with your loaded audio)
   to produce the final MP4. It runs on a background thread with a progress
   callback so the GUI stays responsive during longer encodes.
+- `src/timeline.rs` is the pure time<->pixel math, zoom/drag bounds, and
+  drag-mode classification behind the fine-tuning timeline - kept separate
+  from the egui widget/painting code in `main.rs` so it's unit-testable
+  without a running GUI.
+- `src/vocals.rs` shells out to the `audio-separator` CLI to produce an
+  instrumental copy of the loaded audio (see "Removing vocals" above).
 - `src/main.rs` is the GUI: it also has a **live preview** panel that reads
-  the same timing data as `export.rs` to show a real-time mockup of what
-  the exported CDG will look like as the song plays, plus color pickers
-  that write directly into the exported palette.
+  the same timing data as `export.rs`/`video.rs` to show a real-time
+  mockup of what the exported files will look like as the song plays, the
+  fine-tuning timeline widget, and color pickers that write directly into
+  the exported palette.
 
 ## Known limitations / ideas for extending it
 
@@ -267,20 +356,22 @@ cargo test
 - Only Latin/basic-ASCII glyphs are available from `font8x8`'s basic set;
   accented characters will render blank. Swap in a different font source in
   `font.rs` if you need broader character coverage.
-- Tapping sets the *start* of each line; the word-by-word wipe is an
-  *estimate* by default (word count x ~0.45s/word) - use the "Words" button
-  on any line to override specific words with an exact tapped time (shown
-  underlined in the live preview). The estimate's constants live at the top
-  of `src/lyrics.rs` (`SECONDS_PER_WORD`, `MIN_SING_DURATION`) if you want
-  to tune the default instead.
+- Tapping sets both the start and end of each line (two taps), but the
+  word-by-word wipe *within* that window is still an *estimate* by default
+  (word count x ~0.45s/word) unless you fine-tune specific words via the
+  "Words" panel or the timeline's word bubbles. The estimate's constants
+  live at the top of `src/lyrics.rs` (`SECONDS_PER_WORD`,
+  `MIN_SING_DURATION`) if you want to tune the default instead.
 - The countdown indicator triggers automatically whenever the estimated
   leftover gap before the next line is at least 5 seconds
   (`COUNTDOWN_GAP_THRESHOLD` in `src/lyrics.rs`); there's no manual override
   if you want it to show up on a shorter gap.
-- There's no waveform view - timing relies on your ear + reaction time.
-  The +0.1s/-0.1s nudge buttons next to each line are there to fine-tune
-  a line's start after tapping, and the seek bar/⏪5s/5s⏩/arrow keys let
-  you jump back and redo a line without replaying the whole song.
+- There's no actual waveform display on the timeline (bubbles are
+  positioned by time only, not by audio content) - timing still relies on
+  your ear + reaction time, or the timeline's visual drag/trim for
+  after-the-fact adjustment. The +0.1s/-0.1s nudge buttons next to each
+  line, the seek bar/⏪5s/5s⏩/arrow keys, and the timeline's click/drag-to-seek
+  all help redo a line without replaying the whole song.
 - Seeking rebuilds the playback pipeline and fast-forwards (decodes and
   discards audio) to the target position, rather than using the audio
   container's built-in seek tables - this is slightly heavier per seek but
@@ -294,6 +385,10 @@ cargo test
 - The live preview is a second renderer reading the same timing data, not
   a decoder of the actual `.cdg` bytes - see "Live preview vs. the exported
   file" above.
+- Vocal removal always uses one hardcoded model
+  (`UVR-MDX-NET-Inst_HQ_3.onnx`) - there's no in-app way to pick a
+  different `audio-separator` model or tune its parameters (segment size,
+  overlap, etc.) yet.
 
 ## More documentation
 

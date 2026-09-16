@@ -26,15 +26,22 @@ an old Rust toolchain, not a bug in this project.
 - `cargo clippy --all-targets` doesn't introduce *new* warnings (some pre-existing ones,
   like `too_many_arguments` on the video-frame drawing helpers, are known and accepted -
   no need to go fix unrelated ones as part of your change).
-- If you touched `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`, `formats.rs`, or
-  `video.rs`, add or update a unit test alongside the change - these modules are pure
-  logic with no GUI/audio dependency, so there's no excuse not to. `main.rs` (GUI
-  wiring) has no automated tests; changes there are verified by running the app.
-- If your change affects both `export.rs` (`.cdg`) and `video.rs` (`.mp4`), or the live
-  preview in `main.rs`, make sure all three still agree - see
+- If you touched `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`, `formats.rs`,
+  `video.rs`, `timeline.rs`, or `vocals.rs`'s output-resolution logic, add or update a
+  unit test alongside the change - these modules are pure logic with no GUI/audio
+  dependency, so there's no excuse not to. `main.rs` (GUI wiring, including the
+  timeline widget's painting/interaction code) has no automated tests; changes there
+  are verified by running the app. The actual `ffmpeg`/`audio-separator` subprocess
+  invocations aren't exercised in the test suite either, since they need the external
+  tool installed - verify those manually.
+- If your change affects `export.rs` (`.cdg`), `video.rs` (`.mp4`), the live preview,
+  or the fine-tuning timeline in `main.rs`, make sure they still agree - see
   [ARCHITECTURE.md](ARCHITECTURE.md#data-flow) for why that matters and which shared
   functions in `lyrics.rs` are supposed to be the single source of truth for timing
-  decisions.
+  decisions. The timeline in particular is also a *writer*, not just a display - a
+  drag needs to write back the same `LyricLine` fields (`start`, `sing_end_override`,
+  `word_overrides`, `word_end_overrides`) that tapping and manual entry use, and go
+  through the same overlap validation where applicable.
 - Update [CHANGELOG.md](CHANGELOG.md) under `## [Unreleased]` (add that heading at the
   top if it doesn't exist yet).
 

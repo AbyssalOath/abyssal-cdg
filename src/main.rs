@@ -779,8 +779,9 @@ impl KaraokeApp {
         let result = Arc::new(Mutex::new(None));
         let result_clone = result.clone();
 
-        self.status =
-            "Removing vocals… (phase cancellation - quality depends on the mix)".to_string();
+        self.status = "Removing vocals… this runs a real separation model and can take a \
+                       while (longer on CPU than GPU)."
+            .to_string();
         self.vocal_removal_export = Some(VocalRemovalExportHandle { result });
 
         std::thread::spawn(move || {
@@ -801,11 +802,7 @@ impl KaraokeApp {
         if let Some(result) = finished {
             match result {
                 Ok(path) => {
-                    self.status = format!(
-                        "Saved {} - vocals reduced via phase cancellation; quality varies by \
-                         mix, so give it a listen before relying on it.",
-                        path.display()
-                    );
+                    self.status = format!("Saved {} - instrumental separated.", path.display());
                 }
                 Err(e) => {
                     self.status = format!("Instrumental export failed: {e}");
@@ -1786,7 +1783,7 @@ impl eframe::App for KaraokeApp {
                                 "4K",
                             );
                         });
-                    ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals");
+                    ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals (slow)");
                     if ui.button("Export video (.mp4)…").clicked() {
                         self.start_video_export();
                     }
@@ -1804,11 +1801,11 @@ impl eframe::App for KaraokeApp {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Both vocal-removal options use phase cancellation (subtracting one \
-                         stereo channel from the other) - cheap and needs nothing beyond \
-                         ffmpeg, but only reduces a vocal that's panned dead center, and will \
-                         also dull other centered elements (bass, kick, ...). Try it on your \
-                         mix before relying on it.",
+                        "Both vocal-removal options run a real ML separation model (UVR-MDX-NET, \
+                         via the audio-separator command-line tool) - genuinely separates the \
+                         instrumental instead of just cancelling centered audio, but needs \
+                         audio-separator installed separately (pip install audio-separator) and \
+                         can take a while to run, especially without a GPU.",
                     )
                     .small()
                     .weak(),

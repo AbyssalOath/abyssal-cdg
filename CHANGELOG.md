@@ -7,6 +7,59 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+### Added
+
+- **Fine-tuning timeline**: a kdenlive/karaodeo-style widget at the bottom of the
+  window showing one draggable/resizable bubble per lyric line (drag the body to move
+  it, an edge to trim start/end independently), plus a row of individual word bubbles
+  shown for every line at once. Click or drag empty space to seek/scrub playback,
+  scroll to zoom, shift+scroll to pan; the view auto-scrolls to keep the playhead in
+  frame during playback. Dragging the first/last word of a line past that line's own
+  boundary stretches the line's own bubble to match, rather than being blocked.
+- **Two-phase tap-to-time**: Space/"Tap next line" now registers a line's start on the
+  first press and its end on the second, instead of only ever setting the start - the
+  button/status text says which one (and which line) the next press will set.
+  Skipping the end-tap is still fine; it falls back to the automatic estimate.
+- **Per-word end times**: the "Fine-tune words" panel gained a Start/End toggle -
+  clicking a word in End mode sets when its held-out highlight should stop advancing
+  and freeze, instead of it always running until the next word starts. Lets a held
+  note followed by a pause render accurately instead of stretching to fill the gap.
+- **Manual timecode entry**: the timing table's Start/End columns are now editable
+  text fields (`MM:SS.CC`, lenient parsing), so a line's timing can be typed directly
+  instead of only tapped or dragged.
+- **Start/end overlap validation**: a start or end that would cross a neighboring
+  line's *explicitly set* time is rejected with a specific error message (e.g. "Start
+  (01:05.50) can't be before the previous line ends (01:06.00)") instead of silently
+  applied or silently corrupting the ordering - checked wherever a time is set
+  (tapping, the per-row "Tap"/"End of line" buttons, and manual entry).
+- **Vocal removal**: "Export instrumental audio…" (standalone `.mp3`/`.wav`) and a
+  "Remove vocals" checkbox on video export, both running real ML source separation
+  (UVR-MDX-NET-Inst_HQ_3, via the `audio-separator` command-line tool) rather than a
+  crude filter. Requires `audio-separator` installed separately - see the README.
+
+### Changed
+
+- The live preview now shows the same multi-line verse blocks as the video export
+  (previously it only ever showed one current line at a time, like the more
+  constrained `.cdg` layout) - see the README's "Live preview vs. the exported file"
+  for what this does and doesn't mean for `.cdg` accuracy.
+- During a long instrumental break, upcoming lines queued later in the same block now
+  hide as soon as the current line finishes (instead of sitting there the whole
+  break), and already-sung lines linger briefly then clear too, leaving a blank screen
+  until the countdown dots appear - applied consistently across the CDG export, the
+  video export, and the live preview.
+- Manually-timed words in the live preview are no longer shown underlined - the
+  distinction wasn't meaningful to a viewer and looked like a rendering glitch;
+  precisely-timed words are just held out for their duration like any other word.
+- The timing table's columns are now ordered Start / Lyric / End / Singer / ...
+
+### Fixed
+
+- Word-level timeline bubbles could get stuck with zero room to move: a word's drag
+  bounds used to be pinned to its immediate neighbor's position, which by default
+  touches exactly where the word itself already sits (no gap), leaving nothing to
+  drag. Word bubbles are now bounded by the whole line's own window instead.
+
 ## [0.1.0] - 2026-09-13
 
 Initial release.

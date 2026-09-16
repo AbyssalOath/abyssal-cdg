@@ -47,17 +47,21 @@ egui = "0.27"
 
 `main.rs` and `audio.rs`'s device initialization are the only code that touches
 `eframe`/`egui`/`rodio` directly - `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`,
-`formats.rs`, and `video.rs` are pure logic with no GUI/audio dependency, and are fully
-covered by the unit test suite:
+`formats.rs`, `video.rs`, and `timeline.rs` are pure logic with no GUI/audio
+dependency, and are fully covered by the unit test suite:
 
 ```bash
 cargo test
 ```
 
-This covers CDG packet encoding/timing, word-timing math, the countdown-window logic,
-duet/screaming color resolution, lyric-file import/export (LRC, UltraStar, KOK), video
-block-splitting, and the playback clock's play/pause/resume/seek state machine - all
-without needing real audio hardware or a display.
+This covers CDG packet encoding/timing, word-timing math (including per-word start/end
+overrides), the countdown-window and sung-line-blanking logic, timecode format/parse
+and start/end overlap validation, duet/screaming color resolution, lyric-file
+import/export (LRC, UltraStar, KOK), video block-splitting, the fine-tuning timeline's
+zoom/drag math, `vocals.rs`'s output-file-resolution logic, and the playback clock's
+play/pause/resume/seek state machine - all without needing real audio hardware, a
+display, or `ffmpeg`/`audio-separator` installed (those two are only needed to
+actually *run* video export/vocal removal, not to build or test the project).
 
 If `cargo build`/`cargo test` fails with a *different* error than the one above, please
 open an issue with the exact output, your `rustc --version`, and your OS.
