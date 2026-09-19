@@ -117,6 +117,11 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Fixed
 
+- Space did nothing once every line had both a start and an end (it only ever
+  drove tap-to-time, which had nothing left to do) - it now pauses/resumes
+  playback instead once tapping is complete (or starts it, if the song isn't
+  playing yet), so fine-tuning with the timeline/word panel doesn't require
+  reaching for the mouse just to control playback.
 - Word-level timeline bubbles could get stuck with zero room to move: a word's drag
   bounds used to be pinned to its immediate neighbor's position, which by default
   touches exactly where the word itself already sits (no gap), leaving nothing to

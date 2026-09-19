@@ -1476,8 +1476,9 @@ impl KaraokeApp {
                     // click words as they come up rather than having to
                     // manually select each line.
                     self.word_tap_line = Some(0);
-                    self.status = "All lines timed! Keep playing - click words as they're \
-                                   sung to fine-tune them; it'll follow the song automatically."
+                    self.status = "All lines timed! Click words as they're sung to fine-tune \
+                                   them - it'll follow the song automatically. Space now \
+                                   pauses/resumes playback instead of tapping."
                         .to_string();
                 } else {
                     self.status = format!(
@@ -1486,6 +1487,26 @@ impl KaraokeApp {
                         lyrics::format_timecode(pos)
                     );
                 }
+            }
+        }
+    }
+
+    /// Space-bar behavior once there's nothing left to tap along (see the
+    /// key handler in `update()`): play from the start if nothing's loaded
+    /// yet, resume if paused, otherwise pause - the same three actions as
+    /// the Play/Pause/Resume buttons, just combined into whichever one
+    /// applies, so Space can drive playback hands-free while fine-tuning
+    /// once every line is timed.
+    fn toggle_play_pause(&mut self) {
+        let is_playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
+        let is_paused = self.audio.as_ref().map(|a| a.is_paused()).unwrap_or(false);
+        if let Some(a) = &mut self.audio {
+            if is_playing {
+                a.pause();
+            } else if is_paused {
+                a.resume();
+            } else if let Err(e) = a.play_from_start() {
+                self.status = format!("Playback error: {e}");
             }
         }
     }
@@ -3049,7 +3070,15 @@ impl eframe::App for KaraokeApp {
         let typing = ctx.memory(|m| m.focused().is_some());
         if !typing {
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-                self.tap_next();
+                // Once there's nothing left to tap (no lyrics parsed yet,
+                // or every line already has both a start and an end),
+                // Space drives playback instead - much less hunting for the
+                // mouse while fine-tuning with the timeline/word panel.
+                if self.next_untimed >= self.lines.len() {
+                    self.toggle_play_pause();
+                } else {
+                    self.tap_next();
+                }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 if let Some(a) = &mut self.audio {

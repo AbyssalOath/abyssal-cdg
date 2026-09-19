@@ -243,6 +243,14 @@ impl AudioPlayer {
         Ok(())
     }
 
+    /// True if there's a loaded pipeline sitting paused (as opposed to
+    /// never started/stopped, where there's no sink at all) - lets a caller
+    /// tell "resume" and "play from start" apart without duplicating the
+    /// sink-presence check `resume()` itself already does.
+    pub fn is_paused(&self) -> bool {
+        self.sink.as_ref().map(|s| s.is_paused()).unwrap_or(false)
+    }
+
     /// Resume from a paused state (no-op if nothing loaded or nothing paused).
     pub fn resume(&mut self) {
         if let Some(sink) = &self.sink {

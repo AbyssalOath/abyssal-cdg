@@ -29,7 +29,10 @@ used by karaoke machines and "MP3+G" karaoke software.
    Skipping the end-tap is fine too - it just falls back to an automatic
    estimate until you set it, either later or via the timeline/table below.
    Press **M/F/D/S** at any point to set the current line's voice
-   (Male/Female/Duet/Screaming) without reaching for the mouse.
+   (Male/Female/Duet/Screaming) without reaching for the mouse. Once every
+   line has both a start and an end, Space stops tapping and instead
+   pauses/resumes playback (or starts it, if the song isn't playing yet) -
+   handy for fine-tuning without reaching for the mouse each time.
 5. **Missed a line, or the song's fast?** Drag the seek bar (or use the
    ⏪5s/5s⏩ buttons, or the left/right arrow keys) to jump straight back to any
    point in the song and pick up tapping again from there - no need to
