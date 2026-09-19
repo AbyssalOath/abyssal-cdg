@@ -49,12 +49,17 @@ pub struct WordAlignment {
     pub end: f64,
 }
 
+fn aeneas_python() -> String {
+    std::env::var("ABYSSAL_CDG_PYTHON")
+        .unwrap_or_else(|_| "python3".to_string())
+}
+
 /// Confirms `aeneas` is importable for `python3`, with a clear, actionable
 /// error message if not. Checked via `import aeneas` rather than looking
 /// for a standalone executable, since aeneas is invoked as a Python module
 /// (`python3 -m aeneas.tools.execute_task`), not its own binary.
 pub fn check_aligner_available() -> Result<()> {
-    let result = Command::new("python3")
+    let result = Command::new(aeneas_python())
         .args(["-c", "import aeneas"])
         .output();
     match result {
@@ -130,7 +135,7 @@ fn align_line_in_dir(
          is_audio_file_head_length={head:.3}|is_audio_file_process_length={duration:.3}"
     );
 
-    let output = Command::new("python3")
+    let output = Command::new(aeneas_python())
         .args(["-m", "aeneas.tools.execute_task"])
         .arg(audio_path)
         .arg(&text_path)
