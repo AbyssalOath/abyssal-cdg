@@ -117,6 +117,19 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Fixed
 
+- **Windows release installers/executables showed a generic icon instead of
+  the app icon.** `cargo packager`'s `icons` config only ever had a single
+  large PNG, which is enough for it to auto-generate a macOS `.icns` and to
+  use directly for the Linux `.deb`/AppImage icon, but it has no PNG->`.ico`
+  conversion of its own and a raw PNG isn't a valid Windows icon resource -
+  so the installer/shortcut icon silently fell back to a default, and
+  separately, the compiled `.exe` itself never had an icon resource embedded
+  at all (that's outside anything `cargo packager` does - it packages an
+  already-built binary, it doesn't modify its PE resources). Fixed both: a
+  real multi-resolution `.ico` (`assets/icons/abyssal-cdg-icon.ico`) is now
+  listed first in `icons` for the installer/shortcut icon, and a new
+  `build.rs` (via the `winresource` crate, Windows-only) embeds the same
+  icon plus basic version info directly into the compiled `.exe`.
 - Space did nothing once every line had both a start and an end (it only ever
   drove tap-to-time, which had nothing left to do) - it now pauses/resumes
   playback instead once tapping is complete (or starts it, if the song isn't

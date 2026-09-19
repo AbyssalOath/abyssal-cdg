@@ -18,6 +18,14 @@ ab_glyph = "0.2.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Only does anything when targeting Windows (see build.rs) - embeds the app
+# icon into the compiled .exe itself, since `cargo packager` only sets the
+# *installer's* icon (see the `icons` key below), not the exe's own PE
+# resources. Without this, the installed app/shortcuts/taskbar show
+# Windows' generic executable icon no matter what `cargo packager` is told.
+[build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = 2
 
@@ -31,8 +39,14 @@ category = "Music"
 # asset - without it, the packager treats a 1024px-wide icon as a 1x asset,
 # which isn't a valid ICNS size (1024px only exists as the 512x512@2x icon
 # type) and macOS packaging fails with "No matching IconType". Named "@2x",
-# the same file is correctly read as the 512x512@2x icon instead.
-icons = ["assets/icons/abyssal-cdg-icon@2x.png"]
+# the same file is correctly read as the 512x512@2x icon instead. macOS
+# (.icns) and Linux (.deb/AppImage) icons are both generated/used straight
+# from this PNG. Windows is different: `cargo packager` has no PNG->.ico
+# conversion of its own, and a PNG isn't a valid Windows icon resource, so
+# a real pre-built multi-resolution .ico is listed first - it's picked
+# over the PNG for the installer/shortcut icon on Windows, while macOS/
+# Linux packaging keeps using the PNG above.
+icons = ["assets/icons/abyssal-cdg-icon.ico", "assets/icons/abyssal-cdg-icon@2x.png"]
 
 # eframe (winit/glow) needs an X11 or Wayland stack plus xkbcommon, GTK3 is
 # needed for the native "load audio file" dialog (`rfd`), and ALSA is

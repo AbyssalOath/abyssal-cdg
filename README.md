@@ -343,6 +343,37 @@ pairing, the loaded audio is copied alongside either one under the
 matching base filename if you have it loaded, ready to drop into a
 folder-based player/game library.
 
+## Installing a prebuilt release
+
+Each [GitHub release](../../releases) includes a `.dmg` (macOS), `.msi`/`.exe`
+installer (Windows), and `.AppImage`/`.deb` (Linux) - no Rust toolchain or
+build step needed. Two things to know before you install one:
+
+- **macOS: "Apple could not verify... is free of malware."** This app isn't
+  currently signed with a paid Apple Developer ID or notarized by Apple (that
+  program costs $99/year), so Gatekeeper shows this warning on first launch
+  for *any* app downloaded outside the App Store that isn't notarized - it's
+  not a sign of anything actually wrong with the app. To open it anyway:
+  right-click (or Control-click) the app in Finder and choose **Open**, then
+  confirm **Open** in the dialog that appears (this only needs to be done
+  once); or go to **System Settings -> Privacy & Security**, scroll to the
+  blocked-app notice near the bottom, and click **Open Anyway**. If you'd
+  rather not click through a warning at all, you can also strip the
+  quarantine flag yourself in Terminal:
+  ```bash
+  xattr -d com.apple.quarantine "/Applications/Abyssal CDG Creator.app"
+  ```
+- **Windows: "Windows protected your PC" (SmartScreen)** can appear for the
+  same reason (no paid code-signing certificate) - click **More info**, then
+  **Run anyway**.
+
+Neither warning means the download was tampered with; it's the standard
+"nobody paid Apple/Microsoft to vouch for this build" message every
+unsigned/unnotarized indie app shows. See
+[SECURITY.md](SECURITY.md) if you want to verify what a release actually
+does before running it - it's all open source, built by the same CI
+workflow that produced the artifact.
+
 ## Building
 
 You need a normal, reasonably current Rust toolchain (install via
