@@ -50,8 +50,7 @@ pub struct WordAlignment {
 }
 
 fn aeneas_python() -> String {
-    std::env::var("ABYSSAL_CDG_PYTHON")
-        .unwrap_or_else(|_| "python3".to_string())
+    std::env::var("ABYSSAL_CDG_PYTHON").unwrap_or_else(|_| "python3".to_string())
 }
 
 /// Confirms `aeneas` is importable for `python3`, with a clear, actionable
