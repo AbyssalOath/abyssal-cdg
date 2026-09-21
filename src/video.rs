@@ -650,7 +650,10 @@ fn fit_filter(fit: BackgroundFit, w: u32, h: u32, pad_color: Rgb8) -> String {
             format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}")
         }
         BackgroundFit::Contain => {
-            let hex = format!("0x{:02x}{:02x}{:02x}", pad_color.r, pad_color.g, pad_color.b);
+            let hex = format!(
+                "0x{:02x}{:02x}{:02x}",
+                pad_color.r, pad_color.g, pad_color.b
+            );
             format!(
                 "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={hex}"
             )
@@ -1033,7 +1036,10 @@ mod tests {
             Background::from_path(std::path::PathBuf::from("notes.txt")),
             None
         );
-        assert_eq!(Background::from_path(std::path::PathBuf::from("noext")), None);
+        assert_eq!(
+            Background::from_path(std::path::PathBuf::from("noext")),
+            None
+        );
     }
 
     #[test]

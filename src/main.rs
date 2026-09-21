@@ -253,7 +253,11 @@ struct KaraokeApp {
     /// frame. The inner `None` means "already tried and failed to load
     /// `background`" (e.g. a moved/deleted file) - remembered so a broken
     /// background doesn't retry that expensive load every single frame.
-    background_preview: Option<(video::Background, video::BackgroundFit, Option<egui::TextureHandle>)>,
+    background_preview: Option<(
+        video::Background,
+        video::BackgroundFit,
+        Option<egui::TextureHandle>,
+    )>,
     /// Whether a video export should mux in a vocals-reduced copy of the
     /// audio (via [`vocals::remove_vocals_to_file`]) instead of the
     /// original.
@@ -1161,8 +1165,8 @@ impl KaraokeApp {
             .add_filter(
                 "Image or video",
                 &[
-                    "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "mp4", "mov",
-                    "mkv", "avi", "webm", "m4v",
+                    "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "mp4", "mov", "mkv",
+                    "avi", "webm", "m4v",
                 ],
             )
             .pick_file()
@@ -1174,8 +1178,7 @@ impl KaraokeApp {
                     self.background_preview = None;
                 }
                 None => {
-                    self.status =
-                        "That file isn't a supported image or video format.".to_string();
+                    self.status = "That file isn't a supported image or video format.".to_string();
                 }
             }
         }
@@ -2388,7 +2391,11 @@ impl KaraokeApp {
 
         let (rect, _response) =
             ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-        match self.background_preview.as_ref().and_then(|(_, _, t)| t.as_ref()) {
+        match self
+            .background_preview
+            .as_ref()
+            .and_then(|(_, _, t)| t.as_ref())
+        {
             Some(texture) => {
                 ui.painter().image(
                     texture.id(),
@@ -3788,9 +3795,7 @@ impl eframe::App for KaraokeApp {
                                         ui.label(format!("{kind}: {name}"));
                                     }
                                     None => {
-                                        ui.label(
-                                            egui::RichText::new("No background set.").weak(),
-                                        );
+                                        ui.label(egui::RichText::new("No background set.").weak());
                                     }
                                 }
                                 ui.add_space(6.0);
@@ -3799,9 +3804,10 @@ impl eframe::App for KaraokeApp {
                                     egui::ComboBox::from_id_source("background_fit")
                                         .selected_text(self.background_fit.label())
                                         .show_ui(ui, |ui| {
-                                            for option in
-                                                [video::BackgroundFit::Cover, video::BackgroundFit::Contain]
-                                            {
+                                            for option in [
+                                                video::BackgroundFit::Cover,
+                                                video::BackgroundFit::Contain,
+                                            ] {
                                                 if ui
                                                     .selectable_label(
                                                         self.background_fit == option,
