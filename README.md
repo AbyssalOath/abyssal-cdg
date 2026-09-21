@@ -4,6 +4,12 @@ A desktop app (Rust + egui) that turns an audio file and a block of pasted
 lyrics into a real karaoke `.cdg` file - the standard CD+Graphics format
 used by karaoke machines and "MP3+G" karaoke software.
 
+
+## Demonstrations
+![Usage Screenshot](assets/screenshots/usage.png)
+
+![Export Screenshot](assets/screenshots/export.png)
+
 ## What it does
 
 1. **Load an audio file** (mp3, wav, flac, ogg, m4a, aac) - via **"Load
