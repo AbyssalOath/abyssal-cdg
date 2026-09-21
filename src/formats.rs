@@ -451,14 +451,15 @@ fn secs_to_beat(secs: f64, gap_secs: f64, bpm: f64) -> i64 {
 }
 
 fn singer_to_player_marker(singer: Singer) -> &'static str {
-    match singer.render_as() {
-        Singer::Male => "P1",
+    match singer {
+        // UltraStar has no "unassigned" concept of its own - an untouched
+        // line is just the primary performer, same as an explicit `Male`.
+        Singer::Default | Singer::Male => "P1",
         Singer::Female => "P2",
         Singer::Duet => "P3",
         // Not part of the base UltraStar spec, but the same reasonable
         // extension `import_ultrastar` already accepts on the way in.
         Singer::Screaming => "P4",
-        Singer::Default => unreachable!("render_as() never returns Default"),
     }
 }
 

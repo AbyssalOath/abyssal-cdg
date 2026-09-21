@@ -16,12 +16,12 @@
 //! tiles) whenever it's short enough to fit, and automatically falls back
 //! to normal size for longer lines so nothing runs off-screen or clips.
 //!
-//! Color palette: the CDG format gives us 16 color slots. We use 12 of
+//! Color palette: the CDG format gives us 16 color slots. We use 14 of
 //! them: 8 for background/voice text colors (loaded via the low CLUT,
-//! completely full: background + 3 voices x 2 colors + preview), and 4
-//! more for the title/artist card plus a 4th "screaming" voice color pair
-//! (loaded via the high CLUT, which has 4 of its 8 slots free for future
-//! use).
+//! completely full: background + 3 voices x 2 colors + preview), and 6
+//! more for the title/artist card plus the "screaming" and "default" voice
+//! color pairs (loaded via the high CLUT, which has 2 of its 8 slots left
+//! free for future use).
 
 use crate::cdg::{CdgColor, CdgWriter, BLANK_TILE, SAFE_COLS};
 use crate::font;
@@ -55,11 +55,13 @@ const FEMALE_HIGHLIGHT: u8 = 4;
 const DUET_UNSUNG: u8 = 5;
 const DUET_HIGHLIGHT: u8 = 6;
 const PREVIEW: u8 = 7;
-// High CLUT (palette indices 8-11, loaded separately; 12-15 unused):
+// High CLUT (palette indices 8-15, loaded separately; 14-15 unused):
 const TITLE: u8 = 8;
 const ARTIST: u8 = 9;
 const SCREAMING_UNSUNG: u8 = 10;
 const SCREAMING_HIGHLIGHT: u8 = 11;
+const DEFAULT_UNSUNG: u8 = 12;
+const DEFAULT_HIGHLIGHT: u8 = 13;
 
 /// A fully customizable set of on-screen colors. All defaults produce the
 /// classic white/yellow karaoke look; duet voices get their own color pair
@@ -67,6 +69,11 @@ const SCREAMING_HIGHLIGHT: u8 = 11;
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub background: CdgColor,
+    /// Color for a line whose singer hasn't been manually set - defaults to
+    /// the same look as `male_unsung`/`male_highlight`, but independently
+    /// adjustable (e.g. to match a background image/video's palette).
+    pub default_unsung: CdgColor,
+    pub default_highlight: CdgColor,
     pub male_unsung: CdgColor,
     pub male_highlight: CdgColor,
     pub female_unsung: CdgColor,
@@ -85,6 +92,8 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             background: CdgColor::new(0, 0, 2),
+            default_unsung: CdgColor::new(14, 14, 14),
+            default_highlight: CdgColor::new(15, 15, 0),
             male_unsung: CdgColor::new(14, 14, 14),
             male_highlight: CdgColor::new(15, 15, 0),
             female_unsung: CdgColor::new(10, 10, 15),
@@ -107,6 +116,8 @@ impl Palette {
     pub fn high_contrast() -> Self {
         Self {
             background: CdgColor::new(0, 0, 0),
+            default_unsung: CdgColor::new(7, 7, 7),
+            default_highlight: CdgColor::new(15, 15, 0),
             male_unsung: CdgColor::new(7, 7, 7),
             male_highlight: CdgColor::new(15, 15, 0),
             female_unsung: CdgColor::new(6, 6, 9),
@@ -125,6 +136,8 @@ impl Palette {
     pub fn sunset() -> Self {
         Self {
             background: CdgColor::new(2, 0, 3),
+            default_unsung: CdgColor::new(9, 6, 10),
+            default_highlight: CdgColor::new(15, 9, 2),
             male_unsung: CdgColor::new(9, 6, 10),
             male_highlight: CdgColor::new(15, 9, 2),
             female_unsung: CdgColor::new(10, 6, 9),
@@ -143,6 +156,8 @@ impl Palette {
     pub fn ocean() -> Self {
         Self {
             background: CdgColor::new(0, 1, 3),
+            default_unsung: CdgColor::new(6, 9, 11),
+            default_highlight: CdgColor::new(0, 14, 15),
             male_unsung: CdgColor::new(6, 9, 11),
             male_highlight: CdgColor::new(0, 14, 15),
             female_unsung: CdgColor::new(7, 8, 12),
@@ -177,8 +192,8 @@ impl Palette {
             self.artist,
             self.screaming_unsung,
             self.screaming_highlight,
-            zero,
-            zero,
+            self.default_unsung,
+            self.default_highlight,
             zero,
             zero,
         ]
@@ -186,12 +201,12 @@ impl Palette {
 
     /// (unsung color index, highlight color index) for a given singer.
     fn singer_colors(&self, s: Singer) -> (u8, u8) {
-        match s.render_as() {
+        match s {
+            Singer::Default => (DEFAULT_UNSUNG, DEFAULT_HIGHLIGHT),
             Singer::Male => (MALE_UNSUNG, MALE_HIGHLIGHT),
             Singer::Female => (FEMALE_UNSUNG, FEMALE_HIGHLIGHT),
             Singer::Duet => (DUET_UNSUNG, DUET_HIGHLIGHT),
             Singer::Screaming => (SCREAMING_UNSUNG, SCREAMING_HIGHLIGHT),
-            Singer::Default => unreachable!("render_as() never returns Default"),
         }
     }
 }
@@ -738,8 +753,9 @@ mod tests {
         // 5th color category can't silently overflow it unnoticed.
         let high = Palette::default().high_clut();
         assert_eq!(high.len(), 8);
-        // Currently: title, artist, screaming_unsung, screaming_highlight
-        // (4 used), leaving exactly 4 zero-padded slots free for later.
+        // Currently: title, artist, screaming_unsung, screaming_highlight,
+        // default_unsung, default_highlight (6 used), leaving exactly 2
+        // zero-padded slots free for later.
     }
 
     #[test]

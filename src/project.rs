@@ -49,6 +49,15 @@ pub struct RgbColor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectColors {
     pub background: RgbColor,
+    /// Color for a line whose singer hasn't been manually set. `None` in
+    /// every project saved before this had its own color (via
+    /// `#[serde(default)]`) - callers should fall back to `male_unsung`/
+    /// `male_highlight` in that case, matching how `Default` used to always
+    /// render identically to `Male`.
+    #[serde(default)]
+    pub default_unsung: Option<RgbColor>,
+    #[serde(default)]
+    pub default_highlight: Option<RgbColor>,
     pub male_unsung: RgbColor,
     pub male_highlight: RgbColor,
     pub female_unsung: RgbColor,
@@ -198,6 +207,8 @@ mod tests {
         };
         ProjectColors {
             background: c(1),
+            default_unsung: Some(c(13)),
+            default_highlight: Some(c(14)),
             male_unsung: c(2),
             male_highlight: c(3),
             female_unsung: c(4),
@@ -279,6 +290,32 @@ mod tests {
         assert_eq!(loaded.background_dim, 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_colors_without_a_saved_default_voice_color_deserializes_to_none() {
+        // A project saved before `Default` had its own color - `colors`
+        // omits `default_unsung`/`default_highlight` entirely. Callers
+        // (see `KaraokeApp::apply_project_file`) fall back to `male_unsung`/
+        // `male_highlight` in that case, matching how `Default` used to
+        // always render identically to `Male`.
+        let json = serde_json::json!({
+            "background": {"r": 1, "g": 2, "b": 3},
+            "male_unsung": {"r": 4, "g": 5, "b": 6},
+            "male_highlight": {"r": 7, "g": 8, "b": 9},
+            "female_unsung": {"r": 10, "g": 11, "b": 12},
+            "female_highlight": {"r": 13, "g": 14, "b": 15},
+            "duet_unsung": {"r": 16, "g": 17, "b": 18},
+            "duet_highlight": {"r": 19, "g": 20, "b": 21},
+            "preview": {"r": 22, "g": 23, "b": 24},
+            "title": {"r": 25, "g": 26, "b": 27},
+            "artist": {"r": 28, "g": 29, "b": 30},
+            "screaming_unsung": {"r": 31, "g": 32, "b": 33},
+            "screaming_highlight": {"r": 34, "g": 35, "b": 36},
+        });
+        let colors: ProjectColors = serde_json::from_value(json).unwrap();
+        assert_eq!(colors.default_unsung, None);
+        assert_eq!(colors.default_highlight, None);
     }
 
     #[test]

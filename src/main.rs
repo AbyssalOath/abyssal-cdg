@@ -205,6 +205,11 @@ struct KaraokeApp {
     artist: String,
 
     color_bg: egui::Color32,
+    /// Color for a line whose singer hasn't been manually set - defaults to
+    /// the same look as `color_male_unsung`/`color_male_highlight`, but
+    /// independently adjustable (e.g. to match a background image/video).
+    color_default_unsung: egui::Color32,
+    color_default_highlight: egui::Color32,
     color_male_unsung: egui::Color32,
     color_male_highlight: egui::Color32,
     color_female_unsung: egui::Color32,
@@ -527,6 +532,8 @@ impl KaraokeApp {
             title: String::new(),
             artist: String::new(),
             color_bg: color32_from_cdg(p.background),
+            color_default_unsung: color32_from_cdg(p.default_unsung),
+            color_default_highlight: color32_from_cdg(p.default_highlight),
             color_male_unsung: color32_from_cdg(p.male_unsung),
             color_male_highlight: color32_from_cdg(p.male_highlight),
             color_female_unsung: color32_from_cdg(p.female_unsung),
@@ -582,6 +589,8 @@ impl KaraokeApp {
     fn palette(&self) -> Palette {
         Palette {
             background: cdg_from_color32(self.color_bg),
+            default_unsung: cdg_from_color32(self.color_default_unsung),
+            default_highlight: cdg_from_color32(self.color_default_highlight),
             male_unsung: cdg_from_color32(self.color_male_unsung),
             male_highlight: cdg_from_color32(self.color_male_highlight),
             female_unsung: cdg_from_color32(self.color_female_unsung),
@@ -600,6 +609,8 @@ impl KaraokeApp {
         let c = |c: egui::Color32| video::Rgb8::new(c.r(), c.g(), c.b());
         VideoPalette {
             background: c(self.color_bg),
+            default_unsung: c(self.color_default_unsung),
+            default_highlight: c(self.color_default_highlight),
             male_unsung: c(self.color_male_unsung),
             male_highlight: c(self.color_male_highlight),
             female_unsung: c(self.color_female_unsung),
@@ -615,12 +626,12 @@ impl KaraokeApp {
     }
 
     fn singer_colors(&self, s: Singer) -> (egui::Color32, egui::Color32) {
-        match s.render_as() {
+        match s {
+            Singer::Default => (self.color_default_unsung, self.color_default_highlight),
             Singer::Male => (self.color_male_unsung, self.color_male_highlight),
             Singer::Female => (self.color_female_unsung, self.color_female_highlight),
             Singer::Duet => (self.color_duet_unsung, self.color_duet_highlight),
             Singer::Screaming => (self.color_screaming_unsung, self.color_screaming_highlight),
-            Singer::Default => unreachable!("render_as() never returns Default"),
         }
     }
 
@@ -628,6 +639,8 @@ impl KaraokeApp {
     fn apply_color_preset(&mut self, preset: ColorPreset) {
         let p = preset.palette();
         self.color_bg = color32_from_cdg(p.background);
+        self.color_default_unsung = color32_from_cdg(p.default_unsung);
+        self.color_default_highlight = color32_from_cdg(p.default_highlight);
         self.color_male_unsung = color32_from_cdg(p.male_unsung);
         self.color_male_highlight = color32_from_cdg(p.male_highlight);
         self.color_female_unsung = color32_from_cdg(p.female_unsung);
@@ -669,6 +682,8 @@ impl KaraokeApp {
             artist: self.artist.clone(),
             colors: project::ProjectColors {
                 background: rgb_color_from_color32(self.color_bg),
+                default_unsung: Some(rgb_color_from_color32(self.color_default_unsung)),
+                default_highlight: Some(rgb_color_from_color32(self.color_default_highlight)),
                 male_unsung: rgb_color_from_color32(self.color_male_unsung),
                 male_highlight: rgb_color_from_color32(self.color_male_highlight),
                 female_unsung: rgb_color_from_color32(self.color_female_unsung),
@@ -815,6 +830,12 @@ impl KaraokeApp {
 
         let c = project.colors;
         self.color_bg = color32_from_rgb_color(c.background);
+        // A project saved before `Default` had its own color falls back to
+        // `Male`'s - exactly how `Default` used to always render, so an old
+        // project's look doesn't change just from being reopened.
+        self.color_default_unsung = color32_from_rgb_color(c.default_unsung.unwrap_or(c.male_unsung));
+        self.color_default_highlight =
+            color32_from_rgb_color(c.default_highlight.unwrap_or(c.male_highlight));
         self.color_male_unsung = color32_from_rgb_color(c.male_unsung);
         self.color_male_highlight = color32_from_rgb_color(c.male_highlight);
         self.color_female_unsung = color32_from_rgb_color(c.female_unsung);
@@ -3521,6 +3542,15 @@ impl eframe::App for KaraokeApp {
                 .small()
                 .weak(),
             );
+
+            ui.checkbox(&mut self.auto_follow_words, "Auto-follow fine-tune panel")
+                .on_hover_text(
+                    "While the \"Fine-tune words\" panel is open and the song is playing, it \
+                     normally jumps to whichever line is currently playing. Turn this off to \
+                     keep it on one line until you pick another yourself - handy for catching \
+                     a line's very first or last word, which auto-follow can otherwise snatch \
+                     the panel away from (or onto) right as it needs a click.",
+                );
         });
 
         self.draw_export_dialog(ctx);
@@ -3710,6 +3740,21 @@ impl eframe::App for KaraokeApp {
                                         ui.color_edit_button_srgba(&mut self.color_bg);
                                         ui.end_row();
 
+                                        ui.label("Default - upcoming")
+                                            .on_hover_text(
+                                                "Used for any line whose singer hasn't been \
+                                                 manually set. Defaults to the same look as \
+                                                 Male, but can be set independently - e.g. to \
+                                                 match a background image/video's palette.",
+                                            );
+                                        ui.color_edit_button_srgba(&mut self.color_default_unsung);
+                                        ui.end_row();
+                                        ui.label("Default - sung");
+                                        ui.color_edit_button_srgba(
+                                            &mut self.color_default_highlight,
+                                        );
+                                        ui.end_row();
+
                                         ui.label("Male - upcoming");
                                         ui.color_edit_button_srgba(&mut self.color_male_unsung);
                                         ui.end_row();
@@ -3864,7 +3909,6 @@ impl eframe::App for KaraokeApp {
                         ui.horizontal(|ui| {
                             ui.strong("Fine-tune words:");
                             ui.label(&self.lines[i].text);
-                            ui.checkbox(&mut self.auto_follow_words, "Auto-follow");
                             if ui.small_button("Close").clicked() {
                                 self.word_tap_line = None;
                             }
@@ -3875,12 +3919,12 @@ impl eframe::App for KaraokeApp {
                              line to line, so there's no need to reselect a line yourself. \
                              Click a word again to retime it. If auto-follow keeps snatching \
                              the panel away before you can catch a line's first or last word, \
-                             turn it off."
+                             turn off Auto-follow up in the top panel."
                         } else {
-                            "Auto-follow is off - this panel stays on this line until you pick \
-                             another one (below, or by clicking a lyric line in the timeline), \
-                             so a line's first/last word is easier to catch. Click a word again \
-                             to retime it."
+                            "Auto-follow (top panel) is off - this panel stays on this line \
+                             until you pick another one (click any lyric line below, or a \
+                             bubble on the timeline), so a line's first/last word is easier to \
+                             catch. Click a word again to retime it."
                         });
                         ui.horizontal(|ui| {
                             ui.label("Tap sets a word's:");
@@ -4043,7 +4087,19 @@ impl eframe::App for KaraokeApp {
                                     } else {
                                         egui::RichText::new(&self.lines[i].text)
                                     };
-                                    ui.add(egui::Label::new(text_label).wrap());
+                                    // Clicking the lyric text itself opens/switches the
+                                    // "Fine-tune words" panel to this line - the same as
+                                    // the "Words" button below, just a bigger, more obvious
+                                    // target, and one that also shows which line is
+                                    // currently selected (highlighted) at a glance.
+                                    let selected = self.word_tap_line == Some(i);
+                                    if ui
+                                        .selectable_label(selected, text_label)
+                                        .on_hover_text("Click to select this line for fine-tuning words.")
+                                        .clicked()
+                                    {
+                                        words_idx = Some(i);
+                                    }
                                 });
 
                                 // End field - stays empty (just like Start

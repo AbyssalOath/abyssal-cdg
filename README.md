@@ -48,18 +48,21 @@ used by karaoke machines and "MP3+G" karaoke software.
    songs or intense sections - each gets its own color pair so singers can
    tell whose line is whose (or when to belt it) at a glance.
 8. **Fine-tune individual words** a few ways:
-   - Click "Words" next to any line to open a strip of clickable word
-     buttons, and a Start/End toggle above them. In Start mode (the
-     default), clicking a word sets when its highlight begins; switch to
-     End mode to set when it should stop advancing and freeze instead of
-     always running until the next word starts (useful for a held note
-     followed by a pause). Green = start set, blue = end set, teal = both.
-     Once every line has a start time (step 4), this panel opens
-     automatically and **follows along with the song** as it plays. Handy
-     for most words, but it can snatch the panel away from (or onto) a
-     line right as its very first/last word needs a click - toggle
-     **Auto-follow** off in the panel to keep it on one line until you
-     move on yourself.
+   - Click a lyric line (or the "Words" button next to it) to open a strip
+     of clickable word buttons for it, and a Start/End toggle above them.
+     In Start mode (the default), clicking a word sets when its highlight
+     begins; switch to End mode to set when it should stop advancing and
+     freeze instead of always running until the next word starts (useful
+     for a held note followed by a pause). Green = start set, blue = end
+     set, teal = both. The currently-selected line is highlighted in the
+     list. Once every line has a start time (step 4), this panel opens
+     automatically and **follows along with the song** as it plays, thanks
+     to the **"Auto-follow fine-tune panel"** checkbox up in the top
+     panel (on by default). Handy for most words, but it can snatch the
+     panel away from (or onto) a line right as its very first/last word
+     needs a click - turn Auto-follow off to keep the panel on one line
+     until you click a different one yourself (or a bubble on the
+     timeline).
    - Fine-tune visually on the **timeline** at the bottom of the window
      (see below) - a waveform of the loaded audio is drawn behind the
      bubbles, so you can drag one to line up with an actual vocal onset
@@ -75,7 +78,10 @@ used by karaoke machines and "MP3+G" karaoke software.
 9. **Customize colors** for every element (background, each voice's
    upcoming/already-sung colors, the next-line preview, and the title
    card) via the color pickers, or pick a built-in preset to skip the
-   pickers entirely.
+   pickers entirely. A line whose singer is still **Default** (untouched)
+   uses its own color pair, separate from Male - it starts out looking
+   identical to Male, but can be set independently, e.g. to match a
+   background image/video's palette.
 10. **Use an image or video as the background** (album art, a music video,
     ...) instead of a flat color - the **Background** panel below the
     preview lets you choose one, pick a **fit** mode, and adjust a **dim**

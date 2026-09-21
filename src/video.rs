@@ -149,6 +149,11 @@ impl Rgb8 {
 #[derive(Clone, Copy, Debug)]
 pub struct VideoPalette {
     pub background: Rgb8,
+    /// Color for a line whose singer hasn't been manually set - defaults to
+    /// the same look as `male_unsung`/`male_highlight`, but independently
+    /// adjustable (e.g. to match a background image/video's palette).
+    pub default_unsung: Rgb8,
+    pub default_highlight: Rgb8,
     pub male_unsung: Rgb8,
     pub male_highlight: Rgb8,
     pub female_unsung: Rgb8,
@@ -164,12 +169,12 @@ pub struct VideoPalette {
 
 impl VideoPalette {
     fn singer_colors(&self, s: Singer) -> (Rgb8, Rgb8) {
-        match s.render_as() {
+        match s {
+            Singer::Default => (self.default_unsung, self.default_highlight),
             Singer::Male => (self.male_unsung, self.male_highlight),
             Singer::Female => (self.female_unsung, self.female_highlight),
             Singer::Duet => (self.duet_unsung, self.duet_highlight),
             Singer::Screaming => (self.screaming_unsung, self.screaming_highlight),
-            Singer::Default => unreachable!("render_as() never returns Default"),
         }
     }
 }
@@ -1104,6 +1109,8 @@ mod tests {
     fn legend_text_and_colors_uses_each_singers_highlight_color() {
         let palette = VideoPalette {
             background: Rgb8::new(5, 5, 20),
+            default_unsung: Rgb8::new(230, 230, 230),
+            default_highlight: Rgb8::new(255, 220, 0),
             male_unsung: Rgb8::new(230, 230, 230),
             male_highlight: Rgb8::new(255, 220, 0),
             female_unsung: Rgb8::new(210, 210, 255),
@@ -1270,6 +1277,8 @@ mod tests {
 
         let palette = VideoPalette {
             background: Rgb8::new(5, 5, 20),
+            default_unsung: Rgb8::new(230, 230, 230),
+            default_highlight: Rgb8::new(255, 220, 0),
             male_unsung: Rgb8::new(230, 230, 230),
             male_highlight: Rgb8::new(255, 220, 0),
             female_unsung: Rgb8::new(210, 210, 255),
