@@ -55,7 +55,11 @@ used by karaoke machines and "MP3+G" karaoke software.
      always running until the next word starts (useful for a held note
      followed by a pause). Green = start set, blue = end set, teal = both.
      Once every line has a start time (step 4), this panel opens
-     automatically and **follows along with the song** as it plays.
+     automatically and **follows along with the song** as it plays. Handy
+     for most words, but it can snatch the panel away from (or onto) a
+     line right as its very first/last word needs a click - toggle
+     **Auto-follow** off in the panel to keep it on one line until you
+     move on yourself.
    - Fine-tune visually on the **timeline** at the bottom of the window
      (see below) - a waveform of the loaded audio is drawn behind the
      bubbles, so you can drag one to line up with an actual vocal onset

@@ -187,6 +187,13 @@ struct KaraokeApp {
     /// Whether clicking a word in the fine-tune panel sets its start or end
     /// time - see [`WordTapMode`].
     word_tap_mode: WordTapMode,
+    /// Whether the fine-tune-words panel automatically switches to whichever
+    /// line is currently playing (see [`Self::auto_follow_word_tap_line`]).
+    /// On by default, but it can make a line's very first/last word hard to
+    /// catch - the panel jumps to/away from the line right as it starts/
+    /// ends, the same instant those words need a click - so it can be
+    /// turned off to fine-tune a line at your own pace instead.
+    auto_follow_words: bool,
     /// Line index + in-progress text while a start-time field in the
     /// timing table is focused - `None` the rest of the time, so the
     /// displayed text otherwise always mirrors the line's live value.
@@ -489,6 +496,7 @@ impl KaraokeApp {
             tap_phase: TapPhase::default(),
             word_tap_line: None,
             word_tap_mode: WordTapMode::default(),
+            auto_follow_words: true,
             start_edit: None,
             end_edit: None,
             title: String::new(),
@@ -1585,9 +1593,13 @@ impl KaraokeApp {
     /// While the fine-tune-words panel is open and the song is playing,
     /// keep it pointed at whichever line is currently active, so the user
     /// can just play through and click words without manually reselecting
-    /// a line every time the song moves on to the next one.
+    /// a line every time the song moves on to the next one. Does nothing
+    /// when [`Self::auto_follow_words`] is turned off, so a line stays
+    /// selected until the user moves on themselves - useful for a line's
+    /// first/last word, which auto-follow can otherwise snatch the panel
+    /// away from (or onto) right as it needs a click.
     fn auto_follow_word_tap_line(&mut self) {
-        if self.word_tap_line.is_none() {
+        if !self.auto_follow_words || self.word_tap_line.is_none() {
             return;
         }
         let Some(audio) = &self.audio else { return };
@@ -3613,16 +3625,24 @@ impl eframe::App for KaraokeApp {
                         ui.horizontal(|ui| {
                             ui.strong("Fine-tune words:");
                             ui.label(&self.lines[i].text);
+                            ui.checkbox(&mut self.auto_follow_words, "Auto-follow");
                             if ui.small_button("Close").clicked() {
                                 self.word_tap_line = None;
                             }
                         });
-                        ui.label(
+                        ui.label(if self.auto_follow_words {
                             "Play the song and just click each word the instant it's sung - \
                              this panel follows along automatically as the song moves from \
                              line to line, so there's no need to reselect a line yourself. \
-                             Click a word again to retime it.",
-                        );
+                             Click a word again to retime it. If auto-follow keeps snatching \
+                             the panel away before you can catch a line's first or last word, \
+                             turn it off."
+                        } else {
+                            "Auto-follow is off - this panel stays on this line until you pick \
+                             another one (below, or by clicking a lyric line in the timeline), \
+                             so a line's first/last word is easier to catch. Click a word again \
+                             to retime it."
+                        });
                         ui.horizontal(|ui| {
                             ui.label("Tap sets a word's:");
                             ui.selectable_value(
