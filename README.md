@@ -606,4 +606,4 @@ cargo test
 
 If you find Abyssal CDG helpful, please consider supporting its development:
 
-[Donate via Ko-fi](https://ko-fi.com/lordsodomiser)
+[Donate via Ko-fi](https://ko-fi.com/abyssaloath)
