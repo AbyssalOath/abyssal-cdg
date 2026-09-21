@@ -833,7 +833,8 @@ impl KaraokeApp {
         // A project saved before `Default` had its own color falls back to
         // `Male`'s - exactly how `Default` used to always render, so an old
         // project's look doesn't change just from being reopened.
-        self.color_default_unsung = color32_from_rgb_color(c.default_unsung.unwrap_or(c.male_unsung));
+        self.color_default_unsung =
+            color32_from_rgb_color(c.default_unsung.unwrap_or(c.male_unsung));
         self.color_default_highlight =
             color32_from_rgb_color(c.default_highlight.unwrap_or(c.male_highlight));
         self.color_male_unsung = color32_from_rgb_color(c.male_unsung);
@@ -3740,13 +3741,12 @@ impl eframe::App for KaraokeApp {
                                         ui.color_edit_button_srgba(&mut self.color_bg);
                                         ui.end_row();
 
-                                        ui.label("Default - upcoming")
-                                            .on_hover_text(
-                                                "Used for any line whose singer hasn't been \
+                                        ui.label("Default - upcoming").on_hover_text(
+                                            "Used for any line whose singer hasn't been \
                                                  manually set. Defaults to the same look as \
                                                  Male, but can be set independently - e.g. to \
                                                  match a background image/video's palette.",
-                                            );
+                                        );
                                         ui.color_edit_button_srgba(&mut self.color_default_unsung);
                                         ui.end_row();
                                         ui.label("Default - sung");
@@ -4095,7 +4095,9 @@ impl eframe::App for KaraokeApp {
                                     let selected = self.word_tap_line == Some(i);
                                     if ui
                                         .selectable_label(selected, text_label)
-                                        .on_hover_text("Click to select this line for fine-tuning words.")
+                                        .on_hover_text(
+                                            "Click to select this line for fine-tuning words.",
+                                        )
                                         .clicked()
                                     {
                                         words_idx = Some(i);
