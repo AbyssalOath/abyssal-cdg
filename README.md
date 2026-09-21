@@ -600,3 +600,10 @@ cargo test
 - [CHANGELOG.md](CHANGELOG.md) - notable changes by version.
 - [BUILD_TROUBLESHOOTING.md](BUILD_TROUBLESHOOTING.md) - the most common
   build failure (an old Rust toolchain) and how to fix it.
+
+
+## Support the Project
+
+If you find Abyssal CDG helpful, please consider supporting its development:
+
+[Donate via Ko-fi](https://ko-fi.com/lordsodomiser)
