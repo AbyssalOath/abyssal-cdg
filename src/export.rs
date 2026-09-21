@@ -26,7 +26,8 @@
 use crate::cdg::{CdgColor, CdgWriter, BLANK_TILE, SAFE_COLS};
 use crate::font;
 use crate::lyrics::{
-    countdown_window, countdown_window_between, word_timings, Singer, TimedLine, SUNG_LINGER_SECS,
+    countdown_window, countdown_window_between, singer_legend, word_timings, Singer, TimedLine,
+    SUNG_LINGER_SECS,
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,9 @@ use std::path::{Path, PathBuf};
 /// The current line gets a 2-row-tall band so it can use 2x-scaled text.
 const TITLE_ROW: u8 = 1;
 const ARTIST_ROW: u8 = 4;
+/// Row for the singer color legend (e.g. "Male  Female"), shown alongside
+/// the title/artist card for songs with more than one voice color in play.
+const LEGEND_ROW: u8 = 5;
 const CURRENT_ROW: u8 = 6;
 const PREVIEW_ROW: u8 = 10;
 const COUNTDOWN_ROW: u8 = 13;
@@ -182,11 +186,12 @@ impl Palette {
 
     /// (unsung color index, highlight color index) for a given singer.
     fn singer_colors(&self, s: Singer) -> (u8, u8) {
-        match s {
+        match s.render_as() {
             Singer::Male => (MALE_UNSUNG, MALE_HIGHLIGHT),
             Singer::Female => (FEMALE_UNSUNG, FEMALE_HIGHLIGHT),
             Singer::Duet => (DUET_UNSUNG, DUET_HIGHLIGHT),
             Singer::Screaming => (SCREAMING_UNSUNG, SCREAMING_HIGHLIGHT),
+            Singer::Default => unreachable!("render_as() never returns Default"),
         }
     }
 }
@@ -287,6 +292,39 @@ fn draw_char_at(
         for (tc, tile) in tile_row.iter().enumerate() {
             w.tile_block(band_row + tr as u8, (col + tc) as u8, color0, color1, tile);
         }
+    }
+}
+
+/// Builds the legend's display text (e.g. "Male  Female") plus a
+/// per-character foreground color index (spaces get a throwaway index,
+/// since [`draw_legend_row`] skips drawing whitespace).
+fn legend_text_and_colors(palette: &Palette, singers: &[Singer]) -> (String, Vec<u8>) {
+    let mut text = String::new();
+    let mut colors = Vec::new();
+    for (i, singer) in singers.iter().enumerate() {
+        if i > 0 {
+            text.push_str("  ");
+            colors.extend([BG, BG]);
+        }
+        let (_, highlight) = palette.singer_colors(*singer);
+        let label = singer.label();
+        text.push_str(label);
+        colors.extend(std::iter::repeat_n(highlight, label.chars().count()));
+    }
+    (text, colors)
+}
+
+/// Draws a legend line laid out like [`draw_row_scaled`], but with each
+/// character's foreground color taken from `colors` individually instead of
+/// a single color for the whole line - so each singer's label can be shown
+/// in that singer's own highlight color.
+fn draw_legend_row(w: &mut CdgWriter, band_row: u8, layout: &LineLayout, colors: &[u8]) {
+    for (char_idx, ch) in layout.text.chars().enumerate() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        let color1 = colors.get(char_idx).copied().unwrap_or(BG);
+        draw_char_at(w, band_row, layout, char_idx, ch, BG, color1);
     }
 }
 
@@ -413,16 +451,22 @@ pub fn render_cdg(
             ARTIST,
         );
     }
+    let legend_singers = singer_legend(timed_lines);
+    if !legend_singers.is_empty() {
+        let (text, colors) = legend_text_and_colors(palette, &legend_singers);
+        draw_legend_row(&mut w, LEGEND_ROW, &layout_line_scaled(&text, 1), &colors);
+    }
     // Only actually spend stream time on the title-card rows (and the wipe
     // that clears them) when there's something to show there - with no
-    // title/artist, there's nothing to clear, and forcing the stream
+    // title/artist/legend, there's nothing to clear, and forcing the stream
     // forward to `card_end` would pad the file with dead air even for a
     // song with no lyric lines at all.
     let card_end = title_card_end(timed_lines);
-    if title.is_some() || artist.is_some() {
+    if title.is_some() || artist.is_some() || !legend_singers.is_empty() {
         w.advance_to(card_end);
         clear_band(&mut w, TITLE_ROW, PREFERRED_SCALE);
         clear_row(&mut w, ARTIST_ROW);
+        clear_row(&mut w, LEGEND_ROW);
     }
 
     // If there's a long stretch between the title card fading (or, if
@@ -634,6 +678,37 @@ mod tests {
         lines[1].start = Some(3.0);
         lines[1].singer = crate::lyrics::Singer::Female;
         let timed = resolve_timing(&lines, Some(6.0));
+        let bytes = render_cdg(&timed, 6.0, &Palette::default(), None, None);
+        assert_eq!(bytes.len() % 24, 0);
+    }
+
+    #[test]
+    fn duet_legend_renders_without_title_or_artist() {
+        // No title/artist given - the singer-color legend alone should
+        // still trigger the intro-card timing (advance + clear rows)
+        // without panicking.
+        let mut lines = vec![LyricLine::new("his line"), LyricLine::new("her line")];
+        lines[0].start = Some(0.0);
+        lines[0].singer = crate::lyrics::Singer::Male;
+        lines[1].start = Some(3.0);
+        lines[1].singer = crate::lyrics::Singer::Female;
+        let timed = resolve_timing(&lines, Some(6.0));
+        assert_eq!(
+            crate::lyrics::singer_legend(&timed).len(),
+            2,
+            "a two-voice song should get a legend"
+        );
+        let bytes = render_cdg(&timed, 6.0, &Palette::default(), None, None);
+        assert_eq!(bytes.len() % 24, 0);
+    }
+
+    #[test]
+    fn single_voice_song_gets_no_legend() {
+        let mut lines = vec![LyricLine::new("hello"), LyricLine::new("world")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(3.0);
+        let timed = resolve_timing(&lines, Some(6.0));
+        assert!(crate::lyrics::singer_legend(&timed).is_empty());
         let bytes = render_cdg(&timed, 6.0, &Palette::default(), None, None);
         assert_eq!(bytes.len() % 24, 0);
     }

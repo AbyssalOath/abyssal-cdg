@@ -20,7 +20,15 @@
 /// differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Singer {
+    /// No voice manually assigned - every line starts out this way. Renders
+    /// with the same colors as `Male` (see [`Singer::render_as`]), but -
+    /// unlike explicitly choosing `Male` - doesn't by itself make the intro
+    /// screen's singer-color legend appear. That way a song nobody has
+    /// touched the singer setting on never shows a legend, while a duet or
+    /// screaming section (which necessarily involves setting *some* line to
+    /// something other than `Default`) still does.
     #[default]
+    Default,
     Male,
     Female,
     Duet,
@@ -33,11 +41,45 @@ pub enum Singer {
 impl Singer {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Default => "Default",
             Self::Male => "Male",
             Self::Female => "Female",
             Self::Duet => "Duet",
             Self::Screaming => "Screaming",
         }
+    }
+
+    /// The color this singer actually renders as - `Default` renders
+    /// identically to `Male` (see [`Singer::label`]'s doc comment).
+    pub fn render_as(self) -> Self {
+        match self {
+            Self::Default => Self::Male,
+            other => other,
+        }
+    }
+
+    const ALL: [Singer; 4] = [Self::Male, Self::Female, Self::Duet, Self::Screaming];
+}
+
+/// The distinct voice colors actually used across `lines` (with `Default`
+/// lines counted as `Male`, the color they render as - see
+/// [`Singer::render_as`]), in a fixed Male/Female/Duet/Screaming order
+/// regardless of which order they first appear in the song. Used to build a
+/// color-legend on the intro screen so singers can see which color means
+/// what before the song starts. Returns an empty list for a song with only
+/// one (or zero) distinct voice color, since a legend only earns its place
+/// once more than one is actually in play - e.g. a duet, or a song with a
+/// dedicated screaming section - which also means an untouched song (every
+/// line still at `Default`) never gets a legend.
+pub fn singer_legend(lines: &[TimedLine]) -> Vec<Singer> {
+    let used: Vec<Singer> = Singer::ALL
+        .into_iter()
+        .filter(|s| lines.iter().any(|l| l.singer.render_as() == *s))
+        .collect();
+    if used.len() > 1 {
+        used
+    } else {
+        Vec::new()
     }
 }
 
@@ -595,7 +637,7 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "Hello world");
         assert_eq!(lines[2].text, "Third");
-        assert_eq!(lines[0].singer, Singer::Male); // default
+        assert_eq!(lines[0].singer, Singer::Default); // default
     }
 
     #[test]
@@ -681,6 +723,61 @@ mod tests {
         let timed = resolve_timing(&lines, Some(6.0));
         assert_eq!(timed[0].singer, Singer::Female);
         assert_eq!(timed[1].singer, Singer::Duet);
+    }
+
+    #[test]
+    fn singer_legend_is_empty_when_only_one_voice_is_used() {
+        let lines = vec![
+            TimedLine::new("a".into(), 0.0, 1.0, Singer::Male),
+            TimedLine::new("b".into(), 1.0, 2.0, Singer::Male),
+        ];
+        assert!(singer_legend(&lines).is_empty());
+    }
+
+    #[test]
+    fn singer_legend_is_empty_for_no_lines() {
+        assert!(singer_legend(&[]).is_empty());
+    }
+
+    #[test]
+    fn singer_legend_is_empty_for_an_untouched_song() {
+        // Nothing manually assigned - every line is still `Default`. Even
+        // though that renders as `Male`, there's only one color in play, so
+        // no legend should appear.
+        let lines = vec![
+            TimedLine::new("a".into(), 0.0, 1.0, Singer::Default),
+            TimedLine::new("b".into(), 1.0, 2.0, Singer::Default),
+        ];
+        assert!(singer_legend(&lines).is_empty());
+    }
+
+    #[test]
+    fn singer_legend_shows_up_once_any_line_is_set_away_from_default() {
+        // A realistic duet: only the second voice's lines get manually
+        // assigned, the rest are left at `Default`. The legend should
+        // still appear, listing `Male` (what `Default` renders as) and
+        // `Female` - the two colors actually on screen.
+        let lines = vec![
+            TimedLine::new("his line".into(), 0.0, 1.0, Singer::Default),
+            TimedLine::new("her line".into(), 1.0, 2.0, Singer::Female),
+        ];
+        assert_eq!(singer_legend(&lines), vec![Singer::Male, Singer::Female]);
+    }
+
+    #[test]
+    fn singer_legend_lists_distinct_singers_in_a_fixed_order() {
+        // Female appears before Male in the song, but the legend should
+        // still list them in the fixed Male/Female/Duet/Screaming order.
+        let lines = vec![
+            TimedLine::new("a".into(), 0.0, 1.0, Singer::Female),
+            TimedLine::new("b".into(), 1.0, 2.0, Singer::Male),
+            TimedLine::new("c".into(), 2.0, 3.0, Singer::Female),
+            TimedLine::new("d".into(), 3.0, 4.0, Singer::Screaming),
+        ];
+        assert_eq!(
+            singer_legend(&lines),
+            vec![Singer::Male, Singer::Female, Singer::Screaming]
+        );
     }
 
     #[test]

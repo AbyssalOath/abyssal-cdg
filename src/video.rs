@@ -23,7 +23,7 @@
 use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
     blank_sung_lines, countdown_window, countdown_window_between, current_line_wipe_fraction,
-    group_into_blocks, hide_upcoming_lines, normalize_text, TimedLine,
+    group_into_blocks, hide_upcoming_lines, normalize_text, singer_legend, Singer, TimedLine,
 };
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
@@ -98,13 +98,13 @@ pub struct VideoPalette {
 }
 
 impl VideoPalette {
-    fn singer_colors(&self, s: crate::lyrics::Singer) -> (Rgb8, Rgb8) {
-        use crate::lyrics::Singer;
-        match s {
+    fn singer_colors(&self, s: Singer) -> (Rgb8, Rgb8) {
+        match s.render_as() {
             Singer::Male => (self.male_unsung, self.male_highlight),
             Singer::Female => (self.female_unsung, self.female_highlight),
             Singer::Duet => (self.duet_unsung, self.duet_highlight),
             Singer::Screaming => (self.screaming_unsung, self.screaming_highlight),
+            Singer::Default => unreachable!("render_as() never returns Default"),
         }
     }
 }
@@ -281,6 +281,27 @@ fn draw_text_line_wipe(
     }
 }
 
+/// Builds the singer-legend's display text (e.g. "Male   Female") plus a
+/// per-character color to pass to [`draw_text_line_chars`] - each singer's
+/// label is colored with that singer's own highlight color, so the legend
+/// on the intro screen ties the colors used during the song to the voice
+/// they represent.
+fn legend_text_and_colors(palette: &VideoPalette, singers: &[Singer]) -> (String, Vec<Rgb8>) {
+    let mut text = String::new();
+    let mut colors = Vec::new();
+    for (i, singer) in singers.iter().enumerate() {
+        if i > 0 {
+            text.push_str("   ");
+            colors.extend([palette.preview; 3]);
+        }
+        let (_, highlight) = palette.singer_colors(*singer);
+        let label = singer.label();
+        text.push_str(label);
+        colors.extend(std::iter::repeat_n(highlight, label.chars().count()));
+    }
+    (text, colors)
+}
+
 /// Convenience wrapper for a whole line in a single uniform color.
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_uniform(
@@ -345,7 +366,8 @@ fn render_frame(
     canvas.fill(palette.background);
     let max_width = w * 0.92;
 
-    let has_title_card = title.is_some() || artist.is_some();
+    let legend_singers = singer_legend(timed_lines);
+    let has_title_card = title.is_some() || artist.is_some() || !legend_singers.is_empty();
     if has_title_card && t < card_end {
         if let Some(ti) = title {
             draw_text_line_uniform(
@@ -369,6 +391,19 @@ fn render_frame(
                 h * 0.52,
                 &by,
                 palette.artist,
+                max_width,
+            );
+        }
+        if !legend_singers.is_empty() {
+            let (text, colors) = legend_text_and_colors(palette, &legend_singers);
+            draw_text_line_chars(
+                canvas,
+                regular,
+                h * 0.04,
+                w / 2.0,
+                h * 0.62,
+                &text,
+                &colors,
                 max_width,
             );
         }
@@ -630,6 +665,35 @@ pub fn render_video(
 mod tests {
     use super::*;
     use crate::lyrics::{resolve_timing, word_timings, LyricLine, Singer};
+
+    #[test]
+    fn legend_text_and_colors_uses_each_singers_highlight_color() {
+        let palette = VideoPalette {
+            background: Rgb8::new(5, 5, 20),
+            male_unsung: Rgb8::new(230, 230, 230),
+            male_highlight: Rgb8::new(255, 220, 0),
+            female_unsung: Rgb8::new(210, 210, 255),
+            female_highlight: Rgb8::new(255, 90, 220),
+            duet_unsung: Rgb8::new(200, 255, 200),
+            duet_highlight: Rgb8::new(255, 150, 0),
+            preview: Rgb8::new(110, 110, 160),
+            title: Rgb8::new(255, 255, 255),
+            artist: Rgb8::new(160, 160, 200),
+            screaming_unsung: Rgb8::new(140, 30, 20),
+            screaming_highlight: Rgb8::new(255, 60, 10),
+        };
+        let (text, colors) =
+            legend_text_and_colors(&palette, &[Singer::Male, Singer::Female]);
+        assert_eq!(text, "Male   Female");
+        assert_eq!(colors.len(), text.chars().count());
+        // First char of "Male" should be the male highlight color...
+        assert_eq!(colors[0].r, palette.male_highlight.r);
+        // ...and the first char of "Female" (after "Male" + 3 spaces) the
+        // female highlight color.
+        let female_start = "Male   ".chars().count();
+        assert_eq!(colors[female_start].r, palette.female_highlight.r);
+        assert_eq!(colors[female_start].g, palette.female_highlight.g);
+    }
 
     #[test]
     fn lerp_interpolates_correctly() {

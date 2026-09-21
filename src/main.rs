@@ -24,7 +24,7 @@ use eframe::egui;
 use export::Palette;
 use lyrics::{
     blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines,
-    parse_pasted_lyrics, resolve_timing, LyricLine, Singer, TimedLine,
+    parse_pasted_lyrics, resolve_timing, singer_legend, LyricLine, Singer, TimedLine,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,24 @@ fn format_time(secs: f64) -> String {
     let s = (total_ds / 10) % 60;
     let d = total_ds % 10;
     format!("{:02}:{:02}.{}", m, s, d)
+}
+
+/// Naming convention this app looks for on import to auto-fill the title/
+/// artist fields, so users importing a batch of songs don't have to type
+/// them in by hand: an audio file named "Artist - Song Name.ext". Returns
+/// `None` (leaving the fields alone) when the file's name (extension
+/// stripped) doesn't contain a " - " separator, or either side of it is
+/// empty after trimming - safer than guessing wrong from an unrelated
+/// filename.
+fn parse_artist_title_from_filename(path: &Path) -> Option<(String, String)> {
+    let stem = path.file_stem()?.to_str()?;
+    let (artist, title) = stem.split_once(" - ")?;
+    let artist = artist.trim();
+    let title = title.trim();
+    if artist.is_empty() || title.is_empty() {
+        return None;
+    }
+    Some((artist.to_string(), title.to_string()))
 }
 
 /// Convert a CDG 4-bit-per-channel color to a full-range egui color for UI
@@ -560,11 +578,12 @@ impl KaraokeApp {
     }
 
     fn singer_colors(&self, s: Singer) -> (egui::Color32, egui::Color32) {
-        match s {
+        match s.render_as() {
             Singer::Male => (self.color_male_unsung, self.color_male_highlight),
             Singer::Female => (self.color_female_unsung, self.color_female_highlight),
             Singer::Duet => (self.color_duet_unsung, self.color_duet_highlight),
             Singer::Screaming => (self.color_screaming_unsung, self.color_screaming_highlight),
+            Singer::Default => unreachable!("render_as() never returns Default"),
         }
     }
 
@@ -1070,6 +1089,18 @@ impl KaraokeApp {
             match audio.load(path.clone()) {
                 Ok(()) => {
                     self.status = "Audio loaded.".to_string();
+                    // Only guess from the filename when both fields are
+                    // still blank - never overwrite a title/artist the user
+                    // (or a loaded project) already set.
+                    if self.title.trim().is_empty() && self.artist.trim().is_empty() {
+                        if let Some((artist, title)) = parse_artist_title_from_filename(&path) {
+                            self.artist = artist;
+                            self.title = title;
+                            self.status =
+                                "Audio loaded. Title/artist auto-filled from the filename."
+                                    .to_string();
+                        }
+                    }
                     recent::record_audio(APP_ID, &path);
                     self.recent_files = recent::load(APP_ID);
                     self.start_waveform_job(path);
@@ -2230,7 +2261,10 @@ impl KaraokeApp {
             ui.set_min_size(egui::vec2(width, height));
             ui.set_max_size(egui::vec2(width, height));
 
-            let has_title_card = !self.title.trim().is_empty() || !self.artist.trim().is_empty();
+            let legend_singers = singer_legend(&timed);
+            let has_title_card = !self.title.trim().is_empty()
+                || !self.artist.trim().is_empty()
+                || !legend_singers.is_empty();
 
             ui.vertical_centered(|ui| {
                 ui.add_space(height * 0.15);
@@ -2247,6 +2281,30 @@ impl KaraokeApp {
                             self.color_artist,
                             egui::RichText::new(format!("by {}", self.artist)).size(14.0),
                         );
+                    }
+                    if !legend_singers.is_empty() {
+                        ui.add_space(6.0);
+                        // Built as a single multi-colored label (rather than a
+                        // `ui.horizontal` of separate labels) so
+                        // `vertical_centered` centers the whole legend as one
+                        // block, the same way it centers the title/artist text.
+                        let mut job = egui::text::LayoutJob::default();
+                        for (i, singer) in legend_singers.iter().enumerate() {
+                            if i > 0 {
+                                job.append("   ", 0.0, egui::TextFormat::default());
+                            }
+                            let (_, highlight) = self.singer_colors(*singer);
+                            job.append(
+                                singer.label(),
+                                0.0,
+                                egui::TextFormat {
+                                    color: highlight,
+                                    font_id: egui::FontId::proportional(12.0),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        ui.label(job);
                     }
                     return;
                 }
@@ -3299,6 +3357,14 @@ impl eframe::App for KaraokeApp {
                 ui.label("Artist:");
                 ui.add(egui::TextEdit::singleline(&mut self.artist).desired_width(220.0));
             });
+            ui.label(
+                egui::RichText::new(
+                    "Tip: name imported audio files \"Artist - Song Name.ext\" and these \
+                     fields fill in automatically when they're both still blank.",
+                )
+                .small()
+                .weak(),
+            );
         });
 
         self.draw_export_dialog(ctx);
@@ -3758,6 +3824,11 @@ impl eframe::App for KaraokeApp {
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut self.lines[i].singer,
+                                            Singer::Default,
+                                            "Default",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.lines[i].singer,
                                             Singer::Male,
                                             "Male",
                                         );
@@ -3914,4 +3985,49 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(KaraokeApp::new()))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_artist_and_title_from_the_expected_naming_scheme() {
+        let (artist, title) =
+            parse_artist_title_from_filename(Path::new("Imagine Dragons - Believer.mp3"))
+                .unwrap();
+        assert_eq!(artist, "Imagine Dragons");
+        assert_eq!(title, "Believer");
+    }
+
+    #[test]
+    fn trims_extra_whitespace_around_the_separator() {
+        let (artist, title) =
+            parse_artist_title_from_filename(Path::new("  Queen  -  Bohemian Rhapsody.flac"))
+                .unwrap();
+        assert_eq!(artist, "Queen");
+        assert_eq!(title, "Bohemian Rhapsody");
+    }
+
+    #[test]
+    fn returns_none_without_a_dash_separator() {
+        assert!(parse_artist_title_from_filename(Path::new("Believer.mp3")).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_one_side_is_empty() {
+        assert!(parse_artist_title_from_filename(Path::new(" - Believer.mp3")).is_none());
+        assert!(parse_artist_title_from_filename(Path::new("Imagine Dragons - .mp3")).is_none());
+    }
+
+    #[test]
+    fn only_splits_on_the_first_dash() {
+        // A song whose real title contains " - " should still split into
+        // (artist, everything else) rather than truncating at the last one.
+        let (artist, title) =
+            parse_artist_title_from_filename(Path::new("Artist - Part One - Part Two.mp3"))
+                .unwrap();
+        assert_eq!(artist, "Artist");
+        assert_eq!(title, "Part One - Part Two");
+    }
 }

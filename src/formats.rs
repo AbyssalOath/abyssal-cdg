@@ -318,7 +318,10 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
 
     let mut lines: Vec<(f64, String, Vec<f64>, Singer)> = Vec::new();
     let mut current: Option<PendingLine> = None;
-    let mut current_singer = Singer::Male;
+    // No `P`-marker seen yet - `Default` rather than an explicit `Male`, so
+    // a plain (non-duet) UltraStar file that never uses player markers at
+    // all doesn't make the app think every line was manually assigned.
+    let mut current_singer = Singer::Default;
 
     let finish = |current: &mut Option<PendingLine>,
                   out: &mut Vec<(f64, String, Vec<f64>, Singer)>| {
@@ -448,13 +451,14 @@ fn secs_to_beat(secs: f64, gap_secs: f64, bpm: f64) -> i64 {
 }
 
 fn singer_to_player_marker(singer: Singer) -> &'static str {
-    match singer {
+    match singer.render_as() {
         Singer::Male => "P1",
         Singer::Female => "P2",
         Singer::Duet => "P3",
         // Not part of the base UltraStar spec, but the same reasonable
         // extension `import_ultrastar` already accepts on the way in.
         Singer::Screaming => "P4",
+        Singer::Default => unreachable!("render_as() never returns Default"),
     }
 }
 
@@ -469,9 +473,10 @@ fn singer_to_player_marker(singer: Singer) -> &'static str {
 /// as exactly on-pitch or exactly off, but the lyrics and their timing are
 /// real. Player markers (`P1`-`P4`) are only written where the singer
 /// actually changes from the previous line (and never before a leading
-/// `Male` line, `import_ultrastar`'s own default), so a single-voice song
-/// exports as a plain, non-duet file rather than one needlessly marked up
-/// with a redundant `P1` on every line.
+/// `Default`/`Male` line - `Default` renders and round-trips the same as an
+/// explicit `Male`), so a single-voice song exports as a plain, non-duet
+/// file rather than one needlessly marked up with a redundant `P1` on every
+/// line.
 pub fn export_ultrastar(
     timed: &[TimedLine],
     title: Option<&str>,
@@ -494,7 +499,9 @@ pub fn export_ultrastar(
     let mut last_singer: Option<Singer> = None;
     for (i, line) in timed.iter().enumerate() {
         let changed = last_singer != Some(line.singer);
-        if changed && !(i == 0 && line.singer == Singer::Male) {
+        let leading_unassigned_voice =
+            i == 0 && matches!(line.singer, Singer::Male | Singer::Default);
+        if changed && !leading_unassigned_voice {
             out.push_str(singer_to_player_marker(line.singer));
             out.push('\n');
         }
