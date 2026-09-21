@@ -3994,8 +3994,7 @@ mod tests {
     #[test]
     fn parses_artist_and_title_from_the_expected_naming_scheme() {
         let (artist, title) =
-            parse_artist_title_from_filename(Path::new("Imagine Dragons - Believer.mp3"))
-                .unwrap();
+            parse_artist_title_from_filename(Path::new("Imagine Dragons - Believer.mp3")).unwrap();
         assert_eq!(artist, "Imagine Dragons");
         assert_eq!(title, "Believer");
     }

@@ -682,8 +682,7 @@ mod tests {
             screaming_unsung: Rgb8::new(140, 30, 20),
             screaming_highlight: Rgb8::new(255, 60, 10),
         };
-        let (text, colors) =
-            legend_text_and_colors(&palette, &[Singer::Male, Singer::Female]);
+        let (text, colors) = legend_text_and_colors(&palette, &[Singer::Male, Singer::Female]);
         assert_eq!(text, "Male   Female");
         assert_eq!(colors.len(), text.chars().count());
         // First char of "Male" should be the male highlight color...
