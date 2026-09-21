@@ -17,6 +17,9 @@ anyhow = "1.0"
 ab_glyph = "0.2.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Decodes a user-picked background image (album art, ...) for the video
+# export/preview - PNG/JPEG/GIF/BMP/WebP/TIFF via the default features.
+image = "0.25"
 
 # Only does anything when targeting Windows (see build.rs) - embeds the app
 # icon into the compiled .exe itself, since `cargo packager` only sets the

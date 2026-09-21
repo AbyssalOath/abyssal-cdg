@@ -27,7 +27,7 @@ use crate::lyrics::{
 };
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -52,6 +52,71 @@ impl Resolution {
         match self {
             Resolution::Hd1080 => "1080p",
             Resolution::Uhd4k => "4K",
+        }
+    }
+}
+
+/// A user-picked image or video shown behind the lyrics in the video export
+/// (and the live preview) instead of a flat `palette.background` fill -
+/// album art, a music video, etc. Never applies to the legacy `.cdg`
+/// export, which is hard-capped at a 300x216, 16-color tile display with no
+/// room for arbitrary imagery.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Background {
+    /// A still image, scaled/cropped to fill the frame and held for the
+    /// whole song.
+    Image(std::path::PathBuf),
+    /// A video, scaled/cropped to fill the frame and decoded frame-by-frame
+    /// in step with the export; looped if it's shorter than the song.
+    Video(std::path::PathBuf),
+}
+
+impl Background {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Image(p) | Self::Video(p) => p,
+        }
+    }
+
+    /// Guesses which kind of background a file is from its extension -
+    /// used by the "choose a background" file dialog, which accepts both
+    /// kinds through one filter. `None` for an extension that's neither a
+    /// still image nor a video format the export pipeline (`image` crate /
+    /// `ffmpeg`) can actually read.
+    pub fn from_path(path: std::path::PathBuf) -> Option<Self> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tif" | "tiff" => {
+                Some(Self::Image(path))
+            }
+            "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" => Some(Self::Video(path)),
+            _ => None,
+        }
+    }
+}
+
+/// How a background image/video that doesn't already match the frame's
+/// aspect ratio gets fit into it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum BackgroundFit {
+    /// Scales up to completely fill the frame, cropping off whatever
+    /// overflows (centered) - never distorts the image/video, but can crop
+    /// off part of it. The default, and how most video editors handle a
+    /// background clip that doesn't match the canvas.
+    #[default]
+    Cover,
+    /// Scales down to fit entirely within the frame, padding the leftover
+    /// space (letterboxed/pillarboxed, centered) with the palette's
+    /// background color - nothing is ever cropped, at the cost of visible
+    /// bars when the aspect ratios don't match.
+    Contain,
+}
+
+impl BackgroundFit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cover => "Cover (fills the frame, may crop edges)",
+            Self::Contain => "Contain (shows all of it, may add bars)",
         }
     }
 }
@@ -130,6 +195,34 @@ impl Canvas {
             px[0] = color.r;
             px[1] = color.g;
             px[2] = color.b;
+        }
+    }
+
+    /// Overwrites the whole canvas with an already-sized RGB24 buffer (row-
+    /// major, top-to-bottom, exactly `w * h * 3` bytes) - used to drop a
+    /// decoded background image/video frame in before drawing lyrics on top
+    /// of it. Silently no-ops on a size mismatch (e.g. a background video's
+    /// decoder came up short on its very last frame) rather than panicking
+    /// mid-export; the canvas just keeps whatever was already in it.
+    fn set_from_rgb24(&mut self, data: &[u8]) {
+        if data.len() == self.buf.len() {
+            self.buf.copy_from_slice(data);
+        }
+    }
+
+    /// Blends a flat color across the *entire* canvas at `alpha` - used to
+    /// dim an image/video background enough that lyric text drawn on top of
+    /// it (via [`Canvas::blend_pixel`]) stays legible instead of fighting
+    /// with busy/bright footage.
+    fn dim(&mut self, color: Rgb8, alpha: f32) {
+        let a = alpha.clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return;
+        }
+        for px in self.buf.chunks_mut(3) {
+            px[0] = (px[0] as f32 * (1.0 - a) + color.r as f32 * a).round() as u8;
+            px[1] = (px[1] as f32 * (1.0 - a) + color.g as f32 * a).round() as u8;
+            px[2] = (px[2] as f32 * (1.0 - a) + color.b as f32 * a).round() as u8;
         }
     }
 
@@ -348,6 +441,12 @@ fn draw_countdown_dots(
     }
 }
 
+/// Draws one frame's lyrics/title-card/countdown content onto `canvas`.
+/// Does *not* touch the background - the caller fills `canvas` first,
+/// either with `palette.background` (the plain solid-color look) or a
+/// decoded image/video background frame (optionally dimmed), so this
+/// function's `blend_pixel`-based text drawing composites correctly over
+/// either one. See [`render_video`].
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     canvas: &mut Canvas,
@@ -363,7 +462,6 @@ fn render_frame(
 ) {
     let w = canvas.w as f32;
     let h = canvas.h as f32;
-    canvas.fill(palette.background);
     let max_width = w * 0.92;
 
     let legend_singers = singer_legend(timed_lines);
@@ -541,6 +639,146 @@ pub fn check_ffmpeg_available() -> Result<()> {
     }
 }
 
+/// An `ffmpeg` `-vf` filter chain that fits a `w`x`h` frame according to
+/// `fit` - either "cover" (scale to fill, cropping the overflow, centered)
+/// or "contain" (scale to fit within, padding the leftover space with
+/// `pad_color`, centered). Never distorts the source's own aspect ratio
+/// either way.
+fn fit_filter(fit: BackgroundFit, w: u32, h: u32, pad_color: Rgb8) -> String {
+    match fit {
+        BackgroundFit::Cover => {
+            format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}")
+        }
+        BackgroundFit::Contain => {
+            let hex = format!("0x{:02x}{:02x}{:02x}", pad_color.r, pad_color.g, pad_color.b);
+            format!(
+                "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={hex}"
+            )
+        }
+    }
+}
+
+/// Decodes and fits a still-image background to exactly `w * h * 3` RGB24
+/// bytes, ready to hand to [`Canvas::set_from_rgb24`] once per export (a
+/// static image is the same on every frame, so this only runs once). Also
+/// used by the live preview to build the same background at preview
+/// resolution.
+pub(crate) fn load_image_background(
+    path: &Path,
+    w: u32,
+    h: u32,
+    fit: BackgroundFit,
+    pad_color: Rgb8,
+) -> Result<Vec<u8>> {
+    let img = image::open(path)
+        .with_context(|| format!("couldn't read background image {}", path.display()))?;
+    let rgb = match fit {
+        BackgroundFit::Cover => img
+            .resize_to_fill(w, h, image::imageops::FilterType::Lanczos3)
+            .to_rgb8(),
+        BackgroundFit::Contain => {
+            // `resize` (unlike `resize_to_fill`) scales down to fit
+            // *within* the bounds, preserving aspect ratio, so the result
+            // may come up short in one dimension - pasted centered onto a
+            // pad_color-filled canvas of exactly w x h to make up the rest.
+            let scaled = img
+                .resize(w, h, image::imageops::FilterType::Lanczos3)
+                .to_rgb8();
+            let mut canvas = image::RgbImage::from_pixel(
+                w,
+                h,
+                image::Rgb([pad_color.r, pad_color.g, pad_color.b]),
+            );
+            let x = ((w - scaled.width()) / 2) as i64;
+            let y = ((h - scaled.height()) / 2) as i64;
+            image::imageops::overlay(&mut canvas, &scaled, x, y);
+            canvas
+        }
+    };
+    Ok(rgb.into_raw())
+}
+
+/// Spawns a dedicated `ffmpeg` process that does nothing but decode a
+/// background video to a raw RGB24 frame stream, already fit to `w`x`h`
+/// (see [`BackgroundFit`]) and resampled to `fps` - so the main export loop
+/// can just read `w * h * 3`-byte frames from its stdout in lockstep with
+/// its own rendering, exactly like it already reads nothing at all for a
+/// plain solid-color background. `-stream_loop -1` loops the source
+/// indefinitely, so a background video shorter than the song just repeats
+/// rather than running out partway through.
+fn spawn_background_video_decoder(
+    path: &Path,
+    w: u32,
+    h: u32,
+    fps: u32,
+    fit: BackgroundFit,
+    pad_color: Rgb8,
+) -> Result<std::process::Child> {
+    Command::new("ffmpeg")
+        .args(["-stream_loop", "-1", "-i"])
+        .arg(path)
+        .args([
+            "-vf",
+            &format!("{},fps={fps}", fit_filter(fit, w, h, pad_color)),
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-an",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to launch ffmpeg to decode {}", path.display()))
+}
+
+/// Grabs a single early frame from a background video, fit to `w`x`h` (see
+/// [`BackgroundFit`]), for the live in-app preview to show as a stand-in
+/// for the real footage - full frame-accurate video playback inside that
+/// small preview isn't worth the extra decoder/timing machinery it'd take,
+/// when the actual export already plays the real video back in sync with
+/// the song.
+pub fn extract_video_background_thumbnail(
+    path: &Path,
+    w: u32,
+    h: u32,
+    fit: BackgroundFit,
+    pad_color: Rgb8,
+) -> Result<Vec<u8>> {
+    check_ffmpeg_available()?;
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &fit_filter(fit, w, h, pad_color),
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to run ffmpeg on {}", path.display()))?;
+    let expected_len = w as usize * h as usize * 3;
+    if !output.status.success() || output.stdout.len() < expected_len {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n");
+        bail!(
+            "couldn't read a preview frame from {}:\n{tail}",
+            path.display()
+        );
+    }
+    Ok(output.stdout)
+}
+
 /// Renders the full karaoke video to `output_path`, muxed with the audio
 /// at `audio_path`. Calls `on_progress(0.0..=1.0)` periodically so the UI
 /// can show a progress bar - this can take anywhere from several seconds to
@@ -555,6 +793,9 @@ pub fn render_video(
     resolution: Resolution,
     fps: u32,
     audio_path: &Path,
+    background: Option<&Background>,
+    background_fit: BackgroundFit,
+    background_dim: f32,
     output_path: &Path,
     mut on_progress: impl FnMut(f32),
 ) -> Result<()> {
@@ -569,6 +810,65 @@ pub fn render_video(
     let card_end = crate::export::title_card_end(timed_lines);
     let blocks = group_into_blocks(timed_lines);
     let total_frames = ((total_duration * fps as f64).ceil() as u64).max(1);
+
+    // Prepare whatever's going to fill the background of every frame, before
+    // spawning the (potentially slow to start) encoder process.
+    enum BackgroundSource {
+        None,
+        Image(Vec<u8>),
+        Video {
+            child: std::process::Child,
+            stdout: std::process::ChildStdout,
+            frame: Vec<u8>,
+            scratch: Vec<u8>,
+            got_first_frame: bool,
+        },
+    }
+    impl BackgroundSource {
+        /// Kills the background decoder's `ffmpeg` process (spawned with
+        /// `-stream_loop -1`, so it never exits on its own) and reaps it -
+        /// otherwise it'd sit there decoding forever once the main export
+        /// loop stops reading its stdout, whether that's because the
+        /// export finished or because it was aborted early.
+        fn cleanup(&mut self) {
+            if let Self::Video { child, .. } = self {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut bg_source = match background {
+        None => BackgroundSource::None,
+        Some(Background::Image(path)) => BackgroundSource::Image(load_image_background(
+            path,
+            w,
+            h,
+            background_fit,
+            palette.background,
+        )?),
+        Some(Background::Video(path)) => {
+            let mut child = spawn_background_video_decoder(
+                path,
+                w,
+                h,
+                fps,
+                background_fit,
+                palette.background,
+            )?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("failed to open background decoder's stdout"))?;
+            let frame_len = w as usize * h as usize * 3;
+            BackgroundSource::Video {
+                child,
+                stdout,
+                frame: vec![0u8; frame_len],
+                scratch: vec![0u8; frame_len],
+                got_first_frame: false,
+            }
+        }
+    };
 
     let mut child = Command::new("ffmpeg")
         .args([
@@ -620,6 +920,42 @@ pub fn render_video(
 
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 / fps as f64;
+
+        let mut fatal_bg_error: Option<std::io::Error> = None;
+        match &mut bg_source {
+            BackgroundSource::None => canvas.fill(palette.background),
+            BackgroundSource::Image(buf) => canvas.set_from_rgb24(buf),
+            BackgroundSource::Video {
+                stdout,
+                frame: bg_frame,
+                scratch,
+                got_first_frame,
+                ..
+            } => {
+                match stdout.read_exact(scratch) {
+                    Ok(()) => {
+                        std::mem::swap(bg_frame, scratch);
+                        *got_first_frame = true;
+                    }
+                    // A later hiccup/EOF just freezes on the last good
+                    // frame instead of failing the whole export - only a
+                    // failure to decode even the first frame is fatal.
+                    Err(e) if !*got_first_frame => fatal_bg_error = Some(e),
+                    Err(_) => {}
+                }
+                canvas.set_from_rgb24(bg_frame);
+            }
+        }
+        if let Some(e) = fatal_bg_error {
+            bg_source.cleanup();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("couldn't decode the background video: {e}"));
+        }
+        if background.is_some() {
+            canvas.dim(Rgb8::new(0, 0, 0), background_dim);
+        }
+
         render_frame(
             &mut canvas,
             &regular,
@@ -639,6 +975,7 @@ pub fn render_video(
             on_progress(frame_idx as f32 / total_frames as f32);
         }
     }
+    bg_source.cleanup();
     drop(stdin);
     on_progress(1.0);
 
@@ -665,6 +1002,97 @@ pub fn render_video(
 mod tests {
     use super::*;
     use crate::lyrics::{resolve_timing, word_timings, LyricLine, Singer};
+
+    #[test]
+    fn background_from_path_recognizes_image_extensions_case_insensitively() {
+        assert_eq!(
+            Background::from_path(std::path::PathBuf::from("cover.PNG")),
+            Some(Background::Image(std::path::PathBuf::from("cover.PNG")))
+        );
+        assert_eq!(
+            Background::from_path(std::path::PathBuf::from("art.jpeg")),
+            Some(Background::Image(std::path::PathBuf::from("art.jpeg")))
+        );
+    }
+
+    #[test]
+    fn background_from_path_recognizes_video_extensions() {
+        assert_eq!(
+            Background::from_path(std::path::PathBuf::from("clip.MP4")),
+            Some(Background::Video(std::path::PathBuf::from("clip.MP4")))
+        );
+        assert_eq!(
+            Background::from_path(std::path::PathBuf::from("clip.webm")),
+            Some(Background::Video(std::path::PathBuf::from("clip.webm")))
+        );
+    }
+
+    #[test]
+    fn background_from_path_rejects_unsupported_or_missing_extensions() {
+        assert_eq!(
+            Background::from_path(std::path::PathBuf::from("notes.txt")),
+            None
+        );
+        assert_eq!(Background::from_path(std::path::PathBuf::from("noext")), None);
+    }
+
+    #[test]
+    fn background_path_returns_the_inner_path_for_either_kind() {
+        let img = Background::Image(std::path::PathBuf::from("a.png"));
+        let vid = Background::Video(std::path::PathBuf::from("b.mp4"));
+        assert_eq!(img.path(), std::path::Path::new("a.png"));
+        assert_eq!(vid.path(), std::path::Path::new("b.mp4"));
+    }
+
+    #[test]
+    fn fit_filter_cover_scales_then_crops_to_the_target_size() {
+        assert_eq!(
+            fit_filter(BackgroundFit::Cover, 1920, 1080, Rgb8::new(0, 0, 0)),
+            "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080"
+        );
+    }
+
+    #[test]
+    fn fit_filter_contain_scales_then_pads_with_the_given_color() {
+        assert_eq!(
+            fit_filter(BackgroundFit::Contain, 1920, 1080, Rgb8::new(18, 52, 86)),
+            "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x123456"
+        );
+    }
+
+    #[test]
+    fn canvas_set_from_rgb24_replaces_the_buffer_on_a_matching_size() {
+        let mut canvas = Canvas::new(2, 1);
+        canvas.fill(Rgb8::new(1, 2, 3));
+        let new_pixels = [10, 20, 30, 40, 50, 60];
+        canvas.set_from_rgb24(&new_pixels);
+        assert_eq!(canvas.buf, new_pixels);
+    }
+
+    #[test]
+    fn canvas_set_from_rgb24_ignores_a_size_mismatch() {
+        let mut canvas = Canvas::new(2, 1);
+        canvas.fill(Rgb8::new(1, 2, 3));
+        let wrong_size = [10, 20, 30];
+        canvas.set_from_rgb24(&wrong_size);
+        assert_eq!(canvas.buf, [1, 2, 3, 1, 2, 3]);
+    }
+
+    #[test]
+    fn canvas_dim_blends_toward_the_scrim_color() {
+        let mut canvas = Canvas::new(1, 1);
+        canvas.fill(Rgb8::new(200, 200, 200));
+        canvas.dim(Rgb8::new(0, 0, 0), 0.5);
+        assert_eq!(canvas.buf, [100, 100, 100]);
+    }
+
+    #[test]
+    fn canvas_dim_at_zero_alpha_is_a_no_op() {
+        let mut canvas = Canvas::new(1, 1);
+        canvas.fill(Rgb8::new(200, 100, 50));
+        canvas.dim(Rgb8::new(0, 0, 0), 0.0);
+        assert_eq!(canvas.buf, [200, 100, 50]);
+    }
 
     #[test]
     fn legend_text_and_colors_uses_each_singers_highlight_color() {
@@ -856,6 +1284,7 @@ mod tests {
         // Sample across the whole song including the intro countdown window.
         let mut t = 0.0;
         while t < 30.0 {
+            canvas.fill(palette.background);
             render_frame(
                 &mut canvas,
                 &regular,

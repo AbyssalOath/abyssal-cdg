@@ -13,7 +13,7 @@
 //! saved bytes for a "your work" file.
 
 use crate::lyrics::LyricLine;
-use crate::video::Resolution;
+use crate::video::{Background, BackgroundFit, Resolution};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -74,6 +74,20 @@ pub struct ProjectFile {
     pub artist: String,
     pub colors: ProjectColors,
     pub video_resolution: Resolution,
+    /// An image/video shown behind the lyrics in the video export/preview
+    /// instead of a flat color fill - absent (`None`) in every project
+    /// saved before this existed, via `#[serde(default)]`.
+    #[serde(default)]
+    pub background: Option<Background>,
+    /// How `background` is scaled to fill the frame - defaults to `Cover`
+    /// (crop to fill) for every project saved before this existed.
+    #[serde(default)]
+    pub background_fit: BackgroundFit,
+    /// Opacity (0.0-1.0) of the black scrim blended over `background` so
+    /// lyric text stays legible on top of busy/bright footage. Meaningless
+    /// (and unused) without a `background` set.
+    #[serde(default)]
+    pub background_dim: f32,
 }
 
 impl ProjectFile {
@@ -217,6 +231,9 @@ mod tests {
             artist: "Test Artist".to_string(),
             colors: sample_colors(),
             video_resolution: Resolution::Uhd4k,
+            background: Some(Background::Image(PathBuf::from("/tmp/cover.png"))),
+            background_fit: BackgroundFit::Contain,
+            background_dim: 0.4,
         };
 
         let dir = std::env::temp_dir().join(format!(
@@ -230,6 +247,36 @@ mod tests {
         project.save_to_file(&path).unwrap();
         let loaded = ProjectFile::load_from_file(&path).unwrap();
         assert_eq!(loaded, project);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_a_pre_background_project_file_with_defaults() {
+        // A project file saved before `background`/`background_dim`
+        // existed - must still load, defaulting to no background.
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-cdg-project-test-old-format-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.abyzl");
+        let json = serde_json::json!({
+            "version": CURRENT_VERSION,
+            "audio_path": null,
+            "lyrics_raw": "hi",
+            "lines": [],
+            "title": "",
+            "artist": "",
+            "colors": sample_colors(),
+            "video_resolution": "Hd1080",
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let loaded = ProjectFile::load_from_file(&path).unwrap();
+        assert_eq!(loaded.background, None);
+        assert_eq!(loaded.background_fit, BackgroundFit::Cover);
+        assert_eq!(loaded.background_dim, 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -297,6 +344,9 @@ mod tests {
             artist: String::new(),
             colors: sample_colors(),
             video_resolution: Resolution::Hd1080,
+            background: None,
+            background_fit: BackgroundFit::default(),
+            background_dim: 0.0,
         };
 
         write_autosave(&app_id, &project).unwrap();

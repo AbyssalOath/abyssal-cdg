@@ -76,7 +76,23 @@ used by karaoke machines and "MP3+G" karaoke software.
    upcoming/already-sung colors, the next-line preview, and the title
    card) via the color pickers, or pick a built-in preset to skip the
    pickers entirely.
-10. **Export** a `.cdg` file, a real **MP4 video**, an **instrumental copy
+10. **Use an image or video as the background** (album art, a music video,
+    ...) instead of a flat color - the **Background** panel below the
+    preview lets you choose one, pick a **fit** mode, and adjust a **dim**
+    slider (a black scrim) so lyrics stay legible on top of it. By default
+    (**Cover**) it scales up to fill the frame and crops the overflow,
+    centered - never stretched/distorted, but it can crop off part of an
+    image/video that doesn't match the frame's aspect ratio. If that crops
+    off something you need to see, switch to **Contain**, which scales the
+    whole thing to fit inside the frame instead, adding letterbox/pillarbox
+    bars (in the current Background color) rather than cropping anything.
+    Shows up in the live preview and the **MP4 video export** (a background
+    video is decoded and fit frame-by-frame, looping if it's shorter than
+    the song); the live preview shows a single representative frame from a
+    video background rather than true playback. The `.cdg` export always
+    uses the flat color instead - it's a fixed 300x216, 16-color format
+    with no room for real images.
+11. **Export** a `.cdg` file, a real **MP4 video**, an **instrumental copy
     of the audio**, and/or **LRC/UltraStar lyrics files** (see below) - any
     combination, from one dialog with one shared progress bar.
 
@@ -274,6 +290,12 @@ the format's tiny 300x216 canvas - see below) and won't look identical to
 the preview even though the *timing* is identical. If you're targeting
 `.cdg` specifically, the most direct way to check its exact look is to just
 export it - a short song encodes quickly - and skim the result.
+
+Same idea applies to a **video background**: the live preview shows one
+representative frame from it rather than true playback (full frame-accurate
+video decoding inside that small preview isn't worth the extra machinery),
+while the actual MP4 export plays the real footage back in sync with the
+song.
 
 The exported `.cdg` file contains only the graphics track - CDG never
 contains audio itself. To play it back, put an audio file with the **same

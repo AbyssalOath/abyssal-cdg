@@ -233,6 +233,27 @@ struct KaraokeApp {
     seek_drag_value: Option<f64>,
 
     video_resolution: Resolution,
+    /// An image/video shown behind the lyrics in the video export/preview
+    /// instead of a flat `color_bg` fill - `None` means the plain
+    /// solid-color look, unchanged from before this existed. Never applies
+    /// to the `.cdg` export (see [`video::Background`]).
+    background: Option<video::Background>,
+    /// How `background` is scaled to fill the frame - "Cover" (crop to
+    /// fill, the default) or "Contain" (letterbox/pillarbox to show all of
+    /// it). Meaningless without a `background` set.
+    background_fit: video::BackgroundFit,
+    /// Opacity (0.0-1.0) of the black scrim blended over `background` so
+    /// lyric text stays legible on top of it. Meaningless without a
+    /// `background` set.
+    background_dim: f32,
+    /// Cached preview texture for `background`/`background_fit`, alongside
+    /// the values it was built from so the (fairly expensive - image
+    /// decode, or an `ffmpeg` round trip for a video's poster frame)
+    /// regeneration only happens when either actually changes, not every
+    /// frame. The inner `None` means "already tried and failed to load
+    /// `background`" (e.g. a moved/deleted file) - remembered so a broken
+    /// background doesn't retry that expensive load every single frame.
+    background_preview: Option<(video::Background, video::BackgroundFit, Option<egui::TextureHandle>)>,
     /// Whether a video export should mux in a vocals-reduced copy of the
     /// audio (via [`vocals::remove_vocals_to_file`]) instead of the
     /// original.
@@ -518,6 +539,10 @@ impl KaraokeApp {
             status: String::new(),
             seek_drag_value: None,
             video_resolution: Resolution::Hd1080,
+            background: None,
+            background_fit: video::BackgroundFit::default(),
+            background_dim: 0.4,
+            background_preview: None,
             remove_vocals_for_video: false,
             show_export_dialog: false,
             export_cdg: true,
@@ -653,6 +678,9 @@ impl KaraokeApp {
                 screaming_highlight: rgb_color_from_color32(self.color_screaming_highlight),
             },
             video_resolution: self.video_resolution,
+            background: self.background.clone(),
+            background_fit: self.background_fit,
+            background_dim: self.background_dim,
         }
     }
 
@@ -776,6 +804,10 @@ impl KaraokeApp {
         self.title = project.title;
         self.artist = project.artist;
         self.video_resolution = project.video_resolution;
+        self.background = project.background;
+        self.background_fit = project.background_fit;
+        self.background_dim = project.background_dim;
+        self.background_preview = None;
 
         let c = project.colors;
         self.color_bg = color32_from_rgb_color(c.background);
@@ -1116,6 +1148,75 @@ impl KaraokeApp {
                 Err(e) => {
                     self.status = format!("Couldn't load audio: {e}");
                 }
+            }
+        }
+    }
+
+    /// Lets the user pick an image or video to show behind the lyrics in
+    /// the video export/preview (see [`video::Background`]) - one dialog,
+    /// filtered to both kinds of file, with the kind itself guessed from
+    /// the extension on pick.
+    fn choose_background_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Image or video",
+                &[
+                    "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "mp4", "mov",
+                    "mkv", "avi", "webm", "m4v",
+                ],
+            )
+            .pick_file()
+        {
+            match video::Background::from_path(path) {
+                Some(bg) => {
+                    self.status = format!("Background set to {}.", bg.path().display());
+                    self.background = Some(bg);
+                    self.background_preview = None;
+                }
+                None => {
+                    self.status =
+                        "That file isn't a supported image or video format.".to_string();
+                }
+            }
+        }
+    }
+
+    /// Rebuilds the live preview's background texture if it's stale (i.e.
+    /// doesn't match `self.background` anymore). A no-op most frames -
+    /// decoding an image or extracting a video's poster frame only happens
+    /// once per background selection, not once per frame. A failed load
+    /// (a moved/deleted file, an unreadable video, ...) is cached too - as
+    /// "no texture" - so it isn't retried every frame; the failure reason
+    /// is shown once in the status bar instead.
+    fn ensure_background_preview(&mut self, ctx: &egui::Context, w: usize, h: usize) {
+        let Some(bg) = self.background.clone() else {
+            self.background_preview = None;
+            return;
+        };
+        let fit = self.background_fit;
+        if matches!(&self.background_preview, Some((cached, cached_fit, _)) if *cached == bg && *cached_fit == fit)
+        {
+            return;
+        }
+        let pad_color = video::Rgb8::new(self.color_bg.r(), self.color_bg.g(), self.color_bg.b());
+        let rgb = match &bg {
+            video::Background::Image(path) => {
+                video::load_image_background(path, w as u32, h as u32, fit, pad_color)
+            }
+            video::Background::Video(path) => {
+                video::extract_video_background_thumbnail(path, w as u32, h as u32, fit, pad_color)
+            }
+        };
+        match rgb {
+            Ok(bytes) => {
+                let image = egui::ColorImage::from_rgb([w, h], &bytes);
+                let texture =
+                    ctx.load_texture("background_preview", image, egui::TextureOptions::LINEAR);
+                self.background_preview = Some((bg, fit, Some(texture)));
+            }
+            Err(e) => {
+                self.status = format!("Couldn't load a background preview: {e:#}");
+                self.background_preview = Some((bg, fit, None));
             }
         }
     }
@@ -2015,6 +2116,9 @@ impl KaraokeApp {
         let title = (!self.title.trim().is_empty()).then(|| self.title.trim().to_string());
         let artist = (!self.artist.trim().is_empty()).then(|| self.artist.trim().to_string());
         let resolution = self.video_resolution;
+        let background = self.background.clone();
+        let background_fit = self.background_fit;
+        let background_dim = self.background_dim;
         let remove_vocals_for_video = self.remove_vocals_for_video;
         let instrumental_ext = self.instrumental_format.extension();
         let lrc_enhanced = self.lrc_enhanced_words;
@@ -2202,6 +2306,9 @@ impl KaraokeApp {
                         resolution,
                         30,
                         &render_audio_path,
+                        background.as_ref(),
+                        background_fit,
+                        background_dim,
                         &video_path,
                         |p| set_progress(video_phase, p),
                     );
@@ -2260,8 +2367,12 @@ impl KaraokeApp {
 
     /// Draws the live "what will this look like" preview: a mock TV screen
     /// showing exactly what the exported CDG will show at the current
-    /// playback position (or position 0 if nothing is playing).
-    fn draw_preview(&self, ui: &mut egui::Ui) {
+    /// playback position (or position 0 if nothing is playing). When a
+    /// background image/video is set, it's drawn (dimmed) behind everything
+    /// else here too, so legibility can be judged without exporting first -
+    /// though a background video shows a single representative frame here
+    /// rather than true playback (see [`video::extract_video_background_thumbnail`]).
+    fn draw_preview(&mut self, ui: &mut egui::Ui) {
         let t = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
         let (timed, _total) = self.resolved();
         let card_end = export::title_card_end(&timed);
@@ -2269,10 +2380,36 @@ impl KaraokeApp {
         let width = ui.available_width().min(480.0);
         let height = width * 9.0 / 16.0;
 
-        egui::Frame::default().fill(self.color_bg).show(ui, |ui| {
-            ui.set_min_size(egui::vec2(width, height));
-            ui.set_max_size(egui::vec2(width, height));
+        // A fixed, modest resolution for the preview background - it's
+        // scaled up to whatever `width`x`height` ends up being when drawn,
+        // and doesn't need to match the export's real resolution.
+        const PREVIEW_BG_SIZE: (usize, usize) = (480, 270);
+        self.ensure_background_preview(ui.ctx(), PREVIEW_BG_SIZE.0, PREVIEW_BG_SIZE.1);
 
+        let (rect, _response) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        match self.background_preview.as_ref().and_then(|(_, _, t)| t.as_ref()) {
+            Some(texture) => {
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                ui.painter().rect_filled(rect, 0.0, self.color_bg);
+            }
+        }
+        if self.background.is_some() {
+            let alpha = (self.background_dim.clamp(0.0, 1.0) * 255.0).round() as u8;
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(alpha));
+        }
+
+        let mut content_ui = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center), None);
+        let ui = &mut content_ui;
+        {
             let legend_singers = singer_legend(&timed);
             let has_title_card = !self.title.trim().is_empty()
                 || !self.artist.trim().is_empty()
@@ -2511,7 +2648,7 @@ impl KaraokeApp {
                     }
                 }
             });
-        });
+        }
     }
 
     /// Draws the fine-tuning timeline: one draggable/resizable "bubble" per
@@ -3611,6 +3748,102 @@ impl eframe::App for KaraokeApp {
                                         ui.color_edit_button_srgba(&mut self.color_artist);
                                         ui.end_row();
                                     });
+                            });
+                        egui::CollapsingHeader::new("Background")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Show an image or video behind the lyrics in the video \
+                                         export and the preview above, instead of the flat \
+                                         Background color. The .cdg export always uses the flat \
+                                         color instead - it's a fixed 300x216, 16-color format \
+                                         with no room for real images.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Choose Image/Video…").clicked() {
+                                        self.choose_background_dialog();
+                                    }
+                                    if self.background.is_some() && ui.button("Clear").clicked() {
+                                        self.background = None;
+                                        self.background_preview = None;
+                                        self.status = "Background cleared.".to_string();
+                                    }
+                                });
+                                match &self.background {
+                                    Some(bg) => {
+                                        let kind = match bg {
+                                            video::Background::Image(_) => "Image",
+                                            video::Background::Video(_) => "Video",
+                                        };
+                                        let name = bg
+                                            .path()
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default();
+                                        ui.label(format!("{kind}: {name}"));
+                                    }
+                                    None => {
+                                        ui.label(
+                                            egui::RichText::new("No background set.").weak(),
+                                        );
+                                    }
+                                }
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Fit:");
+                                    egui::ComboBox::from_id_source("background_fit")
+                                        .selected_text(self.background_fit.label())
+                                        .show_ui(ui, |ui| {
+                                            for option in
+                                                [video::BackgroundFit::Cover, video::BackgroundFit::Contain]
+                                            {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.background_fit == option,
+                                                        option.label(),
+                                                    )
+                                                    .clicked()
+                                                    && self.background_fit != option
+                                                {
+                                                    self.background_fit = option;
+                                                    // Built for the old fit mode - drop it so
+                                                    // the preview regenerates.
+                                                    self.background_preview = None;
+                                                }
+                                            }
+                                        });
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Cover crops the edges so nothing gets stretched; \
+                                         Contain shows the whole image/video with bars added \
+                                         if the aspect ratio doesn't match.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Dim:");
+                                    ui.add(
+                                        egui::Slider::new(&mut self.background_dim, 0.0..=1.0)
+                                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "How much of a black scrim to blend over the \
+                                         background image/video so the lyrics stay legible on \
+                                         top of it.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
                             });
                     });
             });
