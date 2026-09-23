@@ -9,6 +9,43 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Added
 
+- **Backing/echo vocals**: a line can have a second vocalist's phrase
+  attached to it (the "Echo" button in the timing table) that overlaps
+  part of it while it's still being sung - typically the last word or
+  phrase, echoed by a second singer. Tapped independently (its own
+  Start/End, bounded within its host line's own window) and colored with
+  its own voice, reusing the existing Male/Female/Duet/Screaming palette
+  rather than a new color category. The `.cdg` export draws it on its own
+  row directly under the current line, with its own concurrent word-wipe;
+  the video export draws it directly beneath the current line at a
+  smaller size. Deliberately scoped to fall entirely within its host
+  line's own timing window (not a fully independent, freely-overlapping
+  line) - see `ARCHITECTURE.md`/the code comments on `BackingVocal` for
+  why.
+- **"Abyssal" color preset**: solid black background, blood-red unsung/dark
+  lyric text, warm gold sung/highlight wipe. The red/gold pair is a
+  lightness contrast (dark vs. bright), not a hue contrast, so it stays
+  distinguishable under deuteranopia, protanopia, and tritanopia alike -
+  every other voice pair in this preset (female, duet, screaming) follows
+  the same dim-vs-bright principle and avoids a red-vs-green axis entirely.
+  Selectable from Colors -> Preset alongside Classic/High Contrast/Sunset/
+  Ocean.
+- **Custom lyric-text font**: a searchable picker (Colors panel -> Font)
+  lists every font family installed on your system (via `font-kit`) and
+  applies your choice to the video export and the live preview. Scoped to
+  those two renderers only - the `.cdg` export's font is a fixed 6x12-pixel
+  1-bit bitmap tile format sourced from a purpose-built bitmap font, not a
+  scalable font renderer, so it isn't something an arbitrary system font can
+  reasonably substitute into. Saved with the project; opening a project on a
+  machine that doesn't have the referenced font installed falls back to the
+  bundled default (DejaVu Sans) and shows a notice rather than failing to load.
+- **Bulk voice assignment for the timing table**: each line now has a
+  selection checkbox (Shift-click for a range, Ctrl/Cmd-click to add/remove
+  one at a time, plus "Select all"/"Deselect all") and a "set voice for
+  selection" toolbar - select every line, apply the song's majority voice in
+  one click, then fix the few that differ with the existing per-line
+  dropdown, instead of setting each line individually. Applies as a single
+  undoable action.
 - **Save/load project files** (`.abyzl`, JSON): captures the loaded audio's path,
   raw lyrics text, every line's timing/overrides, title/artist, colors, and video
   resolution. Ctrl+S saves (to the current file, or "Save Project As…" if there
@@ -117,6 +154,50 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Fixed
 
+- **Dragging a timeline bubble's edge could grab the whole bubble instead,
+  if the very first movement was toward the bubble's interior** (e.g.
+  dragging left to shrink from the right edge) - the documented-by-users
+  workaround was to drag the wrong way first, then back. Root cause: egui
+  only recognizes a drag once the pointer has moved past its own
+  click-vs-drag threshold (6px as of egui 0.28), so by the time a drag is
+  recognized, the reported pointer position has already drifted a few
+  pixels in whatever direction you moved first - and that drifted position
+  was what decided whether you'd grabbed an edge or the body. Now classified
+  from the actual mouse-down position (`press_origin`) instead, which isn't
+  affected by that threshold. Applies to both the line-level and word-level
+  timeline bubbles.
+- **Re-parsing the lyrics text box wiped every line's timing, even lines
+  whose text didn't change.** Clicking "Parse lyrics" after fixing a typo,
+  adding a line, or reordering lines used to fully discard and rebuild the
+  line list from scratch - a serious problem on any song that was already
+  tapped/tuned. Re-parsing now diffs the new text against the existing
+  lines (matched by content via a longest-common-subsequence pass, not list
+  position, so an insertion/deletion/reorder doesn't smear later lines'
+  timing) and carries over as much timing as it safely can: unchanged lines
+  keep everything; a line reworded with the same word count keeps its
+  line-level timing and whichever words didn't change; a line whose word
+  count changed keeps its line-level timing but resets word-level timing
+  (there's no sound way to line up two different-length word lists); a
+  duplicated line (e.g. a repeated chorus) keeps each occurrence's own
+  distinct timing rather than risking a swap. Tapping also now correctly
+  resumes at the first still-untimed line after a re-parse, instead of
+  always restarting from the top.
+- **The "get ready" countdown dots could appear after the last lyric line**,
+  counting down toward a line that doesn't exist, whenever there was 5+
+  seconds of silence after the song's last line finished (e.g. a long
+  instrumental outro). The gap-detection logic had no notion of "is there
+  actually a next line" - fixed in the `.cdg` export, the video export, and
+  the live preview, all of which draw the dots independently. The screen
+  still clears/blanks during that trailing silence as before; it just no
+  longer shows dots promising a line that never starts. The pre-song
+  (intro) countdown is unaffected - it always has a real target (the first
+  line) to count into.
+- **The background-video/image preview could show a stale letterbox/
+  pillarbox color** after changing the background color picker. The actual
+  `.mp4` export was always correct (it never caches this), but the in-app
+  preview's cached thumbnail only invalidated on the background file or fit
+  mode changing, not the color - so the pad color looked "stuck" even
+  though a real export already reflected the new color.
 - **Windows release installers/executables showed a generic icon instead of
   the app icon.** `cargo packager`'s `icons` config only ever had a single
   large PNG, which is enough for it to auto-generate a macOS `.icns` and to

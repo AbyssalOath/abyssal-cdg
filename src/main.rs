@@ -10,6 +10,7 @@ mod audio;
 mod cdg;
 mod export;
 mod font;
+mod fonts;
 mod formats;
 mod lyrics;
 mod project;
@@ -23,8 +24,8 @@ use audio::AudioPlayer;
 use eframe::egui;
 use export::Palette;
 use lyrics::{
-    blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines,
-    parse_pasted_lyrics, resolve_timing, singer_legend, LyricLine, Singer, TimedLine,
+    blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines, resolve_timing,
+    singer_legend, BackingVocal, LyricLine, Singer, TimedLine,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,40 @@ fn parse_artist_title_from_filename(path: &Path) -> Option<(String, String)> {
         return None;
     }
     Some((artist.to_string(), title.to_string()))
+}
+
+/// Applies one checkbox click in the timing table's selection column to
+/// `selected`/`anchor` - standard file-browser-style multi-select
+/// semantics: a plain click selects just this line (replacing whatever was
+/// selected); Shift-click extends the selection to every line between the
+/// anchor and this one (inclusive, in either direction), replacing the
+/// selection with that range rather than adding to it; Ctrl/Cmd-click
+/// toggles just this line's membership without touching the rest. Either
+/// modifier moves the anchor to `i` afterward, so a Shift-click chain
+/// extends from wherever you last clicked, not always from the very first
+/// click. A free function (rather than a `KaraokeApp` method) purely so it
+/// can be unit-tested directly, the same way `parse_artist_title_from_filename`
+/// above is.
+fn apply_row_selection_click(
+    selected: &mut std::collections::BTreeSet<usize>,
+    anchor: &mut Option<usize>,
+    i: usize,
+    shift: bool,
+    cmd: bool,
+) {
+    if shift {
+        let a = anchor.unwrap_or(i);
+        let (lo, hi) = (a.min(i), a.max(i));
+        *selected = (lo..=hi).collect();
+    } else if cmd {
+        if !selected.remove(&i) {
+            selected.insert(i);
+        }
+    } else {
+        selected.clear();
+        selected.insert(i);
+    }
+    *anchor = Some(i);
 }
 
 /// Convert a CDG 4-bit-per-channel color to a full-range egui color for UI
@@ -184,6 +219,9 @@ struct KaraokeApp {
     tap_phase: TapPhase,
     /// If set, the fine-tune-words panel is open for this line index.
     word_tap_line: Option<usize>,
+    /// If set, the backing/echo vocal panel is open for this line index -
+    /// see [`BackingVocal`].
+    backing_vocal_edit: Option<usize>,
     /// Whether clicking a word in the fine-tune panel sets its start or end
     /// time - see [`WordTapMode`].
     word_tap_mode: WordTapMode,
@@ -200,6 +238,19 @@ struct KaraokeApp {
     start_edit: Option<(usize, String)>,
     /// Same as `start_edit`, for the end-time field.
     end_edit: Option<(usize, String)>,
+    /// Line indices currently selected in the timing table's checkbox
+    /// column, for bulk actions (currently just "set voice for selection"),
+    /// driven by [`apply_row_selection_click`]. Not persisted (project
+    /// save/load, undo/redo) since it's pure transient UI state, and
+    /// clamped to `self.lines`'s current length wherever it's read, since
+    /// `self.lines` can shrink out from under it (re-parsing, undo, loading
+    /// a different file, ...).
+    selected_lines: std::collections::BTreeSet<usize>,
+    /// The last line clicked in the timing table's checkbox column, i.e.
+    /// where a subsequent Shift-click range-select extends from. `None`
+    /// means nothing's been clicked yet this session (Shift-click with no
+    /// anchor falls back to selecting just the clicked line).
+    selection_anchor: Option<usize>,
 
     title: String,
     artist: String,
@@ -251,18 +302,56 @@ struct KaraokeApp {
     /// lyric text stays legible on top of it. Meaningless without a
     /// `background` set.
     background_dim: f32,
-    /// Cached preview texture for `background`/`background_fit`, alongside
-    /// the values it was built from so the (fairly expensive - image
-    /// decode, or an `ffmpeg` round trip for a video's poster frame)
-    /// regeneration only happens when either actually changes, not every
-    /// frame. The inner `None` means "already tried and failed to load
-    /// `background`" (e.g. a moved/deleted file) - remembered so a broken
-    /// background doesn't retry that expensive load every single frame.
+    /// Cached preview texture for `background`/`background_fit`/`color_bg`,
+    /// alongside the values it was built from so the (fairly expensive -
+    /// image decode, or an `ffmpeg` round trip for a video's poster frame)
+    /// regeneration only happens when one of them actually changes, not
+    /// every frame. `color_bg` is included because it's the letterbox/
+    /// pillarbox pad color in "Contain" fit mode - without it, changing the
+    /// background color picker would leave the preview showing the old pad
+    /// color indefinitely (a real export would already be correct, since
+    /// that's never cached - only this preview texture is). The inner
+    /// `None` means "already tried and failed to load `background`" (e.g. a
+    /// moved/deleted file) - remembered so a broken background doesn't
+    /// retry that expensive load every single frame.
     background_preview: Option<(
         video::Background,
         video::BackgroundFit,
+        egui::Color32,
         Option<egui::TextureHandle>,
     )>,
+    /// The system font family chosen for lyric text, if any - `None` means
+    /// the bundled default (DejaVu Sans, the same font the video export
+    /// always used before this existed). Applies to the video export and
+    /// this app's own live preview only - never the `.cdg` export, whose
+    /// font is a fixed 6x12-pixel bitmap format with no room for an
+    /// arbitrary system font - see `fonts.rs`.
+    selected_font_family: Option<String>,
+    /// Every family name installed on this machine, once the background
+    /// enumeration (kicked off at startup - see [`FontListJob`]) finishes.
+    /// `None` while still loading; shown as "Loading fonts…" in the picker.
+    font_list: Option<Vec<String>>,
+    font_list_job: Option<FontListJob>,
+    /// Loaded bytes for `selected_font_family`, alongside the name they
+    /// were loaded for, so a change to `selected_font_family` is noticed
+    /// and reloaded rather than silently reusing stale bytes. Cleared (not
+    /// just left stale) whenever `selected_font_family` changes.
+    font_bytes: Option<Vec<u8>>,
+    /// Set when `selected_font_family` couldn't actually be loaded (e.g. a
+    /// project referencing a font this machine doesn't have installed) -
+    /// shown as a persistent notice near the font picker rather than only
+    /// flashing by once in the status bar, and remembered so the (failed)
+    /// load isn't retried every frame.
+    font_load_error: Option<String>,
+    /// Whichever font is currently registered with the egui context under
+    /// [`LYRIC_FONT_FAMILY`] - `None` if none is (yet), so
+    /// `ensure_egui_font_installed` only calls `Context::set_fonts` (not
+    /// free - it rebuilds the font atlas) on an actual change, not every
+    /// frame.
+    installed_egui_font: Option<String>,
+    /// Whether the font-picker's search/list panel is expanded.
+    font_picker_open: bool,
+    font_search: String,
     /// Whether a video export should mux in a vocals-reduced copy of the
     /// audio (via [`vocals::remove_vocals_to_file`]) instead of the
     /// original.
@@ -387,6 +476,7 @@ enum ColorPreset {
     HighContrast,
     Sunset,
     Ocean,
+    Abyssal,
 }
 
 impl ColorPreset {
@@ -396,6 +486,7 @@ impl ColorPreset {
             Self::HighContrast => "High Contrast",
             Self::Sunset => "Sunset",
             Self::Ocean => "Ocean",
+            Self::Abyssal => "Abyssal",
         }
     }
 
@@ -405,14 +496,16 @@ impl ColorPreset {
             Self::HighContrast => Palette::high_contrast(),
             Self::Sunset => Palette::sunset(),
             Self::Ocean => Palette::ocean(),
+            Self::Abyssal => Palette::abyssal(),
         }
     }
 }
-const ALL_COLOR_PRESETS: [ColorPreset; 4] = [
+const ALL_COLOR_PRESETS: [ColorPreset; 5] = [
     ColorPreset::Classic,
     ColorPreset::HighContrast,
     ColorPreset::Sunset,
     ColorPreset::Ocean,
+    ColorPreset::Abyssal,
 ];
 
 /// One output's result from a combined export - a combined export can
@@ -456,12 +549,27 @@ const UNDO_HISTORY_LIMIT: usize = 100;
 /// through unrelated audio to get back to what you just changed.
 const AUDITION_REWIND_SECS: f64 = 2.0;
 
+/// Key the custom lyric font is registered under in egui's font system -
+/// both the `font_data` entry and the `FontFamily::Name` that references
+/// it. Arbitrary but must be consistent between the two.
+const LYRIC_FONT_KEY: &str = "lyric_custom_font";
+
 /// Shared state for a background `waveform::build_waveform` call, kicked
 /// off whenever a new audio file is loaded - decoding a whole song can take
 /// a noticeable fraction of a second, so it happens off the UI thread the
 /// same way exports do.
 struct WaveformJob {
     result: Arc<Mutex<Option<Result<waveform::Waveform, String>>>>,
+}
+
+/// Shared state for the background `fonts::list_family_names` call, kicked
+/// off once at startup - enumerating every font installed on the system can
+/// take a noticeable moment, so it happens off the UI thread the same way
+/// waveform decoding does, rather than freezing the first frame.
+type FontListResult = Arc<Mutex<Option<Result<Vec<String>, String>>>>;
+
+struct FontListJob {
+    result: FontListResult,
 }
 
 /// Common language presets for the auto-align language picker - aeneas
@@ -525,10 +633,13 @@ impl KaraokeApp {
             next_untimed: 0,
             tap_phase: TapPhase::default(),
             word_tap_line: None,
+            backing_vocal_edit: None,
             word_tap_mode: WordTapMode::default(),
             auto_follow_words: true,
             start_edit: None,
             end_edit: None,
+            selected_lines: std::collections::BTreeSet::new(),
+            selection_anchor: None,
             title: String::new(),
             artist: String::new(),
             color_bg: color32_from_cdg(p.background),
@@ -554,6 +665,14 @@ impl KaraokeApp {
             background_fit: video::BackgroundFit::default(),
             background_dim: 0.4,
             background_preview: None,
+            selected_font_family: None,
+            font_list: None,
+            font_list_job: None,
+            font_bytes: None,
+            font_load_error: None,
+            installed_egui_font: None,
+            font_picker_open: false,
+            font_search: String::new(),
             remove_vocals_for_video: false,
             show_export_dialog: false,
             export_cdg: true,
@@ -583,6 +702,7 @@ impl KaraokeApp {
             undo_pending_baseline: None,
         };
         app.undo_last_observed = app.undo_snapshot();
+        app.start_font_list_job();
         app
     }
 
@@ -700,6 +820,7 @@ impl KaraokeApp {
             background: self.background.clone(),
             background_fit: self.background_fit,
             background_dim: self.background_dim,
+            lyric_font_family: self.selected_font_family.clone(),
         }
     }
 
@@ -725,6 +846,7 @@ impl KaraokeApp {
         self.artist = snapshot.artist;
         self.recompute_next_untimed();
         self.word_tap_line = None;
+        self.backing_vocal_edit = None;
         self.timeline_drag = None;
         self.start_edit = None;
         self.end_edit = None;
@@ -827,6 +949,13 @@ impl KaraokeApp {
         self.background_fit = project.background_fit;
         self.background_dim = project.background_dim;
         self.background_preview = None;
+        // A different (or absent) font than whatever was loaded before -
+        // drop the cached bytes/error so `ensure_font_loaded` re-resolves
+        // against the newly-loaded project's own selection next frame,
+        // rather than keeping the previous project's font (or its failure).
+        self.selected_font_family = project.lyric_font_family;
+        self.font_bytes = None;
+        self.font_load_error = None;
 
         let c = project.colors;
         self.color_bg = color32_from_rgb_color(c.background);
@@ -855,6 +984,7 @@ impl KaraokeApp {
 
         self.recompute_next_untimed();
         self.word_tap_line = None;
+        self.backing_vocal_edit = None;
         self.start_edit = None;
         self.end_edit = None;
         self.timeline_drag = None;
@@ -1219,11 +1349,12 @@ impl KaraokeApp {
             return;
         };
         let fit = self.background_fit;
-        if matches!(&self.background_preview, Some((cached, cached_fit, _)) if *cached == bg && *cached_fit == fit)
+        let color = self.color_bg;
+        if matches!(&self.background_preview, Some((cached, cached_fit, cached_color, _)) if *cached == bg && *cached_fit == fit && *cached_color == color)
         {
             return;
         }
-        let pad_color = video::Rgb8::new(self.color_bg.r(), self.color_bg.g(), self.color_bg.b());
+        let pad_color = video::Rgb8::new(color.r(), color.g(), color.b());
         let rgb = match &bg {
             video::Background::Image(path) => {
                 video::load_image_background(path, w as u32, h as u32, fit, pad_color)
@@ -1237,11 +1368,11 @@ impl KaraokeApp {
                 let image = egui::ColorImage::from_rgb([w, h], &bytes);
                 let texture =
                     ctx.load_texture("background_preview", image, egui::TextureOptions::LINEAR);
-                self.background_preview = Some((bg, fit, Some(texture)));
+                self.background_preview = Some((bg, fit, color, Some(texture)));
             }
             Err(e) => {
                 self.status = format!("Couldn't load a background preview: {e:#}");
-                self.background_preview = Some((bg, fit, None));
+                self.background_preview = Some((bg, fit, color, None));
             }
         }
     }
@@ -1278,6 +1409,126 @@ impl KaraokeApp {
                 false
             }
             None => true,
+        }
+    }
+
+    /// Kicks off the one-time background system-font enumeration - see
+    /// [`FontListJob`]. Called once, from [`Self::new`].
+    fn start_font_list_job(&mut self) {
+        let result: FontListResult = Arc::new(Mutex::new(None));
+        let result_clone = result.clone();
+        self.font_list_job = Some(FontListJob { result });
+        std::thread::spawn(move || {
+            let outcome = fonts::list_family_names().map_err(|e| e.to_string());
+            *result_clone.lock().unwrap() = Some(outcome);
+        });
+    }
+
+    /// Checks on the font-enumeration job, if still running. A failure
+    /// (e.g. no working font backend on this system) just leaves the
+    /// picker showing "no fonts found" rather than blocking anything -
+    /// custom fonts are optional, the bundled default still works.
+    fn poll_font_list_job(&mut self) -> bool {
+        let Some(job) = &self.font_list_job else {
+            return false;
+        };
+        let finished = job.result.lock().unwrap().take();
+        match finished {
+            Some(outcome) => {
+                self.font_list = Some(outcome.unwrap_or_default());
+                self.font_list_job = None;
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Loads `selected_font_family`'s bytes into `font_bytes` if it isn't
+    /// already cached for the current selection - called every frame
+    /// (cheap: a name comparison in the common case where nothing changed),
+    /// so a change made through the font picker takes effect immediately.
+    /// Reading a font file is fast enough on a local disk that this runs
+    /// synchronously rather than as its own background job, the same way
+    /// `ensure_background_preview` loads a background image/video's
+    /// thumbnail synchronously.
+    fn ensure_font_loaded(&mut self) {
+        match &self.selected_font_family {
+            None => {
+                self.font_bytes = None;
+                self.font_load_error = None;
+            }
+            Some(name) => {
+                // Already loaded for this exact selection, or already
+                // failed for it - nothing to do either way.
+                if self.font_bytes.is_some() || self.font_load_error.is_some() {
+                    return;
+                }
+                match fonts::load_family_bytes(name) {
+                    Ok(bytes) => {
+                        self.font_bytes = Some(bytes);
+                        self.font_load_error = None;
+                    }
+                    Err(e) => {
+                        let msg = format!("Font \"{name}\" not found, using default. ({e:#})");
+                        // Also surface this in the status bar - the Font
+                        // panel is collapsed by default, so a project that
+                        // references a missing font (e.g. opened on a
+                        // different machine) shouldn't fail silently just
+                        // because nobody happened to expand that panel.
+                        self.status = msg.clone();
+                        self.font_load_error = Some(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bytes to actually use for lyric text right now - the loaded
+    /// custom font, or `None` for the bundled default. A cheap clone
+    /// (called once per video export, not per frame).
+    fn loaded_font_bytes(&self) -> Option<Vec<u8>> {
+        self.font_bytes.clone()
+    }
+
+    /// Registers (or un-registers) the custom lyric font with egui's own
+    /// font system under [`LYRIC_FONT_FAMILY`], only when the effective
+    /// selection has actually changed since the last call - `Context::
+    /// set_fonts` rebuilds the font atlas, not something to do every frame.
+    /// The rest of the UI (buttons, labels, ...) is untouched either way;
+    /// only widgets that explicitly ask for `LYRIC_FONT_FAMILY` (the live
+    /// preview's lyric text) are affected.
+    fn ensure_egui_font_installed(&mut self, ctx: &egui::Context) {
+        let target_name = if self.font_bytes.is_some() {
+            self.selected_font_family.clone()
+        } else {
+            None
+        };
+        if self.installed_egui_font == target_name {
+            return;
+        }
+        let mut defs = egui::FontDefinitions::default();
+        if let Some(bytes) = &self.font_bytes {
+            defs.font_data.insert(
+                LYRIC_FONT_KEY.to_string(),
+                egui::FontData::from_owned(bytes.clone()),
+            );
+            defs.families.insert(
+                egui::FontFamily::Name(LYRIC_FONT_KEY.into()),
+                vec![LYRIC_FONT_KEY.to_string()],
+            );
+        }
+        ctx.set_fonts(defs);
+        self.installed_egui_font = target_name;
+    }
+
+    /// The font family the live preview's lyric text should draw with -
+    /// the custom font if one's active and actually loaded, otherwise
+    /// egui's normal default (matches every other label in the app).
+    fn lyric_font_family(&self) -> egui::FontFamily {
+        if self.installed_egui_font.is_some() {
+            egui::FontFamily::Name(LYRIC_FONT_KEY.into())
+        } else {
+            egui::FontFamily::Proportional
         }
     }
 
@@ -1437,16 +1688,21 @@ impl KaraokeApp {
         false
     }
 
+    /// Re-parses the raw lyrics text box, carrying over as much existing
+    /// timing as it safely can instead of wiping it wholesale (see
+    /// [`lyrics::merge_reparsed_lyrics`]) - this is what makes it safe to
+    /// fix a typo, or insert/reorder a line, without re-tapping the whole
+    /// song from scratch.
     fn parse_lyrics(&mut self) {
-        self.lines = parse_pasted_lyrics(&self.lyrics_raw);
-        self.next_untimed = 0;
-        self.tap_phase = TapPhase::Start;
+        let (lines, report) = lyrics::merge_reparsed_lyrics(&self.lines, &self.lyrics_raw);
+        self.lines = lines;
+        // Some/all lines may already be timed after the merge above -
+        // resume tapping at the first line that still needs it, rather
+        // than always restarting from line 1.
+        self.recompute_next_untimed();
         self.start_edit = None;
         self.end_edit = None;
-        self.status = format!(
-            "Parsed {} line(s). Play the song and tap along.",
-            self.lines.len()
-        );
+        self.status = report.summarize(self.lines.len());
     }
 
     fn load_lyrics_file_dialog(&mut self) {
@@ -1802,6 +2058,75 @@ impl KaraokeApp {
         self.recompute_next_untimed();
     }
 
+    /// The resolved `(start, end)` window for `self.lines[idx]`, if it's
+    /// been timed at all - used to bound a backing vocal's own tapping to
+    /// its host's window (see [`lyrics::check_backing_vocal_start`]/
+    /// [`lyrics::check_backing_vocal_end`]). `resolved_with_indices` sorts
+    /// by start time, so the original index has to be looked up rather
+    /// than assumed to match position.
+    fn host_window_for(&self, idx: usize) -> Option<(f64, f64)> {
+        let (timed, indices) = self.resolved_with_indices();
+        let ti = indices.iter().position(|&oi| oi == idx)?;
+        let host = timed.get(ti)?;
+        Some((host.start, host.end))
+    }
+
+    /// Taps a backing vocal's own `start` while the song plays - must fall
+    /// within its host line's own resolved window (see
+    /// [`Self::host_window_for`]), so the host line needs to be timed
+    /// first.
+    fn tap_backing_vocal_start(&mut self, idx: usize) {
+        let Some(audio) = &self.audio else { return };
+        if !audio.is_playing() {
+            self.status = "Press Play first, then tap.".to_string();
+            return;
+        }
+        let pos = audio.position();
+        let Some((host_start, host_end)) = self.host_window_for(idx) else {
+            self.status = "Time this line's own start/end first.".to_string();
+            return;
+        };
+        if let Err(e) = lyrics::check_backing_vocal_start(pos, host_start, host_end) {
+            self.status = e;
+            return;
+        }
+        if let Some(bv) = self.lines[idx].backing_vocal.as_mut() {
+            bv.start = Some(pos);
+        }
+        self.audition_seek(pos);
+    }
+
+    /// Taps a backing vocal's own `end` - must come after its own `start`
+    /// and not past the host line's own end.
+    fn tap_backing_vocal_end(&mut self, idx: usize) {
+        let Some(audio) = &self.audio else { return };
+        if !audio.is_playing() {
+            self.status = "Press Play first, then tap.".to_string();
+            return;
+        }
+        let pos = audio.position();
+        let Some((_, host_end)) = self.host_window_for(idx) else {
+            self.status = "Time this line's own start/end first.".to_string();
+            return;
+        };
+        let Some(bv_start) = self.lines[idx]
+            .backing_vocal
+            .as_ref()
+            .and_then(|bv| bv.start)
+        else {
+            self.status = "Tap this backing vocal's own start first.".to_string();
+            return;
+        };
+        if let Err(e) = lyrics::check_backing_vocal_end(pos, bv_start, host_end) {
+            self.status = e;
+            return;
+        }
+        if let Some(bv) = self.lines[idx].backing_vocal.as_mut() {
+            bv.end = Some(pos);
+        }
+        self.audition_seek(pos);
+    }
+
     fn reset_timing(&mut self) {
         for l in &mut self.lines {
             l.start = None;
@@ -2144,6 +2469,7 @@ impl KaraokeApp {
         let background = self.background.clone();
         let background_fit = self.background_fit;
         let background_dim = self.background_dim;
+        let custom_font_bytes = self.loaded_font_bytes();
         let remove_vocals_for_video = self.remove_vocals_for_video;
         let instrumental_ext = self.instrumental_format.extension();
         let lrc_enhanced = self.lrc_enhanced_words;
@@ -2334,6 +2660,7 @@ impl KaraokeApp {
                         background.as_ref(),
                         background_fit,
                         background_dim,
+                        custom_font_bytes,
                         &video_path,
                         |p| set_progress(video_phase, p),
                     );
@@ -2416,7 +2743,7 @@ impl KaraokeApp {
         match self
             .background_preview
             .as_ref()
-            .and_then(|(_, _, t)| t.as_ref())
+            .and_then(|(_, _, _, t)| t.as_ref())
         {
             Some(texture) => {
                 ui.painter().image(
@@ -2553,6 +2880,7 @@ impl KaraokeApp {
                         let current_line = &timed[current_idx];
                         let hide_upcoming = hide_upcoming_lines(current_line, t);
                         let blank_sung = blank_sung_lines(current_line, t);
+                        let lyric_family = self.lyric_font_family();
 
                         for (slot, &idx) in block.iter().enumerate() {
                             let line = &timed[idx];
@@ -2566,7 +2894,9 @@ impl KaraokeApp {
                                     } else {
                                         ui.colored_label(
                                             highlight,
-                                            egui::RichText::new(normalized).size(18.0),
+                                            egui::RichText::new(normalized)
+                                                .size(18.0)
+                                                .family(lyric_family.clone()),
                                         );
                                     }
                                 }
@@ -2589,7 +2919,7 @@ impl KaraokeApp {
                                     let spans = lyrics::word_char_spans(&normalized);
                                     let boundary = lyrics::current_line_wipe_fraction(line, t)
                                         * chars.len().max(1) as f32;
-                                    let font_id = egui::FontId::proportional(18.0);
+                                    let font_id = egui::FontId::new(18.0, lyric_family.clone());
                                     for (i, &(offset, len)) in spans.iter().enumerate() {
                                         let word_text: String =
                                             chars[offset..offset + len].iter().collect();
@@ -2629,7 +2959,9 @@ impl KaraokeApp {
                                     } else {
                                         ui.colored_label(
                                             unsung,
-                                            egui::RichText::new(normalized).size(18.0),
+                                            egui::RichText::new(normalized)
+                                                .size(18.0)
+                                                .family(lyric_family.clone()),
                                         );
                                     }
                                 }
@@ -2638,8 +2970,12 @@ impl KaraokeApp {
 
                         ui.add_space(8.0);
 
+                        // Only show the countdown if there's a real next
+                        // line to count into - see the matching comment in
+                        // video.rs's render_frame.
+                        let has_next_line = current_idx + 1 < timed.len();
                         if let Some((cd_start, cd_end)) = countdown_window(current_line) {
-                            if t >= cd_start {
+                            if has_next_line && t >= cd_start {
                                 let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
                                     .clamp(0.0, 1.0);
                                 let lit = ((frac * 4.0).floor() as i32 + 1).clamp(0, 4) as usize;
@@ -2865,8 +3201,23 @@ impl KaraokeApp {
             }
 
             if bubble_response.drag_started() {
-                if let Some(pos) = bubble_response.interact_pointer_pos() {
-                    let local_x = pos.x - bubble_rect.left();
+                // Deliberately *not* `interact_pointer_pos()` here - egui
+                // only recognizes a drag once the pointer has moved past
+                // its own click-vs-drag threshold (`MAX_CLICK_DIST`, 6px as
+                // of egui 0.28), so by the time `drag_started()` fires,
+                // `interact_pointer_pos()` already reflects that post-
+                // threshold position, shifted a few pixels in whatever
+                // direction the user's hand first moved. Classifying the
+                // drag mode from that shifted position - rather than the
+                // actual mouse-down point - was misclassifying an edge-grab
+                // as a whole-bubble move whenever the very first motion
+                // happened to be toward the bubble's interior (exactly the
+                // natural direction when shrinking via that edge), with
+                // "drag the other way first, then back" as the only
+                // workaround. `press_origin()` is the true mouse-down
+                // position, unaffected by that threshold.
+                if let Some(press_pos) = ui.input(|i| i.pointer.press_origin()) {
+                    let local_x = press_pos.x - bubble_rect.left();
                     let mode = timeline::classify_drag(local_x, bubble_rect.width());
                     let prev_sing_end = if i > 0 {
                         Some(timed[i - 1].sing_end)
@@ -2894,7 +3245,7 @@ impl KaraokeApp {
                             line.start,
                             line.sing_end,
                             bounds,
-                            pos.x,
+                            press_pos.x,
                         ),
                     });
                 }
@@ -3016,8 +3367,11 @@ impl KaraokeApp {
                 }
 
                 if bubble_response.drag_started() {
-                    if let Some(pos) = bubble_response.interact_pointer_pos() {
-                        let local_x = pos.x - bubble_rect.left();
+                    // See the matching comment on the line-bubble drag
+                    // above - `press_origin()`, not `interact_pointer_pos()`,
+                    // is what the drag mode must be classified from.
+                    if let Some(press_pos) = ui.input(|i| i.pointer.press_origin()) {
+                        let local_x = press_pos.x - bubble_rect.left();
                         let mode = timeline::classify_drag(local_x, bubble_rect.width());
                         // Bound by the *line's* own singing window, not
                         // the immediate neighbor's position - words
@@ -3071,7 +3425,7 @@ impl KaraokeApp {
                                 word.highlight_at,
                                 word.held_until,
                                 bounds,
-                                pos.x,
+                                press_pos.x,
                             ),
                         });
                     }
@@ -3288,6 +3642,11 @@ impl eframe::App for KaraokeApp {
         if self.poll_align_job() {
             ctx.request_repaint();
         }
+        if self.poll_font_list_job() {
+            ctx.request_repaint();
+        }
+        self.ensure_font_loaded();
+        self.ensure_egui_font_installed(ctx);
         self.auto_follow_word_tap_line();
 
         // Ctrl+S / Ctrl+Shift+S save the project - unlike the shortcuts
@@ -3896,6 +4255,130 @@ impl eframe::App for KaraokeApp {
                                     .weak(),
                                 );
                             });
+                        egui::CollapsingHeader::new("Font")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Choose a font for lyric text in the video export and \
+                                         the preview above. The .cdg export always uses its own \
+                                         fixed built-in font instead - it's a 300x216, 16-color \
+                                         tile format with no room for an arbitrary scalable font.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(4.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Current:");
+                                    ui.strong(
+                                        self.selected_font_family
+                                            .as_deref()
+                                            .unwrap_or("Default (DejaVu Sans)"),
+                                    );
+                                });
+                                if let Some(err) = &self.font_load_error {
+                                    ui.colored_label(egui::Color32::from_rgb(230, 140, 40), err);
+                                }
+
+                                ui.horizontal(|ui| {
+                                    let label = if self.font_picker_open {
+                                        "Close picker"
+                                    } else {
+                                        "Choose font…"
+                                    };
+                                    if ui.button(label).clicked() {
+                                        self.font_picker_open = !self.font_picker_open;
+                                    }
+                                    if self.selected_font_family.is_some()
+                                        && ui.button("Reset to default").clicked()
+                                    {
+                                        self.selected_font_family = None;
+                                        self.font_bytes = None;
+                                        self.font_load_error = None;
+                                    }
+                                });
+
+                                if self.font_picker_open {
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.font_search)
+                                            .hint_text("Search fonts…")
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    match &self.font_list {
+                                        None => {
+                                            ui.label(
+                                                egui::RichText::new("Loading fonts…").weak(),
+                                            );
+                                        }
+                                        Some(list) => {
+                                            // Cloned to a plain owned Vec so
+                                            // the picker's click handling
+                                            // below is free to mutate
+                                            // `self` without fighting a
+                                            // borrow of `self.font_list`.
+                                            let names = list.clone();
+                                            let query = self.font_search.to_lowercase();
+                                            let filtered: Vec<&String> = names
+                                                .iter()
+                                                .filter(|n| {
+                                                    query.is_empty()
+                                                        || n.to_lowercase().contains(&query)
+                                                })
+                                                .collect();
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} font(s)",
+                                                    filtered.len()
+                                                ))
+                                                .small()
+                                                .weak(),
+                                            );
+                                            let mut pick: Option<String> = None;
+                                            egui::ScrollArea::vertical()
+                                                .max_height(180.0)
+                                                .id_source("font_picker_scroll")
+                                                .show(ui, |ui| {
+                                                    for name in &filtered {
+                                                        let selected = self
+                                                            .selected_font_family
+                                                            .as_deref()
+                                                            == Some(name.as_str());
+                                                        if ui
+                                                            .selectable_label(
+                                                                selected,
+                                                                name.as_str(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            pick = Some((*name).clone());
+                                                        }
+                                                    }
+                                                    if filtered.is_empty() {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                "No fonts match your search.",
+                                                            )
+                                                            .weak(),
+                                                        );
+                                                    }
+                                                });
+                                            if let Some(name) = pick {
+                                                if self.selected_font_family.as_deref()
+                                                    != Some(name.as_str())
+                                                {
+                                                    self.selected_font_family = Some(name);
+                                                    self.font_bytes = None;
+                                                    self.font_load_error = None;
+                                                }
+                                                self.font_picker_open = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
                     });
             });
 
@@ -4011,6 +4494,152 @@ impl eframe::App for KaraokeApp {
                 }
             }
 
+            // Backing/echo vocal panel - only shown while a line is
+            // selected for it (see the "Echo" button in the timing table
+            // below).
+            if let Some(i) = self.backing_vocal_edit {
+                if i < self.lines.len() {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong("Backing vocal for:");
+                            ui.label(&self.lines[i].text);
+                            if ui.small_button("Close").clicked() {
+                                self.backing_vocal_edit = None;
+                            }
+                        });
+                        match self.lines[i].backing_vocal.is_some() {
+                            false => {
+                                ui.label(
+                                    "A second vocalist echoing/repeating part of this line \
+                                     while it's still being sung - typically just the last \
+                                     word or phrase.",
+                                );
+                                if ui.button("+ Add backing vocal").clicked() {
+                                    self.lines[i].backing_vocal = Some(BackingVocal::new(""));
+                                }
+                            }
+                            true => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Text:");
+                                    if let Some(bv) = self.lines[i].backing_vocal.as_mut() {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut bv.text)
+                                                .hint_text("Echoed text…")
+                                                .desired_width(220.0),
+                                        );
+                                    }
+                                });
+                                let (bv_start, bv_end, bv_singer) = {
+                                    let bv = self.lines[i].backing_vocal.as_ref().unwrap();
+                                    (bv.start, bv.end, bv.singer)
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "Start: {}",
+                                        bv_start
+                                            .map(lyrics::format_timecode)
+                                            .unwrap_or_else(|| "—".to_string())
+                                    ));
+                                    if ui.small_button("Tap start").clicked() {
+                                        self.tap_backing_vocal_start(i);
+                                    }
+                                    ui.label(format!(
+                                        "End: {}",
+                                        bv_end
+                                            .map(lyrics::format_timecode)
+                                            .unwrap_or_else(|| "—".to_string())
+                                    ));
+                                    if ui.small_button("Tap end").clicked() {
+                                        self.tap_backing_vocal_end(i);
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Tap while the main line is playing - the backing \
+                                         vocal's own window must fall within the main line's \
+                                         own start/end.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Voice:");
+                                    egui::ComboBox::from_id_source(("backing_vocal_singer", i))
+                                        .width(82.0)
+                                        .selected_text(bv_singer.label())
+                                        .show_ui(ui, |ui| {
+                                            for singer in Singer::ALL {
+                                                if ui
+                                                    .selectable_label(
+                                                        bv_singer == singer,
+                                                        singer.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if let Some(bv) =
+                                                        self.lines[i].backing_vocal.as_mut()
+                                                    {
+                                                        bv.singer = singer;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                });
+                                if ui.small_button("Remove backing vocal").clicked() {
+                                    self.lines[i].backing_vocal = None;
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                } else {
+                    self.backing_vocal_edit = None;
+                }
+            }
+
+            // `self.lines` can change out from under a stale selection
+            // (re-parsing, undo/redo, loading a different file, ...) -
+            // drop anything that no longer points at a real line before
+            // the selection toolbar/table below read it this frame.
+            self.selected_lines.retain(|&i| i < self.lines.len());
+
+            ui.horizontal(|ui| {
+                if ui.button("Select all").clicked() {
+                    self.selected_lines = (0..self.lines.len()).collect();
+                }
+                let any_selected = !self.selected_lines.is_empty();
+                ui.add_enabled_ui(any_selected, |ui| {
+                    if ui.button("Deselect all").clicked() {
+                        self.selected_lines.clear();
+                    }
+                });
+                ui.label(format!("{} selected", self.selected_lines.len()));
+                ui.separator();
+                ui.add_enabled_ui(any_selected, |ui| {
+                    ui.label("Set voice for selection:");
+                    for singer in Singer::ALL {
+                        if ui.button(singer.label()).clicked() {
+                            let n = self.selected_lines.len();
+                            for &i in &self.selected_lines {
+                                if let Some(line) = self.lines.get_mut(i) {
+                                    line.singer = singer;
+                                }
+                            }
+                            self.status =
+                                format!("Set {n} selected line(s) to {}.", singer.label());
+                        }
+                    }
+                });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Click a row's checkbox to select it - Shift-click for a range, \
+                     Ctrl/Cmd-click to add/remove one at a time.",
+                )
+                .small()
+                .weak(),
+            );
+
             egui::ScrollArea::both()
                 .id_source("timing_scroll")
                 .auto_shrink([false, false])
@@ -4027,21 +4656,25 @@ impl eframe::App for KaraokeApp {
                     }
 
                     egui::Grid::new("lines_grid")
-                        .num_columns(7)
+                        .num_columns(9)
                         .striped(true)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
                             let mut retap_idx: Option<usize> = None;
                             let mut words_idx: Option<usize> = None;
+                            let mut backing_idx: Option<usize> = None;
                             let mut nudge: Option<(usize, f64)> = None;
                             let mut clear_idx: Option<usize> = None;
                             let mut commit_start: Option<(usize, String)> = None;
                             let mut commit_end: Option<(usize, String)> = None;
+                            let mut selection_click: Option<(usize, bool, bool)> = None;
 
+                            ui.label("");
                             ui.label(egui::RichText::new("Start").small().weak());
                             ui.label(egui::RichText::new("Lyric").small().weak());
                             ui.label(egui::RichText::new("End").small().weak());
                             ui.label(egui::RichText::new("Singer").small().weak());
+                            ui.label("");
                             ui.label("");
                             ui.label("");
                             ui.label("");
@@ -4056,6 +4689,17 @@ impl eframe::App for KaraokeApp {
                             #[allow(clippy::needless_range_loop)]
                             for i in 0..self.lines.len() {
                                 let is_next = i == self.next_untimed;
+
+                                // Selection checkbox - see
+                                // `apply_row_selection_click` for the
+                                // shift/ctrl-click semantics.
+                                let mut checked = self.selected_lines.contains(&i);
+                                let checkbox_resp = ui.checkbox(&mut checked, "");
+                                if checkbox_resp.clicked() {
+                                    let shift = ui.input(|inp| inp.modifiers.shift);
+                                    let cmd = ui.input(|inp| inp.modifiers.command);
+                                    selection_click = Some((i, shift, cmd));
+                                }
 
                                 // Start field.
                                 let editing_start =
@@ -4172,6 +4816,20 @@ impl eframe::App for KaraokeApp {
                                 if ui.small_button("Words").clicked() {
                                     words_idx = Some(i);
                                 }
+                                let echo_label = if self.lines[i].backing_vocal.is_some() {
+                                    "Echo ●"
+                                } else {
+                                    "Echo"
+                                };
+                                if ui
+                                    .small_button(echo_label)
+                                    .on_hover_text(
+                                        "Add/edit a backing vocal overlapping this line.",
+                                    )
+                                    .clicked()
+                                {
+                                    backing_idx = Some(i);
+                                }
                                 ui.horizontal(|ui| {
                                     if self.lines[i].start.is_some() {
                                         if ui.small_button("-0.1s").clicked() {
@@ -4188,11 +4846,23 @@ impl eframe::App for KaraokeApp {
                                 ui.end_row();
                             }
 
+                            if let Some((i, shift, cmd)) = selection_click {
+                                apply_row_selection_click(
+                                    &mut self.selected_lines,
+                                    &mut self.selection_anchor,
+                                    i,
+                                    shift,
+                                    cmd,
+                                );
+                            }
                             if let Some(i) = retap_idx {
                                 self.retap_line(i);
                             }
                             if let Some(i) = words_idx {
                                 self.word_tap_line = Some(i);
+                            }
+                            if let Some(i) = backing_idx {
+                                self.backing_vocal_edit = Some(i);
                             }
                             if let Some((i, delta)) = nudge {
                                 if let Some(s) = &mut self.lines[i].start {
@@ -4345,5 +5015,75 @@ mod tests {
                 .unwrap();
         assert_eq!(artist, "Artist");
         assert_eq!(title, "Part One - Part Two");
+    }
+
+    // --- apply_row_selection_click ---------------------------------------
+
+    #[test]
+    fn plain_click_selects_only_that_line() {
+        let mut selected = std::collections::BTreeSet::from([0, 1, 2]);
+        let mut anchor = Some(0);
+        apply_row_selection_click(&mut selected, &mut anchor, 5, false, false);
+        assert_eq!(selected, std::collections::BTreeSet::from([5]));
+        assert_eq!(anchor, Some(5));
+    }
+
+    #[test]
+    fn shift_click_selects_the_inclusive_range_from_the_anchor() {
+        let mut selected = std::collections::BTreeSet::new();
+        let mut anchor = Some(2);
+        apply_row_selection_click(&mut selected, &mut anchor, 5, true, false);
+        assert_eq!(
+            selected,
+            std::collections::BTreeSet::from([2, 3, 4, 5])
+        );
+
+        // Works in either direction (clicking above the anchor, not just below).
+        let mut anchor2 = Some(5);
+        let mut selected2 = std::collections::BTreeSet::new();
+        apply_row_selection_click(&mut selected2, &mut anchor2, 2, true, false);
+        assert_eq!(
+            selected2,
+            std::collections::BTreeSet::from([2, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn shift_click_replaces_rather_than_extends_a_prior_selection() {
+        let mut selected = std::collections::BTreeSet::from([0, 10, 20]);
+        let mut anchor = Some(0);
+        apply_row_selection_click(&mut selected, &mut anchor, 2, true, false);
+        assert_eq!(selected, std::collections::BTreeSet::from([0, 1, 2]));
+    }
+
+    #[test]
+    fn shift_click_with_no_prior_anchor_just_selects_the_clicked_line() {
+        let mut selected = std::collections::BTreeSet::new();
+        let mut anchor = None;
+        apply_row_selection_click(&mut selected, &mut anchor, 3, true, false);
+        assert_eq!(selected, std::collections::BTreeSet::from([3]));
+        assert_eq!(anchor, Some(3));
+    }
+
+    #[test]
+    fn cmd_click_toggles_one_line_without_touching_the_rest() {
+        let mut selected = std::collections::BTreeSet::from([1, 2]);
+        let mut anchor = Some(2);
+
+        // Not selected yet -> adds it.
+        apply_row_selection_click(&mut selected, &mut anchor, 5, false, true);
+        assert_eq!(selected, std::collections::BTreeSet::from([1, 2, 5]));
+
+        // Already selected -> removes just that one.
+        apply_row_selection_click(&mut selected, &mut anchor, 2, false, true);
+        assert_eq!(selected, std::collections::BTreeSet::from([1, 5]));
+    }
+
+    #[test]
+    fn any_click_moves_the_anchor_to_the_clicked_line() {
+        let mut selected = std::collections::BTreeSet::new();
+        let mut anchor = Some(0);
+        apply_row_selection_click(&mut selected, &mut anchor, 7, false, true);
+        assert_eq!(anchor, Some(7));
     }
 }

@@ -20,6 +20,16 @@ serde_json = "1"
 # Decodes a user-picked background image (album art, ...) for the video
 # export/preview - PNG/JPEG/GIF/BMP/WebP/TIFF via the default features.
 image = "0.25"
+# System font enumeration/loading for the optional custom lyric-text font
+# (video export + live preview only - see fonts.rs for why the .cdg export
+# can't use this). Actively maintained (part of the Servo browser engine);
+# chosen over the smaller `font-loader` crate, which hasn't been touched in
+# several years. On Linux this dlopen's libfontconfig at runtime rather than
+# linking it, so a system without it doesn't stop the app from starting -
+# font enumeration/loading just fails gracefully (as a `Result`) if it's
+# genuinely missing, which in practice is rare on any desktop that already
+# has GTK3 installed (already a hard dependency here via `rfd`).
+font-kit = "0.14"
 
 # Only does anything when targeting Windows (see build.rs) - embeds the app
 # icon into the compiled .exe itself, since `cargo packager` only sets the
@@ -52,7 +62,12 @@ category = "Music"
 icons = ["assets/icons/abyssal-cdg-icon.ico", "assets/icons/abyssal-cdg-icon@2x.png"]
 
 # eframe (winit/glow) needs an X11 or Wayland stack plus xkbcommon, GTK3 is
-# needed for the native "load audio file" dialog (`rfd`), and ALSA is
-# needed for audio playback (`rodio`).
+# needed for the native "load audio file" dialog (`rfd`), ALSA is needed for
+# audio playback (`rodio`), and fontconfig is needed for system font
+# enumeration/loading (`font-kit`, for the custom lyric-text font - see
+# fonts.rs). font-kit dlopen's fontconfig at runtime rather than linking it,
+# so its absence wouldn't stop the app from starting even without this
+# listed - but it's declared explicitly anyway so the font picker actually
+# works out of the box rather than silently finding no fonts.
 [package.metadata.packager.deb]
-depends = ["libgtk-3-0", "libasound2", "libx11-6", "libxkbcommon0"]
+depends = ["libgtk-3-0", "libasound2", "libx11-6", "libxkbcommon0", "libfontconfig1"]

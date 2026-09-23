@@ -47,7 +47,11 @@ impl Singer {
         }
     }
 
-    const ALL: [Singer; 5] = [
+    /// Every variant, in a fixed display order - used both to build the
+    /// color legend (see [`singer_legend`]) and, in `main.rs`, to build the
+    /// timing table's bulk "set voice for selection" buttons from the same
+    /// single list the per-line dropdown's options come from.
+    pub const ALL: [Singer; 5] = [
         Self::Default,
         Self::Male,
         Self::Female,
@@ -150,6 +154,15 @@ pub struct LyricLine {
     /// treating every line as its own block is a safer default than
     /// silently merging unrelated lines together.
     pub starts_new_block: bool,
+    /// A second vocalist echoing/repeating part of this line while it's
+    /// still being sung (typically the last word or phrase) - `None` for
+    /// every line by default; added via the "+ Backing vocal" button.
+    /// Absent from every project saved before this existed, via
+    /// `#[serde(default)]`. See [`BackingVocal`] for why its own timing is
+    /// bounded within this line's own window rather than being a fully
+    /// independent line in its own right.
+    #[serde(default)]
+    pub backing_vocal: Option<BackingVocal>,
 }
 
 impl LyricLine {
@@ -164,11 +177,71 @@ impl LyricLine {
             word_end_overrides: vec![None; word_count],
             sing_end_override: None,
             starts_new_block: true,
+            backing_vocal: None,
         }
     }
 
     pub fn words(&self) -> Vec<&str> {
         self.text.split_whitespace().collect()
+    }
+}
+
+/// A secondary vocalist's line, overlapping part of its host [`LyricLine`]
+/// while the host is still being sung (typically the last word or phrase of
+/// the host line, echoed or answered) - not a full top-level line of its
+/// own, but an attachment on the line it echoes.
+///
+/// Deliberately embedded here rather than represented as a second
+/// independent entry in the main line list, for two reasons: it sidesteps
+/// needing a stable cross-line reference that would have to survive
+/// re-parsing (`merge_reparsed_lyrics` already matches *host* lines by
+/// content; a backing vocal attached to a matched host just comes along for
+/// free, no separate identity/matching scheme needed), and its timing is
+/// constrained to fall entirely within its host's own `[start, end)` window,
+/// which is what keeps `resolve_timing`'s sequential, non-overlapping
+/// `Vec<TimedLine>` unchanged: a backing vocal is purely an extra thing its
+/// host's own rendering step draws during its own window, never a second
+/// independent timeline entry. If a real use case ever needs an echo that
+/// outlasts its host line, that's a deliberate future relaxation, not
+/// something built speculatively now.
+///
+/// Reuses [`Singer`] for its own color rather than a dedicated "backing"
+/// voice category, so it can be colored distinctly from its host (e.g. host
+/// = Male, backing = Female) using exactly the palette slots that already
+/// exist - no new CLUT budget needed in the `.cdg` export.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BackingVocal {
+    pub text: String,
+    /// Start time in seconds - must fall within the host line's own
+    /// `[start, end)` once resolved (see [`check_backing_vocal_start`]).
+    /// `None` means "not yet tapped"; until it's set, this backing vocal
+    /// doesn't render at all (nothing to time it by), the same way an
+    /// untimed [`LyricLine`] doesn't appear in [`resolve_timing`]'s output.
+    pub start: Option<f64>,
+    /// End time in seconds. `None` means "use the host line's own end" as a
+    /// placeholder once `start` is set, the same "graceful default, refine
+    /// later" behavior [`LyricLine::sing_end_override`] already has.
+    pub end: Option<f64>,
+    pub singer: Singer,
+    /// Same shape/meaning as [`LyricLine::word_overrides`], scoped to this
+    /// backing vocal's own words.
+    pub word_overrides: Vec<Option<f64>>,
+    /// Same shape/meaning as [`LyricLine::word_end_overrides`].
+    pub word_end_overrides: Vec<Option<f64>>,
+}
+
+impl BackingVocal {
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let word_count = text.split_whitespace().count();
+        Self {
+            text,
+            start: None,
+            end: None,
+            singer: Singer::default(),
+            word_overrides: vec![None; word_count],
+            word_end_overrides: vec![None; word_count],
+        }
     }
 }
 
@@ -210,6 +283,243 @@ pub fn parse_pasted_lyrics(raw: &str) -> Vec<LyricLine> {
         pending_blank = false;
     }
     result
+}
+
+/// Tallies what [`merge_reparsed_lyrics`] did, so the caller can tell the
+/// user something more useful than just a new line count.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReparseReport {
+    /// Lines whose text didn't change at all - every field carried over.
+    pub unchanged: usize,
+    /// Lines matched to an edited old line with the *same* word count -
+    /// line-level timing kept, and per-word timing kept for whichever
+    /// words didn't change.
+    pub reworded_same_word_count: usize,
+    /// Lines matched to an edited old line with a *different* word count -
+    /// line-level timing kept, but word-level timing reset (there's no
+    /// sound way to carry it over when the words themselves don't line up).
+    pub reworded_word_count_changed: usize,
+    /// Lines with no old counterpart at all - start untimed, as normal.
+    pub added: usize,
+    /// Old lines with no counterpart in the new text - their timing is
+    /// simply gone, since there's nothing left to attach it to.
+    pub removed: usize,
+}
+
+impl ReparseReport {
+    /// True if every line's text was already exactly what it is now - i.e.
+    /// re-parsing was a pure no-op as far as timing is concerned.
+    pub fn is_fully_unchanged(&self, total_lines: usize) -> bool {
+        self.unchanged == total_lines
+            && self.reworded_same_word_count == 0
+            && self.reworded_word_count_changed == 0
+            && self.added == 0
+            && self.removed == 0
+    }
+
+    /// A short, human-readable summary for the status bar.
+    pub fn summarize(&self, total_lines: usize) -> String {
+        if self.is_fully_unchanged(total_lines) {
+            return format!(
+                "Parsed {total_lines} line(s) - no text changed, all existing timing kept."
+            );
+        }
+        let mut parts = Vec::new();
+        if self.unchanged > 0 {
+            parts.push(format!("{} unchanged", self.unchanged));
+        }
+        if self.reworded_same_word_count > 0 {
+            parts.push(format!(
+                "{} reworded (timing kept)",
+                self.reworded_same_word_count
+            ));
+        }
+        if self.reworded_word_count_changed > 0 {
+            parts.push(format!(
+                "{} reworded with a different word count (line timing kept, word timing reset)",
+                self.reworded_word_count_changed
+            ));
+        }
+        if self.added > 0 {
+            parts.push(format!("{} new", self.added));
+        }
+        if self.removed > 0 {
+            parts.push(format!("{} removed", self.removed));
+        }
+        format!("Parsed {total_lines} line(s): {}.", parts.join(", "))
+    }
+}
+
+/// Finds the longest common subsequence of lines between `old` and `new`,
+/// matched by exact text equality, as a list of `(old_index, new_index)`
+/// pairs strictly increasing in both - i.e. the largest set of lines that
+/// appear unmodified, in the same relative order, in both. This is what
+/// [`merge_reparsed_lyrics`] treats as "definitely the same line, unedited",
+/// with everything else falling into a gap between two such anchors (or
+/// before the first/after the last) that gets a best-effort positional
+/// pairing.
+///
+/// Matching by *content* rather than list position is what makes an
+/// insertion/deletion earlier in the song not smear every later line's
+/// timing forward/backward by one slot, and what keeps a duplicated line
+/// (e.g. a chorus repeated twice) from having its two occurrences' timing
+/// swapped: since matched pairs must be increasing in both indices, the
+/// first old occurrence can only ever match the first surviving new
+/// occurrence, never the second.
+///
+/// O(n*m) time and space - fine for realistic lyric line counts (tens to a
+/// few hundred), not chosen with e.g. a full song's worth of KOK-imported
+/// word-level fragments in mind.
+fn lcs_matches(old: &[LyricLine], new: &[LyricLine]) -> Vec<(usize, usize)> {
+    let n = old.len();
+    let m = new.len();
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old[i].text == new[j].text {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old[i].text == new[j].text {
+            pairs.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
+
+/// Merges `old`'s timing into `new` for a pair of lines matched within the
+/// same local gap (see [`merge_reparsed_lyrics`]) - i.e. treated as an
+/// edited version of the same line, not a brand new one, even though the
+/// text itself differs. Line-level timing (`start`, `sing_end_override`,
+/// `singer`) is always kept - a typo fix or reworded phrase doesn't change
+/// *when* the line is sung. Word-level timing is only kept where it can
+/// still mean something: if the word count matches, each word slot whose
+/// text is unchanged at that position keeps its override; every other slot
+/// (word count changed, or that specific word changed) resets to the
+/// automatic estimate, same as a freshly-parsed word.
+///
+/// Returns the merged line and whether the word count matched, so the
+/// caller can tally which case applied (see [`ReparseReport`]).
+fn merge_edited_line(old: &LyricLine, new: &LyricLine) -> (LyricLine, bool) {
+    let mut merged = new.clone();
+    merged.start = old.start;
+    merged.sing_end_override = old.sing_end_override;
+    merged.singer = old.singer;
+    // A backing vocal is attached to the host line's *identity*, not to its
+    // exact word count/text - a reworded host line (typo fix, rephrasing)
+    // keeps whatever backing vocal it had, same as it keeps its own timing.
+    merged.backing_vocal = old.backing_vocal.clone();
+
+    let old_words: Vec<&str> = old.text.split_whitespace().collect();
+    let new_words: Vec<&str> = new.text.split_whitespace().collect();
+    let same_word_count = old_words.len() == new_words.len();
+    if same_word_count {
+        for (i, (&ow, &nw)) in old_words.iter().zip(new_words.iter()).enumerate() {
+            if ow == nw {
+                merged.word_overrides[i] = old.word_overrides.get(i).copied().flatten();
+                merged.word_end_overrides[i] = old.word_end_overrides.get(i).copied().flatten();
+            }
+            // A word that itself changed keeps `merged`'s fresh `None` from
+            // `new.clone()` above - carrying over a manually-tapped time for
+            // a word that no longer exists would silently mistime whatever
+            // word replaced it.
+        }
+    }
+    // Different word count: nothing above applies, so `merged` keeps the
+    // all-`None` word_overrides/word_end_overrides it already got from
+    // `new.clone()` - there's no sound way to line up two word lists of
+    // different lengths without risking attaching a time to the wrong word.
+    (merged, same_word_count)
+}
+
+/// Re-parses `raw` into a fresh line list, the same way [`parse_pasted_lyrics`]
+/// always has, but carries over as much of `old`'s existing timing as it
+/// safely can instead of discarding it wholesale - re-parsing after fixing
+/// a typo (or inserting/reordering a line) used to silently wipe every
+/// line's timing, which is a serious problem on any song that was already
+/// tapped/tuned.
+///
+/// Matching strategy (see [`lcs_matches`] for the "why"): lines with
+/// *exactly* unchanged text, in the same relative order, are matched first
+/// via a longest-common-subsequence pass - these keep every field
+/// untouched. Whatever's left (edited/inserted/deleted lines) falls between
+/// two such matches (or before the first/after the last); within one such
+/// gap, remaining old and new lines are paired positionally in order (the
+/// gap is, by construction, a small localized region of actual change, so
+/// "the Nth old line in this gap corresponds to the Nth new line in this
+/// gap" is a reasonable assumption without more information) - see
+/// [`merge_edited_line`] for what a paired-but-different-text line keeps.
+/// A leftover old line with no new counterpart in its gap is dropped
+/// (nothing left to attach its timing to); a leftover new line with no old
+/// counterpart starts untimed, same as any brand new line.
+pub fn merge_reparsed_lyrics(old: &[LyricLine], raw: &str) -> (Vec<LyricLine>, ReparseReport) {
+    let new = parse_pasted_lyrics(raw);
+    let anchors = lcs_matches(old, &new);
+
+    let mut result = Vec::with_capacity(new.len());
+    let mut report = ReparseReport::default();
+    let mut old_pos = 0usize;
+    let mut new_pos = 0usize;
+
+    for seg in 0..=anchors.len() {
+        let (old_end, new_end) = anchors
+            .get(seg)
+            .copied()
+            .unwrap_or((old.len(), new.len()));
+
+        // The gap before this anchor (or, on the final pass, before the
+        // end of both lists): best-effort positional pairing between
+        // whatever's left unmatched here.
+        let gap_old = &old[old_pos..old_end];
+        let gap_new = &new[new_pos..new_end];
+        let paired = gap_old.len().min(gap_new.len());
+        for k in 0..paired {
+            let (merged, same_word_count) = merge_edited_line(&gap_old[k], &gap_new[k]);
+            if same_word_count {
+                report.reworded_same_word_count += 1;
+            } else {
+                report.reworded_word_count_changed += 1;
+            }
+            result.push(merged);
+        }
+        result.extend_from_slice(&gap_new[paired..]);
+        report.added += gap_new.len() - paired;
+        report.removed += gap_old.len() - paired;
+
+        // The anchor itself (exact text match), if this wasn't the final
+        // (sentinel) pass - carry every field over untouched.
+        if let Some(&(oi, nj)) = anchors.get(seg) {
+            let mut kept = new[nj].clone();
+            kept.start = old[oi].start;
+            kept.sing_end_override = old[oi].sing_end_override;
+            kept.singer = old[oi].singer;
+            kept.word_overrides = old[oi].word_overrides.clone();
+            kept.word_end_overrides = old[oi].word_end_overrides.clone();
+            kept.backing_vocal = old[oi].backing_vocal.clone();
+            result.push(kept);
+            report.unchanged += 1;
+            old_pos = oi + 1;
+            new_pos = nj + 1;
+        } else {
+            old_pos = old_end;
+            new_pos = new_end;
+        }
+    }
+
+    (result, report)
 }
 
 /// Formats seconds as `MM:SS.CC` (centiseconds) for the editable start/end
@@ -319,6 +629,57 @@ pub fn check_end_change(lines: &[LyricLine], idx: usize, new_end: f64) -> Result
     Ok(())
 }
 
+/// Checks whether setting a backing vocal's `start` to `new_start` is
+/// valid: must fall within its host line's own resolved
+/// `[host_start, host_end)` window, since a backing vocal's timing is
+/// bounded to its host's (see [`BackingVocal`]) rather than checked against
+/// the main line list's own neighbor rules.
+pub fn check_backing_vocal_start(
+    new_start: f64,
+    host_start: f64,
+    host_end: f64,
+) -> Result<(), String> {
+    if !new_start.is_finite() || new_start < host_start {
+        return Err(format!(
+            "Start ({}) can't be before the main line starts ({}).",
+            format_timecode(new_start),
+            format_timecode(host_start)
+        ));
+    }
+    if new_start >= host_end {
+        return Err(format!(
+            "Start ({}) must be before the main line ends ({}).",
+            format_timecode(new_start),
+            format_timecode(host_end)
+        ));
+    }
+    Ok(())
+}
+
+/// Checks whether setting a backing vocal's `end` to `new_end` is valid -
+/// after its own `backing_start`, and not after the host line's own end.
+pub fn check_backing_vocal_end(
+    new_end: f64,
+    backing_start: f64,
+    host_end: f64,
+) -> Result<(), String> {
+    if !new_end.is_finite() || new_end <= backing_start {
+        return Err(format!(
+            "End ({}) must be after the backing vocal's own start ({}).",
+            format_timecode(new_end),
+            format_timecode(backing_start)
+        ));
+    }
+    if new_end > host_end {
+        return Err(format!(
+            "End ({}) can't be after the main line ends ({}).",
+            format_timecode(new_end),
+            format_timecode(host_end)
+        ));
+    }
+    Ok(())
+}
+
 /// A line with its resolved [start, end) window, used at export/preview time.
 #[derive(Clone, Debug)]
 pub struct TimedLine {
@@ -337,6 +698,11 @@ pub struct TimedLine {
     pub word_end_overrides: Vec<Option<f64>>,
     /// See [`LyricLine::starts_new_block`].
     pub starts_new_block: bool,
+    /// Resolved from [`LyricLine::backing_vocal`] - `None` either because
+    /// the host line has no backing vocal at all, or because it has one but
+    /// its `start` hasn't been tapped yet (nothing to time it by, so it
+    /// doesn't render - see [`BackingVocal::start`]).
+    pub backing_vocal: Option<TimedBackingVocal>,
 }
 
 impl TimedLine {
@@ -357,6 +723,25 @@ impl TimedLine {
             Some(manual) => manual.clamp(start, end),
             None => (start + estimate_sing_duration(&line.text, window)).clamp(start, end),
         };
+        let backing_vocal = line.backing_vocal.as_ref().and_then(|bv| {
+            let bv_start = bv.start?.clamp(start, end);
+            // No end tapped yet -> the host's own end is a reasonable
+            // placeholder, the same "graceful default, refine later"
+            // behavior an untapped line end already has.
+            let bv_end = bv
+                .end
+                .unwrap_or(end)
+                .clamp(bv_start, end)
+                .max(bv_start + 0.05);
+            Some(TimedBackingVocal {
+                text: bv.text.clone(),
+                start: bv_start,
+                end: bv_end,
+                singer: bv.singer,
+                word_overrides: bv.word_overrides.clone(),
+                word_end_overrides: bv.word_end_overrides.clone(),
+            })
+        });
         Self {
             text: line.text.clone(),
             start,
@@ -366,8 +751,21 @@ impl TimedLine {
             word_overrides: line.word_overrides.clone(),
             word_end_overrides: line.word_end_overrides.clone(),
             starts_new_block: line.starts_new_block,
+            backing_vocal,
         }
     }
+}
+
+/// The resolved (always-timed) counterpart to [`BackingVocal`] - see
+/// [`TimedLine::backing_vocal`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimedBackingVocal {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+    pub singer: Singer,
+    pub word_overrides: Vec<Option<f64>>,
+    pub word_end_overrides: Vec<Option<f64>>,
 }
 
 /// Resolve start/end windows for every line. Requires every line to already
@@ -423,7 +821,39 @@ pub struct TimedWord<'a> {
 /// character count - except where the user has manually overridden a
 /// specific word's start and/or end time, which takes precedence.
 pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
-    let words: Vec<&str> = line.text.split_whitespace().collect();
+    resolve_word_timings(
+        &line.text,
+        line.start,
+        line.sing_end,
+        &line.word_overrides,
+        &line.word_end_overrides,
+    )
+}
+
+/// Same as [`word_timings`], for a backing vocal's own (much shorter, and
+/// bounded within its host's window) text/timing instead of a host line's.
+pub fn backing_vocal_word_timings(bv: &TimedBackingVocal) -> Vec<TimedWord<'_>> {
+    resolve_word_timings(
+        &bv.text,
+        bv.start,
+        bv.end,
+        &bv.word_overrides,
+        &bv.word_end_overrides,
+    )
+}
+
+/// The shared math behind [`word_timings`]/[`backing_vocal_word_timings`] -
+/// spreads `text`'s words across `[start, sing_end)`, proportional to
+/// cumulative character count, except where `word_overrides`/
+/// `word_end_overrides` manually pin a specific word's start and/or end.
+fn resolve_word_timings<'a>(
+    text: &'a str,
+    start: f64,
+    sing_end: f64,
+    word_overrides: &[Option<f64>],
+    word_end_overrides: &[Option<f64>],
+) -> Vec<TimedWord<'a>> {
+    let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return Vec::new();
     }
@@ -432,7 +862,7 @@ pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
         .map(|w| w.chars().count())
         .sum::<usize>()
         .max(1);
-    let duration = (line.sing_end - line.start).max(0.05);
+    let duration = (sing_end - start).max(0.05);
 
     // Resolve every word's *start* first (manual override, or the automatic
     // character-weighted estimate), so each word's automatic *end* can then
@@ -442,22 +872,22 @@ pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
     let mut chars_so_far = 0usize;
     for (i, w) in words.iter().enumerate() {
         let frac = chars_so_far as f64 / total_chars as f64;
-        let auto_start = line.start + duration * frac;
-        let manual_start = line.word_overrides.get(i).copied().flatten();
+        let auto_start = start + duration * frac;
+        let manual_start = word_overrides.get(i).copied().flatten();
         resolved_starts.push(manual_start.unwrap_or(auto_start));
         chars_so_far += w.chars().count();
     }
 
     let mut out = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
-        let start = resolved_starts[i];
-        let manual_start = line.word_overrides.get(i).copied().flatten();
-        let default_end = resolved_starts.get(i + 1).copied().unwrap_or(line.sing_end);
-        let manual_end = line.word_end_overrides.get(i).copied().flatten();
+        let word_start = resolved_starts[i];
+        let manual_start = word_overrides.get(i).copied().flatten();
+        let default_end = resolved_starts.get(i + 1).copied().unwrap_or(sing_end);
+        let manual_end = word_end_overrides.get(i).copied().flatten();
         out.push(TimedWord {
             text: w,
-            highlight_at: start,
-            held_until: manual_end.unwrap_or(default_end).max(start),
+            highlight_at: word_start,
+            held_until: manual_end.unwrap_or(default_end).max(word_start),
             is_manual: manual_start.is_some(),
             end_is_manual: manual_end.is_some(),
         });
@@ -496,10 +926,24 @@ pub fn word_char_spans(text: &str) -> Vec<(usize, usize)> {
 /// instantaneous (no freeze) for words that don't have a manual end
 /// override, since their `held_until` already *is* the next word's start.
 pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
-    let text = normalize_text(&line.text);
+    resolve_wipe_fraction(&normalize_text(&line.text), &word_timings(line), t)
+}
+
+/// Same as [`current_line_wipe_fraction`], for a backing vocal's own
+/// (much shorter) text/word timing.
+pub fn backing_vocal_wipe_fraction(bv: &TimedBackingVocal, t: f64) -> f32 {
+    resolve_wipe_fraction(
+        &normalize_text(&bv.text),
+        &backing_vocal_word_timings(bv),
+        t,
+    )
+}
+
+/// The shared math behind [`current_line_wipe_fraction`]/
+/// [`backing_vocal_wipe_fraction`].
+fn resolve_wipe_fraction(text: &str, words: &[TimedWord], t: f64) -> f32 {
     let char_count = text.chars().count().max(1) as f32;
-    let spans = word_char_spans(&text);
-    let words = word_timings(line);
+    let spans = word_char_spans(text);
     if words.is_empty() || spans.is_empty() {
         return 0.0;
     }
@@ -1015,5 +1459,383 @@ mod tests {
         lines[1].start = Some(5.0);
         assert!(check_end_change(&lines, 0, 5.1).is_err());
         assert!(check_end_change(&lines, 0, 5.0).is_ok());
+    }
+
+    // --- backing vocals ----------------------------------------------------
+
+    #[test]
+    fn backing_vocal_is_absent_until_its_start_is_tapped() {
+        let mut line = LyricLine::new("main line here");
+        line.start = Some(0.0);
+        line.backing_vocal = Some(BackingVocal::new("echo"));
+        let timed = TimedLine::from_line(&line, 0.0, 10.0);
+        assert!(
+            timed.backing_vocal.is_none(),
+            "no start tapped yet -> nothing to render"
+        );
+    }
+
+    #[test]
+    fn backing_vocal_start_is_clamped_within_the_host_window() {
+        let mut line = LyricLine::new("main line here");
+        line.start = Some(0.0);
+        let mut bv = BackingVocal::new("echo");
+        bv.start = Some(-5.0); // before the host even starts
+        bv.end = Some(999.0); // way past the host's own end
+        line.backing_vocal = Some(bv);
+        let timed = TimedLine::from_line(&line, 0.0, 10.0);
+        let tbv = timed.backing_vocal.unwrap();
+        assert_eq!(tbv.start, 0.0);
+        assert_eq!(tbv.end, 10.0);
+    }
+
+    #[test]
+    fn backing_vocal_end_defaults_to_the_hosts_own_end_when_untapped() {
+        let mut line = LyricLine::new("main line here");
+        line.start = Some(0.0);
+        let mut bv = BackingVocal::new("echo");
+        bv.start = Some(7.0);
+        // bv.end left None - not tapped yet.
+        line.backing_vocal = Some(bv);
+        let timed = TimedLine::from_line(&line, 0.0, 10.0);
+        let tbv = timed.backing_vocal.unwrap();
+        assert_eq!(tbv.start, 7.0);
+        assert_eq!(tbv.end, 10.0, "should default to the host's own end");
+    }
+
+    #[test]
+    fn check_backing_vocal_start_must_fall_within_the_host_window() {
+        assert!(check_backing_vocal_start(5.0, 0.0, 10.0).is_ok());
+        assert!(check_backing_vocal_start(-1.0, 0.0, 10.0).is_err());
+        assert!(check_backing_vocal_start(10.0, 0.0, 10.0).is_err()); // not < host_end
+        assert!(check_backing_vocal_start(0.0, 0.0, 10.0).is_ok()); // exactly at host_start is fine
+    }
+
+    #[test]
+    fn check_backing_vocal_end_must_come_after_its_own_start_and_not_past_the_host() {
+        assert!(check_backing_vocal_end(8.0, 5.0, 10.0).is_ok());
+        assert!(check_backing_vocal_end(5.0, 5.0, 10.0).is_err()); // not strictly after its own start
+        assert!(check_backing_vocal_end(10.0, 5.0, 10.0).is_ok()); // exactly at host_end is fine
+        assert!(check_backing_vocal_end(10.1, 5.0, 10.0).is_err()); // past the host
+    }
+
+    #[test]
+    fn backing_vocal_word_timings_work_the_same_way_as_the_host_lines() {
+        let mut line = LyricLine::new("main line");
+        line.start = Some(0.0);
+        let mut bv = BackingVocal::new("echo now");
+        bv.start = Some(2.0);
+        bv.end = Some(4.0);
+        line.backing_vocal = Some(bv);
+        let timed = TimedLine::from_line(&line, 0.0, 10.0);
+        let tbv = timed.backing_vocal.unwrap();
+        let words = backing_vocal_word_timings(&tbv);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].highlight_at, 2.0);
+        assert!(words[1].highlight_at >= words[0].highlight_at);
+        assert!(words[1].highlight_at < 4.0 + 1e-9);
+    }
+
+    #[test]
+    fn a_reparse_carries_the_backing_vocal_through_for_an_unchanged_host_line() {
+        let raw = "main line here";
+        let mut lines = parse_pasted_lyrics(raw);
+        lines[0].start = Some(0.0);
+        let mut bv = BackingVocal::new("echo");
+        bv.start = Some(1.0);
+        bv.end = Some(2.0);
+        lines[0].backing_vocal = Some(bv.clone());
+
+        let (merged, report) = merge_reparsed_lyrics(&lines, raw);
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(merged[0].backing_vocal, Some(bv));
+    }
+
+    #[test]
+    fn a_reparse_carries_the_backing_vocal_through_for_a_reworded_host_line() {
+        let old_raw = "hello world";
+        let mut lines = parse_pasted_lyrics(old_raw);
+        lines[0].start = Some(0.0);
+        let mut bv = BackingVocal::new("echo");
+        bv.start = Some(1.0);
+        bv.end = Some(2.0);
+        lines[0].backing_vocal = Some(bv.clone());
+
+        // Same word count, one word changed - a "reworded" match, not an
+        // exact one, per merge_edited_line - the backing vocal must still
+        // survive, since it's attached to the host line's identity, not to
+        // its exact wording.
+        let (merged, report) = merge_reparsed_lyrics(&lines, "hello there");
+        assert_eq!(report.reworded_same_word_count, 1);
+        assert_eq!(merged[0].backing_vocal, Some(bv));
+    }
+
+    // --- merge_reparsed_lyrics -------------------------------------------
+
+    /// Builds a timed `LyricLine` for merge tests - a start, a sing-end
+    /// override, and every word manually overridden to a distinct time, so
+    /// a test can tell at a glance whether a given field survived a merge.
+    /// Only meaningful in isolation (`starts_new_block` always comes out
+    /// `true`, as if it were the first/only line) - see
+    /// [`timed_lines_from`] for a multi-line fixture with a realistic
+    /// `starts_new_block` per line.
+    fn timed_line(text: &str, start: f64) -> LyricLine {
+        let mut line = LyricLine::new(text);
+        line.start = Some(start);
+        line.sing_end_override = Some(start + 10.0);
+        line.singer = Singer::Duet;
+        let n = line.word_overrides.len();
+        for i in 0..n {
+            line.word_overrides[i] = Some(start + i as f64);
+            line.word_end_overrides[i] = Some(start + i as f64 + 0.5);
+        }
+        line
+    }
+
+    /// Builds a realistic "already timed" fixture: parses `raw` for real
+    /// (so `starts_new_block` is whatever a genuine previous parse would
+    /// have produced for this exact layout, not just a hardcoded default),
+    /// then stamps each resulting line with distinct timing per `starts`.
+    fn timed_lines_from(raw: &str, starts: &[f64]) -> Vec<LyricLine> {
+        let mut lines = parse_pasted_lyrics(raw);
+        assert_eq!(lines.len(), starts.len(), "fixture/starts length mismatch");
+        for (line, &start) in lines.iter_mut().zip(starts) {
+            line.start = Some(start);
+            line.sing_end_override = Some(start + 10.0);
+            line.singer = Singer::Duet;
+            let n = line.word_overrides.len();
+            for i in 0..n {
+                line.word_overrides[i] = Some(start + i as f64);
+                line.word_end_overrides[i] = Some(start + i as f64 + 0.5);
+            }
+        }
+        lines
+    }
+
+    /// Compares every field *except* `starts_new_block`, which is always
+    /// recomputed fresh from the new text's own block structure rather than
+    /// carried over (see `starts_new_block_is_always_recomputed_fresh_not_carried_over`),
+    /// so it's not part of what "timing was preserved" means and is
+    /// legitimately allowed to differ when a line's position relative to
+    /// blank lines changes (e.g. a line inserted before it).
+    fn assert_timing_preserved(actual: &LyricLine, expected: &LyricLine) {
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(actual.start, expected.start);
+        assert_eq!(actual.singer, expected.singer);
+        assert_eq!(actual.word_overrides, expected.word_overrides);
+        assert_eq!(actual.word_end_overrides, expected.word_end_overrides);
+        assert_eq!(actual.sing_end_override, expected.sing_end_override);
+    }
+
+    #[test]
+    fn no_text_change_keeps_every_line_and_every_field_untouched() {
+        let raw = "hello world\nsecond line";
+        let old = timed_lines_from(raw, &[1.0, 5.0]);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+
+        assert_eq!(merged, old, "nothing about the lines should have changed");
+        assert_eq!(report.unchanged, 2);
+        assert!(report.is_fully_unchanged(2));
+        assert_eq!(
+            report.reworded_same_word_count
+                + report.reworded_word_count_changed
+                + report.added
+                + report.removed,
+            0
+        );
+    }
+
+    #[test]
+    fn editing_one_word_in_one_line_only_affects_that_lines_word_timing() {
+        // "hello world" -> "hello there": same word count, one word changed.
+        let old = timed_lines_from("hello world\nsecond line", &[1.0, 5.0]);
+        let raw = "hello there\nsecond line";
+        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+
+        assert_eq!(merged.len(), 2);
+        // Untouched line: byte-for-byte identical, including word timing.
+        assert_eq!(merged[1], old[1]);
+
+        // Edited line: line-level timing kept...
+        assert_eq!(merged[0].text, "hello there");
+        assert_eq!(merged[0].start, old[0].start);
+        assert_eq!(merged[0].sing_end_override, old[0].sing_end_override);
+        assert_eq!(merged[0].singer, old[0].singer);
+        // ...word 0 ("hello") unchanged -> keeps its override...
+        assert_eq!(merged[0].word_overrides[0], old[0].word_overrides[0]);
+        assert_eq!(
+            merged[0].word_end_overrides[0],
+            old[0].word_end_overrides[0]
+        );
+        // ...word 1 ("world" -> "there") changed -> resets to automatic.
+        assert_eq!(merged[0].word_overrides[1], None);
+        assert_eq!(merged[0].word_end_overrides[1], None);
+
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.reworded_same_word_count, 1);
+        assert_eq!(report.reworded_word_count_changed, 0);
+        assert_eq!(report.added, 0);
+        assert_eq!(report.removed, 0);
+    }
+
+    #[test]
+    fn changing_a_lines_word_count_keeps_line_timing_but_resets_word_timing() {
+        let old = vec![timed_line("hello world", 1.0)];
+        let raw = "hello there world"; // 2 words -> 3 words
+        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "hello there world");
+        assert_eq!(merged[0].start, old[0].start);
+        assert_eq!(merged[0].sing_end_override, old[0].sing_end_override);
+        assert_eq!(merged[0].singer, old[0].singer);
+        assert_eq!(merged[0].word_overrides, vec![None, None, None]);
+        assert_eq!(merged[0].word_end_overrides, vec![None, None, None]);
+
+        assert_eq!(report.reworded_word_count_changed, 1);
+        assert_eq!(report.reworded_same_word_count, 0);
+        assert_eq!(report.unchanged, 0);
+    }
+
+    #[test]
+    fn inserting_a_new_line_in_the_middle_keeps_every_existing_lines_timing() {
+        let old = timed_lines_from("first\nsecond\nthird", &[1.0, 5.0, 9.0]);
+        let raw = "first\nbrand new line\nsecond\nthird";
+        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0], old[0]); // "first" untouched
+        assert_eq!(merged[1].text, "brand new line");
+        assert_eq!(merged[1].start, None); // new line starts untimed
+        assert_eq!(merged[2], old[1]); // "second" untouched, timing intact
+        assert_eq!(merged[3], old[2]); // "third" untouched, timing intact
+
+        assert_eq!(report.unchanged, 3);
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.reworded_same_word_count, 0);
+        assert_eq!(report.reworded_word_count_changed, 0);
+    }
+
+    #[test]
+    fn deleting_a_line_only_loses_that_lines_timing() {
+        let old = timed_lines_from("first\nsecond\nthird", &[1.0, 5.0, 9.0]);
+        let raw = "first\nthird"; // "second" deleted
+        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], old[0]);
+        assert_eq!(merged[1], old[2]);
+
+        assert_eq!(report.unchanged, 2);
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.added, 0);
+    }
+
+    #[test]
+    fn a_duplicated_line_keeps_each_occurrences_own_distinct_timing() {
+        // Two identical "chorus" lines with *different* timing - re-parsing
+        // unchanged text must not swap them.
+        let raw = "we will rock you\nverse between\nwe will rock you";
+        let mut old = timed_lines_from(raw, &[10.0, 30.0, 50.0]);
+        old[0].singer = Singer::Male;
+        old[2].singer = Singer::Female;
+        let (chorus1, chorus2) = (old[0].clone(), old[2].clone());
+        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0], chorus1, "first chorus keeps its own timing");
+        assert_eq!(merged[1], old[1]);
+        assert_eq!(merged[2], chorus2, "second chorus keeps its own timing");
+        assert_ne!(
+            merged[0].start, merged[2].start,
+            "the two occurrences must not have been swapped/merged together"
+        );
+        assert_eq!(report.unchanged, 3);
+    }
+
+    #[test]
+    fn a_moved_line_keeps_its_timing_by_content_not_by_position() {
+        // Simulates pasting a new line *above* an already-timed block - the
+        // existing lines shift down by one index but their text (and
+        // therefore their timing) doesn't change.
+        let old = timed_lines_from("verse one\nverse two", &[10.0, 15.0]);
+        let raw = "brand new intro line\nverse one\nverse two";
+        let (merged, _report) = merge_reparsed_lyrics(&old, raw);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].text, "brand new intro line");
+        assert_eq!(merged[0].start, None);
+        // Despite now sitting at index 1/2 instead of 0/1, both keep their
+        // original absolute timing - it's still correct, since the song
+        // itself didn't change, only where this text sits in the list.
+        // `starts_new_block` legitimately differs for "verse one" here (it
+        // was first-in-block in `old`, but no longer is, now that a new
+        // line precedes it) - see `assert_timing_preserved`.
+        assert_timing_preserved(&merged[1], &old[0]);
+        assert_timing_preserved(&merged[2], &old[1]);
+    }
+
+    #[test]
+    fn starts_new_block_is_always_recomputed_fresh_not_carried_over() {
+        // Old data claims "second" doesn't start a new block; the new text
+        // has a blank line before it, which must win regardless of what the
+        // old (now-stale) flag said.
+        let mut old = vec![timed_line("first", 1.0), timed_line("second", 5.0)];
+        old[1].starts_new_block = false;
+        let raw = "first\n\nsecond"; // blank line inserted before "second"
+        let (merged, _report) = merge_reparsed_lyrics(&old, raw);
+
+        assert!(merged[1].starts_new_block);
+        // Timing itself is still preserved even though this flag wasn't.
+        assert_eq!(merged[1].start, old[1].start);
+    }
+
+    #[test]
+    fn empty_old_lines_behaves_like_a_plain_first_parse() {
+        let old: Vec<LyricLine> = Vec::new();
+        let raw = "a\nb\nc";
+        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        assert_eq!(merged, parse_pasted_lyrics(raw));
+        assert_eq!(report.added, 3);
+        assert_eq!(report.unchanged, 0);
+    }
+
+    #[test]
+    fn clearing_the_text_entirely_drops_every_line_and_its_timing() {
+        let old = vec![timed_line("first", 1.0), timed_line("second", 5.0)];
+        let (merged, report) = merge_reparsed_lyrics(&old, "");
+        assert!(merged.is_empty());
+        assert_eq!(report.removed, 2);
+    }
+
+    #[test]
+    fn lcs_matches_is_a_strictly_increasing_valid_alignment() {
+        let old = parse_pasted_lyrics("a\nb\na\nc\nb");
+        let new = parse_pasted_lyrics("x\na\nb\na\ny\nb");
+        let pairs = lcs_matches(&old, &new);
+        // Every matched pair must actually match by text...
+        for &(i, j) in &pairs {
+            assert_eq!(old[i].text, new[j].text);
+        }
+        // ...and indices must be strictly increasing in both lists (a valid
+        // common-subsequence alignment, not just any pairing).
+        for w in pairs.windows(2) {
+            assert!(w[0].0 < w[1].0);
+            assert!(w[0].1 < w[1].1);
+        }
+        // "a b a c b" vs "x a b a y b" shares "a b a b" as a common
+        // subsequence (length 4) - confirm the LCS actually finds it, not
+        // some shorter alignment.
+        assert_eq!(pairs.len(), 4);
+    }
+
+    #[test]
+    fn summarize_reports_a_pure_no_op_distinctly() {
+        let report = ReparseReport {
+            unchanged: 3,
+            ..Default::default()
+        };
+        assert!(report.summarize(3).contains("no text changed"));
     }
 }

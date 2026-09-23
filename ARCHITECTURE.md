@@ -25,7 +25,11 @@ lyrics.rs    The data model: LyricLine (raw, user-entered - start, optional expl
              math, timecode format/parse, and start/end overlap validation all live
              here, shared by every renderer and by main.rs's tap/timeline/manual-entry
              code paths. Also strips Genius-style `[Verse 1]`/`[Chorus]` section
-             markers when parsing pasted lyrics.
+             markers when parsing pasted lyrics. BackingVocal/TimedBackingVocal
+             (a second vocalist echoing part of a line) are embedded on the host
+             LyricLine/TimedLine rather than being independent top-level lines -
+             their own timing is bounded within their host's window, so the
+             sequential, non-overlapping TimedLine list itself never changes.
 formats.rs   Import *and* export for LRC, UltraStar, and KOK lyric files, plus
              format auto-detection. Import produces LyricLine values, same as
              manual paste + tap; export is the direct inverse, consuming the same
@@ -44,10 +48,16 @@ font.rs      Renders characters into CDG's 6x12 tile format (and 2x/3x/... scale
 export.rs    The ".cdg renderer": lays out lines/words/countdown dots on the CDG
              canvas using cdg.rs + font.rs, driven by lyrics.rs's timing. Also owns
              the "paired audio" helper (copying the loaded audio next to a
-             `.cdg`/`.lrc`/UltraStar file under a matching base filename).
+             `.cdg`/`.lrc`/UltraStar file under a matching base filename). A line's
+             backing vocal (if any) draws on its own row (BACKING_ROW) with its own
+             word-wipe running concurrently with the host's - the two lines' word
+             events are merged into one time-sorted sequence before being emitted,
+             since CdgWriter::advance_to is monotonic-only-forward.
 video.rs     The "video renderer": an independent RGB24 frame renderer (via
              `ab_glyph` for anti-aliased text) piped into an `ffmpeg` subprocess,
-             driven by the *same* lyrics.rs timing as export.rs.
+             driven by the *same* lyrics.rs timing as export.rs. A backing vocal
+             draws directly beneath the current line, smaller, with its own wipe,
+             matching the same relationship the `.cdg` export uses.
 timeline.rs  Pure time<->pixel mapping, zoom/drag bounds, and drag-mode
              classification for the fine-tuning timeline - no egui dependency, so
              it's unit-tested directly; main.rs owns the actual widget/painting/

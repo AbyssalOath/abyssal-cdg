@@ -22,10 +22,11 @@
 #[cfg(test)]
 use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
-    blank_sung_lines, countdown_window, countdown_window_between, current_line_wipe_fraction,
-    group_into_blocks, hide_upcoming_lines, normalize_text, singer_legend, Singer, TimedLine,
+    backing_vocal_wipe_fraction, blank_sung_lines, countdown_window, countdown_window_between,
+    current_line_wipe_fraction, group_into_blocks, hide_upcoming_lines, normalize_text,
+    singer_legend, Singer, TimedLine,
 };
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -260,7 +261,7 @@ fn draw_filled_circle(canvas: &mut Canvas, cx: f32, cy: f32, radius: f32, color:
     }
 }
 
-fn measure_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
+fn measure_width(font: &FontArc, scale: PxScale, text: &str) -> f32 {
     let scaled = font.as_scaled(scale);
     text.chars()
         .map(|c| scaled.h_advance(font.glyph_id(c)))
@@ -275,7 +276,7 @@ fn measure_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_chars(
     canvas: &mut Canvas,
-    font: &FontRef,
+    font: &FontArc,
     scale_px: f32,
     center_x: f32,
     baseline_y: f32,
@@ -328,7 +329,7 @@ fn draw_text_line_chars(
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_wipe(
     canvas: &mut Canvas,
-    font: &FontRef,
+    font: &FontArc,
     scale_px: f32,
     center_x: f32,
     baseline_y: f32,
@@ -404,7 +405,7 @@ fn legend_text_and_colors(palette: &VideoPalette, singers: &[Singer]) -> (String
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_uniform(
     canvas: &mut Canvas,
-    font: &FontRef,
+    font: &FontArc,
     scale_px: f32,
     center_x: f32,
     baseline_y: f32,
@@ -455,8 +456,8 @@ fn draw_countdown_dots(
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     canvas: &mut Canvas,
-    regular: &FontRef,
-    bold: &FontRef,
+    regular: &FontArc,
+    bold: &FontArc,
     timed_lines: &[TimedLine],
     blocks: &[Vec<usize>],
     palette: &VideoPalette,
@@ -592,6 +593,31 @@ fn render_frame(
                         wipe_fraction,
                         max_width,
                     );
+
+                    // A backing/echo vocal (if any) draws directly beneath
+                    // the current line, smaller, in its own color, with its
+                    // own independent wipe - only while its own (bounded
+                    // within the host's) window is actually active, same as
+                    // the `.cdg` export's backing row.
+                    if let Some(bv) = &line.backing_vocal {
+                        if t >= bv.start && t < bv.end {
+                            let (bv_unsung, bv_highlight) = palette.singer_colors(bv.singer);
+                            let bv_text = normalize_text(&bv.text);
+                            let bv_wipe = backing_vocal_wipe_fraction(bv, t);
+                            draw_text_line_wipe(
+                                canvas,
+                                regular,
+                                font_size * 0.7,
+                                w / 2.0,
+                                y + line_height * 0.5,
+                                &bv_text,
+                                bv_unsung,
+                                bv_highlight,
+                                bv_wipe,
+                                max_width,
+                            );
+                        }
+                    }
                 }
             }
             std::cmp::Ordering::Greater => {
@@ -611,8 +637,12 @@ fn render_frame(
         }
     }
 
+    // Only draw the countdown if there's a real next line to count into -
+    // for the last line of the song, a long gap here is just trailing
+    // silence after the song ends, not a break before another line.
+    let has_next_line = current_idx + 1 < timed_lines.len();
     if let Some((cd_start, cd_end)) = countdown_window(&timed_lines[current_idx]) {
-        if t >= cd_start {
+        if has_next_line && t >= cd_start {
             let next_singer = timed_lines
                 .get(current_idx + 1)
                 .map(|l| l.singer)
@@ -791,6 +821,15 @@ pub fn extract_video_background_thumbnail(
 /// at `audio_path`. Calls `on_progress(0.0..=1.0)` periodically so the UI
 /// can show a progress bar - this can take anywhere from several seconds to
 /// a few minutes depending on song length and resolution.
+///
+/// `custom_font_bytes`, if `Some`, is used for *both* the regular and bold
+/// text roles in place of the bundled DejaVu Sans/Sans Bold - `ab_glyph`
+/// has no synthetic-bold support, and a system font's family (as
+/// enumerated by `fonts.rs`) isn't guaranteed to include a genuine bold
+/// sibling face, so reusing the one loaded face for both is the honest
+/// simplification: the currently-singing line stays visually distinct via
+/// its slightly larger size and the color wipe, just not a heavier weight.
+/// `None` keeps today's exact behavior (bundled DejaVu, regular + true bold).
 #[allow(clippy::too_many_arguments)]
 pub fn render_video(
     timed_lines: &[TimedLine],
@@ -804,15 +843,24 @@ pub fn render_video(
     background: Option<&Background>,
     background_fit: BackgroundFit,
     background_dim: f32,
+    custom_font_bytes: Option<Vec<u8>>,
     output_path: &Path,
     mut on_progress: impl FnMut(f32),
 ) -> Result<()> {
     check_ffmpeg_available()?;
 
-    let regular =
-        FontRef::try_from_slice(DEJAVU_REGULAR).context("failed to parse embedded regular font")?;
-    let bold =
-        FontRef::try_from_slice(DEJAVU_BOLD).context("failed to parse embedded bold font")?;
+    let (regular, bold) = match custom_font_bytes {
+        Some(bytes) => {
+            let font = FontArc::try_from_vec(bytes)
+                .map_err(|_| anyhow!("failed to parse the selected custom font"))?;
+            (font.clone(), font)
+        }
+        None => (
+            FontArc::try_from_slice(DEJAVU_REGULAR)
+                .context("failed to parse embedded regular font")?,
+            FontArc::try_from_slice(DEJAVU_BOLD).context("failed to parse embedded bold font")?,
+        ),
+    };
 
     let (w, h) = resolution.dimensions();
     let card_end = crate::export::title_card_end(timed_lines);
@@ -1291,8 +1339,8 @@ mod tests {
             screaming_unsung: Rgb8::new(140, 30, 20),
             screaming_highlight: Rgb8::new(255, 60, 10),
         };
-        let regular = FontRef::try_from_slice(DEJAVU_REGULAR).unwrap();
-        let bold = FontRef::try_from_slice(DEJAVU_BOLD).unwrap();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
         let card_end = crate::export::title_card_end(&timed); // long intro before first line at 20.0
         let mut canvas = Canvas::new(320, 180);
 
@@ -1314,5 +1362,152 @@ mod tests {
             );
             t += 0.37;
         }
+    }
+
+    fn test_palette() -> VideoPalette {
+        VideoPalette {
+            background: Rgb8::new(5, 5, 20),
+            default_unsung: Rgb8::new(230, 230, 230),
+            default_highlight: Rgb8::new(255, 220, 0),
+            male_unsung: Rgb8::new(230, 230, 230),
+            male_highlight: Rgb8::new(255, 220, 0),
+            female_unsung: Rgb8::new(210, 210, 255),
+            female_highlight: Rgb8::new(255, 90, 220),
+            duet_unsung: Rgb8::new(200, 255, 200),
+            duet_highlight: Rgb8::new(255, 150, 0),
+            preview: Rgb8::new(110, 110, 160),
+            title: Rgb8::new(255, 255, 255),
+            artist: Rgb8::new(160, 160, 200),
+            screaming_unsung: Rgb8::new(140, 30, 20),
+            screaming_highlight: Rgb8::new(255, 60, 10),
+        }
+    }
+
+    /// True if the leftmost countdown dot's center pixel (see
+    /// [`draw_countdown_dots`]'s geometry) is still exactly the background
+    /// color - i.e. nothing was drawn there.
+    fn countdown_dot_area_is_untouched(canvas: &Canvas, palette: &VideoPalette) -> bool {
+        let w = canvas.w as f32;
+        let h = canvas.h as f32;
+        let cy = (h * 0.85).round() as usize;
+        let cx = (w / 2.0 + (0.0 - 1.5) * (h * 0.05)).round() as usize;
+        let idx = (cy * canvas.w + cx) * 3;
+        canvas.buf[idx] == palette.background.r
+            && canvas.buf[idx + 1] == palette.background.g
+            && canvas.buf[idx + 2] == palette.background.b
+    }
+
+    /// True if any pixel in the horizontal row at `y` differs from the
+    /// background color - i.e. something was actually drawn there.
+    fn row_has_non_background_pixel(canvas: &Canvas, palette: &VideoPalette, y: f32) -> bool {
+        let row = (y.round() as usize).min(canvas.h.saturating_sub(1));
+        (0..canvas.w).any(|x| {
+            let idx = (row * canvas.w + x) * 3;
+            canvas.buf[idx] != palette.background.r
+                || canvas.buf[idx + 1] != palette.background.g
+                || canvas.buf[idx + 2] != palette.background.b
+        })
+    }
+
+    #[test]
+    fn backing_vocal_renders_only_during_its_own_window() {
+        let mut lines = vec![LyricLine::new("hello world")];
+        lines[0].start = Some(0.0);
+        let mut bv = crate::lyrics::BackingVocal::new("hey");
+        bv.start = Some(3.0);
+        bv.end = Some(5.0);
+        lines[0].backing_vocal = Some(bv);
+        let timed = resolve_timing(&lines, Some(10.0));
+        let blocks = group_into_blocks(&timed);
+        assert!(timed[0].backing_vocal.is_some());
+
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed);
+        let (w, h) = (320usize, 180usize);
+
+        // Same geometry `render_frame` itself uses for a single-line block.
+        let line_height = h as f32 * 0.11;
+        let start_y = h as f32 * 0.5 - line_height / 2.0 + line_height * 0.5;
+        let backing_y = start_y + line_height * 0.5;
+
+        let render_at = |t: f64| {
+            let mut canvas = Canvas::new(w, h);
+            canvas.fill(palette.background);
+            render_frame(
+                &mut canvas, &regular, &bold, &timed, &blocks, &palette, None, None, card_end, t,
+            );
+            canvas
+        };
+
+        // Before the backing vocal's own window (t=1.0, window is [3,5)) -
+        // nothing at its row.
+        let before = render_at(1.0);
+        assert!(!row_has_non_background_pixel(&before, &palette, backing_y));
+
+        // Inside its window - something's there.
+        let during = render_at(4.0);
+        assert!(row_has_non_background_pixel(&during, &palette, backing_y));
+
+        // After its window (still within the host's own [0,10) window) -
+        // gone again.
+        let after = render_at(7.0);
+        assert!(!row_has_non_background_pixel(&after, &palette, backing_y));
+    }
+
+    #[test]
+    fn no_countdown_dots_after_the_last_line_even_with_a_long_silent_tail() {
+        // Regression: a long stretch of silence after the *last* line (e.g.
+        // a long instrumental outro) must not draw the countdown dots -
+        // there's no next line to count into.
+        let mut lines = vec![LyricLine::new("hi")];
+        lines[0].start = Some(0.0);
+        let timed = resolve_timing(&lines, Some(30.0)); // huge trailing silence
+        let blocks = group_into_blocks(&timed);
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed);
+        let mut canvas = Canvas::new(320, 180);
+        canvas.fill(palette.background);
+
+        // "hi" sings for ~1.2s, so with a 30s total duration the countdown
+        // window (were it not suppressed) would be [26.0, 30.0) - sample
+        // well inside that window, still within the line's own [0, 30) span.
+        render_frame(
+            &mut canvas, &regular, &bold, &timed, &blocks, &palette, None, None, card_end, 28.0,
+        );
+
+        assert!(
+            countdown_dot_area_is_untouched(&canvas, &palette),
+            "no countdown dot should be drawn after the last line"
+        );
+    }
+
+    #[test]
+    fn countdown_dots_still_show_for_a_real_mid_song_gap() {
+        // Sanity check alongside the test above: only the end-of-song case
+        // changed - a long gap *between* two real lines still draws dots.
+        let mut lines = vec![LyricLine::new("hi"), LyricLine::new("there")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(20.0); // huge mid-song gap
+        let timed = resolve_timing(&lines, Some(22.0));
+        let blocks = group_into_blocks(&timed);
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed);
+        let mut canvas = Canvas::new(320, 180);
+        canvas.fill(palette.background);
+
+        render_frame(
+            &mut canvas, &regular, &bold, &timed, &blocks, &palette, None, None, card_end, 18.0,
+        );
+
+        assert!(
+            !countdown_dot_area_is_untouched(&canvas, &palette),
+            "expected a countdown dot to be drawn for a real mid-song gap"
+        );
     }
 }

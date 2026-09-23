@@ -97,6 +97,14 @@ pub struct ProjectFile {
     /// (and unused) without a `background` set.
     #[serde(default)]
     pub background_dim: f32,
+    /// System font family for lyric text (video export + live preview
+    /// only - see `fonts.rs`) - `None` (the default for every project
+    /// saved before this existed, via `#[serde(default)]`) means the
+    /// bundled default font. If the named family isn't installed on
+    /// whatever machine opens this project, the app falls back to the
+    /// default and shows a notice rather than failing to load.
+    #[serde(default)]
+    pub lyric_font_family: Option<String>,
 }
 
 impl ProjectFile {
@@ -231,6 +239,11 @@ mod tests {
         lines[0].sing_end_override = Some(3.25);
         lines[0].word_overrides[0] = Some(1.6);
         lines[0].word_end_overrides[1] = Some(3.0);
+        let mut bv = crate::lyrics::BackingVocal::new("echo");
+        bv.start = Some(2.0);
+        bv.end = Some(2.8);
+        bv.singer = Singer::Female;
+        lines[0].backing_vocal = Some(bv);
         lines[1].start = Some(4.0);
 
         let project = ProjectFile {
@@ -245,6 +258,7 @@ mod tests {
             background: Some(Background::Image(PathBuf::from("/tmp/cover.png"))),
             background_fit: BackgroundFit::Contain,
             background_dim: 0.4,
+            lyric_font_family: Some("Comic Sans MS".to_string()),
         };
 
         let dir = std::env::temp_dir().join(format!(
@@ -384,6 +398,7 @@ mod tests {
             background: None,
             background_fit: BackgroundFit::default(),
             background_dim: 0.0,
+            lyric_font_family: None,
         };
 
         write_autosave(&app_id, &project).unwrap();
