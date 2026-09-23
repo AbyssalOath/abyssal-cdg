@@ -327,7 +327,20 @@ jobs:
         # that CDN occasionally returns a transient 502/504 - retry a few
         # times with backoff before giving up, rather than failing the
         # whole release on a network blip.
+        #
+        # LD_LIBRARY_PATH: the AppImage format's linuxdeploy tool resolves
+        # each binary's NEEDED entries by searching LD_LIBRARY_PATH plus
+        # the system's normal library paths - it does NOT evaluate the
+        # $ORIGIN rpath already baked into ffmpeg (scripts/build-ffmpeg.sh),
+        # since that rpath only matters once the AppImage actually runs,
+        # not during linuxdeploy's own dependency-discovery pass. Without
+        # this, linuxdeploy can't find libopenh264.so - it lives in
+        # assets/ffmpeg/, not any path it searches by default - and fails
+        # with "ERROR: Could not find dependency: libopenh264.so", which is
+        # what happened on the first real CI run of this workflow. Harmless
+        # on the non-Linux platforms, which ignore LD_LIBRARY_PATH.
         run: |
+          export LD_LIBRARY_PATH="$PWD/assets/ffmpeg${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           for attempt in 1 2 3; do
             if cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }} --verbose; then
               exit 0

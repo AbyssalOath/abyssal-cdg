@@ -90,8 +90,17 @@ soname_suffix_override=""
 case "$OPENH264_OS" in
 	linux) soname_suffix_override="SHAREDLIBSUFFIXMAJORVER=so" ;;
 esac
+# USE_ASM=No: this copy of openh264 is never shipped or executed - only
+# linked against for headers/ABI (see the module docs in ffmpeg_path.rs) -
+# so its own codegen speed doesn't matter, only that it builds. Its NEON
+# AArch64 assembly failed to compile on the macOS arm64 GitHub Actions
+# runner's toolchain (multiple .o files silently missing, then `ar`
+# erroring that they don't exist - a known openh264/Apple Silicon
+# toolchain issue, see cisco/openh264#3353) on the first real CI run of
+# this script. Disabling asm entirely sidesteps that whole class of
+# toolchain fragility for every platform, at zero cost.
 # shellcheck disable=SC2086
-make -C "$work/openh264" OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" $soname_suffix_override -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+make -C "$work/openh264" OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" USE_ASM=No $soname_suffix_override -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 if [ "$OPENH264_OS" = "linux" ]; then
 	# The Makefile's own symlink chain assumes the majorver suffix and
 	# the plain suffix differ (`.so -> .so.MAJORVER -> .so.FULLVER`) -
@@ -101,7 +110,7 @@ if [ "$OPENH264_OS" = "linux" ]; then
 	ln -sf "$(basename "$real")" "$work/openh264/libopenh264.so"
 fi
 # shellcheck disable=SC2086
-make -C "$work/openh264" install OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" $soname_suffix_override PREFIX="$work/openh264-install"
+make -C "$work/openh264" install OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" USE_ASM=No $soname_suffix_override PREFIX="$work/openh264-install"
 if [ "$OPENH264_OS" = "darwin" ]; then
 	dylib="$(find "$work/openh264-install" -name 'libopenh264*.dylib' -not -name '*.dylib.dSYM' | head -n1)"
 	install_name_tool -id "@rpath/libopenh264.dylib" "$dylib"
