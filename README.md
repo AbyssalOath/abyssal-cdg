@@ -5,6 +5,11 @@ lyrics into a real karaoke `.cdg` file - the standard CD+Graphics format
 used by karaoke machines and "MP3+G" karaoke software.
 
 
+[![CI](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml/badge.svg)](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AbyssalOath/abyssal-cdg)](https://github.com/AbyssalOath/abyssal-cdg/releases/latest)
+![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
+![Rust: stable](https://img.shields.io/badge/rust-stable-blue)
+
 ## Demonstrations
 ![Usage Screenshot](assets/screenshots/usage.png)
 
