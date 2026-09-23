@@ -1,6 +1,6 @@
 [package]
 name = "abyssal-cdg"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 authors = ["LordSodomiser"]
 description = "Turns an audio file and pasted lyrics into a real karaoke .cdg file"
