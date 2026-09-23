@@ -408,6 +408,15 @@ deliberately - see "Auto-aligning word timing" above for why, and expect a
 real download the first time you use a given language. Two things to know
 before you install the base installer itself:
 
+- **Linux: the `.AppImage` won't run until you mark it executable.** Not
+  specific to this app - plain HTTP downloads (any browser, `curl`, `wget`,
+  ...) have no way to carry a file's Unix permission bits, so *every*
+  AppImage from *every* project needs this once, right after downloading:
+  ```bash
+  chmod +x Abyssal-CDG-Creator_*.AppImage
+  ```
+  The `.deb` doesn't need this - `dpkg`/your package manager sets the right
+  permissions on install.
 - **macOS: "Apple could not verify... is free of malware."** This app isn't
   currently signed with a paid Apple Developer ID or notarized by Apple (that
   program costs $99/year), so Gatekeeper shows this warning on first launch

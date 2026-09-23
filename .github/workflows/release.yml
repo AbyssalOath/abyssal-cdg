@@ -369,6 +369,19 @@ jobs:
           done
           for f in *.AppImage; do
             cp "$f" "../../../dist/Abyssal-CDG-Creator_${version}_${arch}.AppImage"
+            # Defensive, not a fix for the real problem: `cp` already
+            # preserves the executable bit `cargo packager`'s own AppImage
+            # output has, so this is a no-op in practice. The actual
+            # "why do I need to chmod +x this" friction happens at
+            # *download* time, not build time - plain HTTP (what every
+            # browser/curl/wget download over) has no concept of a Unix
+            # permission bit at all, so the downloaded copy always gets a
+            # fresh, non-executable local permission regardless of
+            # anything set here - universal AppImage behavior, not
+            # specific to this pipeline (see the README's install
+            # instructions for the one real fix: telling the user to run
+            # chmod +x after downloading).
+            chmod +x "../../../dist/Abyssal-CDG-Creator_${version}_${arch}.AppImage"
           done
           for f in *.deb; do
             cp "$f" "../../../dist/Abyssal-CDG-Creator_${version}_${arch}.deb"
