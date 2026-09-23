@@ -21,6 +21,15 @@ Desktop.ini
 .env
 .env.local
 
+# Bundled ML model weights (see model_assets.rs/vocals.rs), the ONNX
+# Runtime shared library (see onnxrt.rs), and the custom ffmpeg + openh264
+# build (see ffmpeg_path.rs) - fetched/built by the release workflow just
+# before packaging, not committed (large binaries with their own upstream
+# licensing, not source code).
+/assets/models/
+/assets/onnxruntime/
+/assets/ffmpeg/
+
 # Likely-accidental exports if you run/test from the repo root
 /*.cdg
 /*.mp4

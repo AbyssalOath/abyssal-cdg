@@ -27,15 +27,16 @@ an old Rust toolchain, not a bug in this project.
   like `too_many_arguments` on the video-frame drawing helpers, are known and accepted -
   no need to go fix unrelated ones as part of your change).
 - If you touched `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`, `formats.rs`,
-  `video.rs`, `timeline.rs`, `project.rs`, `recent.rs`, `waveform.rs`, `align.rs`'s
-  sync-map parsing, or `vocals.rs`'s output-resolution logic, add or update a unit
-  test alongside the change - these modules are pure logic with no GUI dependency,
-  so there's no excuse not to. `main.rs` (GUI wiring, including the timeline
-  widget's painting/interaction code and the undo/redo frame-diffing) has no
-  automated tests; changes there are verified by running the app. The actual
-  `ffmpeg`/`audio-separator`/`aeneas` subprocess invocations aren't exercised in the
-  test suite either, since they need the external tool installed - verify those
-  manually.
+  `video.rs`, `timeline.rs`, `project.rs`, `recent.rs`, `waveform.rs`, or
+  `stft.rs`/`mdx.rs`/`ctc.rs`/`align.rs`/`ffmpeg_path.rs`, add or update a unit test
+  alongside the change - these modules are pure logic with no GUI dependency, so
+  there's no excuse not to. `main.rs` (GUI wiring, including the timeline widget's
+  painting/interaction code and the undo/redo frame-diffing) has no automated tests;
+  changes there are verified by running the app. `ffmpeg`'s subprocess invocation, and
+  `mdx.rs`'s/`align.rs`'s actual ONNX inference against the real (not committed) model
+  files, aren't exercised in the default test suite either - each has an `#[ignore]`d
+  integration test against the real thing for exactly this: `real_model_smoke_test` in
+  `vocals.rs`/`align.rs`, `command_produces_a_working_ffmpeg` in `ffmpeg_path.rs`.
 - If your change affects `export.rs` (`.cdg`), `video.rs` (`.mp4`), `formats.rs`'s
   LRC/UltraStar export, the live preview, or the fine-tuning timeline in `main.rs`,
   make sure they still agree - see
@@ -47,6 +48,14 @@ an old Rust toolchain, not a bug in this project.
   through the same overlap validation where applicable.
 - Update [CHANGELOG.md](CHANGELOG.md) under `## [Unreleased]` (add that heading at the
   top if it doesn't exist yet).
+- If you added, removed, or updated a Cargo dependency, regenerate the crate license
+  list in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) (`cargo license
+  --avoid-dev-deps --avoid-build-deps`, see that file for the exact invocation) and
+  make sure nothing GPL/AGPL-only crept in - if it did, that's a real blocker, not just
+  a doc update, since this project only bundles permissively-licensed dependencies. If
+  you added a new *bundled binary/model* (not a Cargo dependency), add its own entry to
+  that file's "Bundled binaries and models" section instead, with its license and
+  source.
 
 ## Code style
 

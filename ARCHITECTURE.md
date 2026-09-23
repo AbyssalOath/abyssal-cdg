@@ -54,22 +54,56 @@ export.rs    The ".cdg renderer": lays out lines/words/countdown dots on the CDG
              events are merged into one time-sorted sequence before being emitted,
              since CdgWriter::advance_to is monotonic-only-forward.
 video.rs     The "video renderer": an independent RGB24 frame renderer (via
-             `ab_glyph` for anti-aliased text) piped into an `ffmpeg` subprocess,
-             driven by the *same* lyrics.rs timing as export.rs. A backing vocal
-             draws directly beneath the current line, smaller, with its own wipe,
-             matching the same relationship the `.cdg` export uses.
+             `ab_glyph` for anti-aliased text) piped into an `ffmpeg` subprocess
+             (this project's own bundled LGPL build, not a system install - see
+             ffmpeg_path.rs), driven by the *same* lyrics.rs timing as export.rs.
+             A backing vocal draws directly beneath the current line, smaller,
+             with its own wipe, matching the same relationship the `.cdg` export
+             uses.
+ffmpeg_path.rs  Locates the bundled ffmpeg binary and the openh264 shared
+             library its H.264 encoder needs (two different sourcing stories -
+             see the "Bundled binaries and models" section below), the same
+             bundled-resource-or-cache pattern model_assets.rs/onnxrt.rs use.
 timeline.rs  Pure time<->pixel mapping, zoom/drag bounds, and drag-mode
              classification for the fine-tuning timeline - no egui dependency, so
              it's unit-tested directly; main.rs owns the actual widget/painting/
              interaction glue built on top of it.
-vocals.rs    Shells out to the `audio-separator` CLI (a separate Python package,
-             not bundled) to produce an instrumental copy of the loaded audio, for
-             the "Export instrumental audio" button and the video export's "Remove
-             vocals" checkbox.
-align.rs     Shells out to `aeneas` (a separate Python package, not bundled) once
-             per already-timed line, restricted to that line's own tapped window,
-             to fill in real word-level timing via forced alignment - "🪄 Auto-align
-             words".
+vocals.rs    Runs the UVR-MDX-NET-Inst_HQ_3 separation model natively (via `ort`/
+             ONNX Runtime - see mdx.rs/stft.rs) to produce instrumental and vocals
+             stems from the loaded audio, for the "Instrumental audio"/"Vocals
+             audio" export checkboxes and the video export's "Remove vocals"
+             checkbox. Nothing to install separately - the model ships bundled
+             with the app (see model_assets.rs).
+mdx.rs       The MDX-Net separation algorithm itself: chunked overlap-add,
+             STFT->model->ISTFT per chunk, the vocals-by-subtraction formula - a
+             bit-faithful port of `audio-separator`'s reference implementation,
+             not a from-scratch reimplementation of "an" MDX-Net.
+stft.rs      Short-time Fourier transform matching PyTorch's `torch.stft`/
+             `torch.istft` conventions exactly (reflect-padding, windowed
+             overlap-add with NOLA normalization) - mdx.rs's building block.
+model_assets.rs  Locates a bundled ONNX model file next to the installed app
+             (falling back to a per-user cache directory, downloading into it if
+             needed - a dev-build convenience for the separation model, but
+             auto-align's language models always use this path, bundled release
+             or not - see align.rs).
+onnxrt.rs    Locates and loads the ONNX Runtime shared library itself (not a
+             model file) that both vocals.rs/mdx.rs and align.rs/ctc.rs need,
+             via `ort`'s `load-dynamic` feature - the same bundled-or-cached
+             resolution model_assets.rs uses for model files, generalized to a
+             library instead. Exists specifically because ONNX Runtime doesn't
+             publish a prebuilt binary for macOS x86_64 at all (see the release
+             workflow) - every platform goes through this one runtime-loading
+             path rather than 3 platforms doing build-time linking
+             (`download-binaries`) and macOS x86_64 alone doing something
+             different.
+align.rs     Runs a wav2vec2-CTC speech model natively (via `ort`, same as
+             vocals.rs) once per already-timed line, restricted to that line's own
+             tapped window, to fill in real word-level timing via forced alignment
+             - "🪄 Auto-align words". The model isn't bundled (each language is
+             ~1.2GB) - downloaded/cached via model_assets.rs on first use instead.
+ctc.rs       The CTC forced-alignment trellis algorithm and vocab/tokenization
+             logic behind align.rs - kept separate so it's unit-tested with
+             synthetic emission matrices, no ONNX model needed.
 ```
 
 ## Data flow
@@ -207,56 +241,115 @@ still in progress (so the caller knows to keep calling `ctx.request_repaint()`).
   `poll_waveform_job`) decodes the loaded audio into peaks on its own background
   thread whenever a new file is loaded (manually, via drag-and-drop, or via
   project load/recovery).
-- **Auto-align** (`start_word_alignment` / `AlignJob` / `poll_align_job`) runs
-  one `align::align_line` call per already-timed multi-word line, sequentially,
-  on a single background thread, updating progress after each line. A
-  whole-job-level failure (aeneas not installed) short-circuits before
-  attempting any line; a per-line failure doesn't stop the rest.
+- **Auto-align** (`start_word_alignment` / `AlignJob` / `poll_align_job`) loads
+  one `align::Aligner` (decodes the audio and loads the selected language's
+  model once) and calls `align_line` per already-timed multi-word line,
+  sequentially, on a single background thread, updating progress after each
+  line. A whole-job-level failure (model failed to load/download) short-circuits
+  before attempting any line; a per-line failure doesn't stop the rest.
 
 Audio playback itself runs on `rodio`'s own output thread; `AudioPlayer` only
 tracks a wall-clock position (`PlaybackClock`) on the main thread, deliberately
 decoupled from the audio device so it can be unit-tested without real hardware.
 
-## External subprocess dependencies
+## Bundled binaries and models (no external subprocess dependencies left)
 
-Three features shell out to a separate command-line tool that must already be
-installed and on `PATH` - none is a build-time dependency, and none is bundled
-with the app:
+Every feature that used to require a separate command-line install now runs
+against something this project builds or fetches itself:
 
-- **`ffmpeg`** (`video.rs::check_ffmpeg_available`) - required for `.mp4` video export.
-  Frames are piped to it over stdin as raw RGB24, muxed with the loaded audio file.
-- **`audio-separator`** (`vocals.rs::check_audio_separator_available`) - required for
-  vocal removal. It's a Python package (see the README's "Removing vocals" section);
-  this app only ever invokes its CLI with a fixed argument list (never through a shell -
-  see `SECURITY.md`) and reads back the resulting file from a throwaway temp directory
-  it cleans up afterward.
-- **`aeneas`** (`align.rs::check_aligner_available`) - required for "Auto-align
-  words" (see the README's "Auto-aligning word timing" section, including an
-  early accuracy caveat against full music mixes). Invoked as a Python module
-  (`python3 -m aeneas.tools.execute_task`), once per already-timed line, each
-  call writing a small temp text file and reading back a JSON sync map from its
-  own throwaway temp directory.
+- **`ffmpeg`** (`video.rs`/`vocals.rs`, located via `ffmpeg_path.rs`) - required
+  for `.mp4` video export (frames piped to it over stdin as raw RGB24, muxed
+  with the loaded audio file) and for a non-`.wav` stem (`.mp3`) in vocal
+  removal. No longer a system-installed dependency in a packaged build: this
+  project compiles its own `ffmpeg` from source (`scripts/build-ffmpeg.sh`,
+  run by the release workflow), `--disable-gpl` (LGPL v2.1-or-later only, no
+  x264/x265), with H.264 via [openh264](https://github.com/cisco/openh264)
+  (BSD) and MP3 via [LAME](https://lame.sourceforge.io) (LGPL; MP3's patents
+  expired in 2017, so no separate patent question there, unlike H.264). A
+  `cargo run` dev build without one bundled falls back to a system-installed
+  `ffmpeg` on PATH - the only one of this project's bundled binaries that
+  falls back to a system copy rather than downloading/erroring, since a
+  system `ffmpeg` almost certainly already has its own H.264 encoder.
+- **`libopenh264`** (also via `ffmpeg_path.rs`) - the shared library this
+  app's `ffmpeg` build loads for H.264 encoding, and deliberately *not* a
+  copy this project compiles itself: Cisco's patent-royalty coverage for
+  OpenH264 (the reason it avoids H.264's usual per-encoder patent licensing
+  cost) applies only to *Cisco's own* separately-distributed binary -
+  confirmed directly against openh264's own `BINARY_LICENSE.txt`, not
+  assumed. So `ffmpeg` links against openh264's headers/ABI at build time
+  (a copy `scripts/build-ffmpeg.sh` compiles and discards, never
+  distributed), but the actual bundled/downloaded runtime library is
+  Cisco's official binary for that exact version - the same approach
+  Firefox/Chromium use for the same reason. Getting the two builds' ABI to
+  actually agree took real, verified work: openh264's own build bakes a
+  *versioned* library name into what it produces (e.g. `libopenh264.so.8`,
+  or an absolute `/build/path/libopenh264.8.dylib` on macOS) which won't
+  match a generically-named downloaded file, so `scripts/build-ffmpeg.sh`
+  overrides that to a simple, fixed name (verified on Linux with `readelf`
+  and a full build+link+run+encode test against Cisco's real binary
+  swapped in; macOS uses `install_name_tool` to the same end, unverified
+  outside this project's own CI - see the script's comments).
+- **Vocal removal** (`vocals.rs`/`mdx.rs`) and **auto-align**
+  (`align.rs`/`ctc.rs`) used to shell out to the `audio-separator` Python CLI
+  and `aeneas` (which itself needed eSpeak/eSpeak-NG and `ffmpeg`)
+  respectively. Both now run their model natively via `ort` (ONNX Runtime
+  bindings) - no subprocess, no separate install. The difference between
+  them is bundling: vocal removal's ~65MB model ships inside every
+  installer (see `model_assets.rs`); auto-align's models are ~1.2GB *each*,
+  one per language, so only the language actually selected downloads, on
+  first use, into a local cache.
+- **The ONNX Runtime shared library itself** (`onnxrt.rs`) - a separate
+  concern from either ML model file, needed by both of the features above.
+  Loaded via `ort`'s `load-dynamic` feature rather than linked in at build
+  time (`download-binaries`), specifically because ONNX Runtime publishes no
+  prebuilt binary at all for one of this app's four release targets (macOS
+  x86_64 - dropped upstream between versions 1.23 and 1.25). Rather than
+  build that one target from source while the other three link a downloaded
+  binary in normally, all four use the same runtime-loading path: a shared
+  library bundled next to the installed app (built from source by the
+  release workflow for macOS x86_64, downloaded from ONNX Runtime's own
+  releases for the other three), or, in a dev build, the same per-user cache
+  directory the ML model weights fall back to.
 
-All three checks follow the same shape: try running the tool with a harmless flag
-(or, for `aeneas`, a plain `import`), and if that fails, return a clear, actionable
-error (what to install and how) rather than a raw "command not found" or a silent
-failure later.
+None of `ffmpeg`, `libopenh264`, either ONNX model, or the ONNX Runtime
+library itself is a build-time dependency (`cargo build`/`cargo test` need
+none of them) - all are only checked/fetched/loaded at runtime, right before
+the feature that needs them actually runs, the same shape throughout: try
+loading/locating what's needed, and if that fails, return a clear, actionable
+error rather than a raw failure or a silent one later. This is also why
+`cargo build`/`cargo test` make no network requests at all anymore - the
+prior `ort` `download-binaries` approach did, on every build.
 
 ## Testing strategy
 
 `cdg.rs`, `font.rs`, `lyrics.rs`, `formats.rs`, `export.rs`, `video.rs`, `timeline.rs`,
-`project.rs`, `recent.rs`, `waveform.rs`, and `align.rs` have no GUI dependency and are
-unit-tested directly (`cargo test`, no display or audio device required). `audio.rs`'s
-`PlaybackClock` (the play/pause/resume/seek math) is tested the same way, decoupled
-from the real `rodio`/`symphonia` calls it wraps. `vocals.rs`'s output-file-resolution
-logic (`find_output_file`) and `align.rs`'s sync-map parsing (`parse_sync_map`,
-including the head-offset self-correction heuristic) are tested directly against
-fixture data; the actual `audio-separator`/`aeneas`/`ffmpeg` subprocess invocations are
-not exercised in the test suite since they need the external tool installed - all
-three are meant to be verified manually. `project.rs`/`recent.rs`'s tests use their own
-throwaway app id/temp directories so they never touch a real run's actual autosave or
-recent-files slot. `waveform.rs`'s actual audio decoding isn't exercised either (same
-reasoning - it needs a real file), just the pure peak-lookup math. `main.rs` (GUI
-wiring, including the timeline widget's painting/interaction code and the undo/redo
-frame-diffing built on top of the modules above) has no automated tests - it's a thin
-layer that calls into the tested modules above, verified manually by running the app.
+`project.rs`, `recent.rs`, `waveform.rs`, `align.rs`, `ctc.rs`, `stft.rs`, `mdx.rs`, and
+`ffmpeg_path.rs` have no GUI dependency and are unit-tested directly (`cargo test`, no
+display or audio device required). `audio.rs`'s `PlaybackClock` (the play/pause/resume/seek math) is
+tested the same way, decoupled from the real `rodio`/`symphonia` calls it wraps.
+`stft.rs`'s forward/inverse transform is verified by round-trip reconstruction tests
+(`ISTFT(STFT(x)) ≈ x`, within floating-point tolerance) against both a sine wave and
+pseudo-random noise, at MDX-Net's actual `n_fft`/`hop_length` - this is what gives
+confidence the reflect-padding/windowing/NOLA-normalization convention actually matches
+PyTorch's, not just that it compiles. `mdx.rs`'s chunk/pad/trim size constants are
+checked directly against the values verified against the model's own data (see
+`vocals.rs`'s module docs for how). `ctc.rs`'s forced-alignment trellis/backtrack is
+verified against hand-computable synthetic emission matrices with an unambiguous correct
+answer (not just "it runs") - this is what caught a real tie-breaking bug during
+development (the backtrack initially preferred the wrong side of a near-tie, silently
+shifting every word boundary later than it should be). `align.rs`'s bundled vocab files
+are checked for internal consistency (every language parses, has a distinct blank and
+word-delimiter token). Neither `ffmpeg`'s subprocess invocation nor either ML feature's
+actual ONNX inference (which needs the real, multi-tens-of-MB to multi-GB model files,
+not committed to the repo - see `model_assets.rs`) is exercised in the default test
+suite - all are meant to be verified manually (`align.rs` and `vocals.rs` each have an
+`#[ignore]`d real-model integration test for this, `real_model_smoke_test`, and
+`ffmpeg_path.rs` has an equivalent one against a real bundled/cached ffmpeg,
+`command_produces_a_working_ffmpeg` - see each test's own doc comment for how to run it).
+`project.rs`/`recent.rs`'s tests use their own throwaway app id/temp directories so they
+never touch a real run's actual autosave or recent-files slot. `waveform.rs`'s actual
+audio decoding isn't exercised either (same reasoning - it needs a real file), just the
+pure peak-lookup math. `main.rs` (GUI wiring, including the timeline widget's
+painting/interaction code and the undo/redo frame-diffing built on top of the modules
+above) has no automated tests - it's a thin layer that calls into the tested modules
+above, verified manually by running the app.

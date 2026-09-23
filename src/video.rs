@@ -16,8 +16,9 @@
 //! for text (embedded DejaVu Sans / DejaVu Sans Bold - see `assets/`,
 //! bundled under the permissive Bitstream Vera license), then pipe frames
 //! into an `ffmpeg` subprocess via stdin, muxed with the loaded audio file.
-//! This requires `ffmpeg` to be installed and on the PATH; we check for it
-//! up front and return a clear error with install instructions if missing.
+//! `ffmpeg` itself is bundled with the app rather than required on the
+//! system PATH - see `ffmpeg_path.rs` for how it's located (and why the
+//! H.264 encoder it uses, openh264, is resolved separately).
 
 #[cfg(test)]
 use crate::lyrics::MAX_BLOCK_LINES;
@@ -30,7 +31,7 @@ use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 static DEJAVU_REGULAR: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 static DEJAVU_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
@@ -654,24 +655,11 @@ fn render_frame(
     }
 }
 
-/// Confirms `ffmpeg` is installed and callable, with a clear, actionable
-/// error message if not (video export needs it; the `.cdg` path doesn't).
+/// Confirms `ffmpeg` is available, with a clear, actionable error message
+/// if not (video export needs it; the `.cdg` path doesn't). See
+/// `ffmpeg_path.rs` for how it's located.
 pub fn check_ffmpeg_available() -> Result<()> {
-    let result = Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        _ => bail!(
-            "ffmpeg isn't installed (or isn't on your PATH). Video export needs it to encode \
-             the MP4. Install it and try again:\n\
-             - Windows: download from https://ffmpeg.org/download.html and add it to PATH\n\
-             - macOS: brew install ffmpeg\n\
-             - Linux: sudo apt install ffmpeg (or your distro's equivalent)"
-        ),
-    }
+    crate::ffmpeg_path::check_available()
 }
 
 /// An `ffmpeg` `-vf` filter chain that fits a `w`x`h` frame according to
@@ -752,7 +740,7 @@ fn spawn_background_video_decoder(
     fit: BackgroundFit,
     pad_color: Rgb8,
 ) -> Result<std::process::Child> {
-    Command::new("ffmpeg")
+    crate::ffmpeg_path::command()?
         .args(["-stream_loop", "-1", "-i"])
         .arg(path)
         .args([
@@ -786,7 +774,7 @@ pub fn extract_video_background_thumbnail(
     pad_color: Rgb8,
 ) -> Result<Vec<u8>> {
     check_ffmpeg_available()?;
-    let output = Command::new("ffmpeg")
+    let output = crate::ffmpeg_path::command()?
         .args(["-y", "-i"])
         .arg(path)
         .args([
@@ -926,7 +914,22 @@ pub fn render_video(
         }
     };
 
-    let mut child = Command::new("ffmpeg")
+    // openh264 (this app's bundled H.264 encoder - see ffmpeg_path.rs for
+    // why it's openh264 rather than the GPL-licensed x264 most ffmpeg
+    // builds default to) is a simpler, bitrate-driven encoder without
+    // x264's CRF-style "target a perceptual quality" mode, and its
+    // rate-distortion optimization is genuinely weaker than x264's at the
+    // same bitrate - so this targets a generously high bitrate to
+    // compensate, rather than trying to replicate a CRF setting that
+    // openh264 has no real equivalent for. Karaoke video content (mostly
+    // static text over a slow-moving or still background) compresses well
+    // in practice, so this is comfortably more headroom than the content
+    // actually needs.
+    let video_bitrate = match (w, h) {
+        _ if w * h > 1920 * 1080 => "32M", // 4K
+        _ => "10M",                        // 1080p (or anything smaller)
+    };
+    let mut child = crate::ffmpeg_path::command()?
         .args([
             "-y",
             "-f",
@@ -948,11 +951,11 @@ pub fn render_video(
             "-map",
             "1:a",
             "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
+            "libopenh264",
+            "-b:v",
+            video_bitrate,
+            "-profile:v",
+            "high",
             "-pix_fmt",
             "yuv420p",
             "-c:a",

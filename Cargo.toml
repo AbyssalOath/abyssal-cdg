@@ -31,6 +31,48 @@ image = "0.25"
 # has GTK3 installed (already a hard dependency here via `rfd`).
 font-kit = "0.14"
 
+# ONNX Runtime bindings, for native (no Python/audio-separator/aeneas) ML
+# inference - vocal separation (`vocals.rs`/`mdx.rs`) and forced alignment
+# (`align.rs`/`ctc.rs`). `load-dynamic` loads the actual ONNX Runtime
+# shared library (.dll/.so/.dylib) at *runtime* from a path this app
+# resolves itself (see `onnxrt.rs`), rather than linking against one
+# fetched at build time (`download-binaries`) - deliberately, since
+# ONNX Runtime's own prebuilt binaries don't cover macOS x86_64 (dropped
+# between 1.23 and 1.25), so that one target needs a from-source build
+# (see the release workflow) bundled the same way as the other three,
+# with the exact same runtime-loading code path for all four rather than
+# a special case just for Intel Mac.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
+# `ort`'s own "ndarray" feature pulls in `ndarray` with its `std` feature
+# off (feature-unification quirk), which fails to build - depending on it
+# directly here with default features forces `std` back on.
+ndarray = "0.17"
+# Real-input FFT, for the MDX-Net STFT/ISTFT (see stft.rs) - built on
+# `rustfft`, which does the actual FFT math.
+realfft = "3.5"
+# Writes the separated stems to plain WAV - pure Rust, no licensing
+# questions. MP3 output for this feature still shells out to `ffmpeg`
+# (like the video export already does) until that's addressed wholesale.
+hound = "3.5"
+# High-quality resampling to the model's fixed 44.1kHz input rate, for
+# input audio loaded at a different native sample rate.
+rubato = "5.0"
+# HTTP client for the model-download path (see model_assets.rs) -
+# bundled/dev-build-fallback for vocal removal's model, the normal path
+# for auto-align's per-language models.
+ureq = "3.4"
+# Locates the per-user cache directory for the same fallback path.
+dirs = "6.0"
+# NFC normalization for forced-alignment tokenization (ctc.rs) - Korean's
+# syllable-block vocab only matches precomposed text, so input lyric text
+# is normalized before being matched against a language's vocab.
+unicode-normalization = "0.1"
+# Pure-Rust bzip2 *decompression* (no compression needed) - Cisco
+# distributes its official openh264 binaries as .bz2 (see ffmpeg_path.rs
+# for why this app downloads that specific binary rather than bundling a
+# self-compiled one).
+bzip2-rs = "0.1"
+
 # Only does anything when targeting Windows (see build.rs) - embeds the app
 # icon into the compiled .exe itself, since `cargo packager` only sets the
 # *installer's* icon (see the `icons` key below), not the exe's own PE
@@ -60,6 +102,15 @@ category = "Music"
 # over the PNG for the installer/shortcut icon on Windows, while macOS/
 # Linux packaging keeps using the PNG above.
 icons = ["assets/icons/abyssal-cdg-icon.ico", "assets/icons/abyssal-cdg-icon@2x.png"]
+
+# Bundles the vocal-separation ONNX model, the ONNX Runtime shared
+# library, and a custom-built ffmpeg (+ the openh264 library it loads for
+# H.264 encoding) into every installer, so every ML/video/audio feature
+# works with nothing to install separately (see
+# model_assets.rs/onnxrt.rs/ffmpeg_path.rs) - none of these are checked
+# into git (large binaries), all fetched/built into these paths by the
+# release workflow just before packaging.
+resources = ["assets/models", "assets/onnxruntime", "assets/ffmpeg"]
 
 # eframe (winit/glow) needs an X11 or Wayland stack plus xkbcommon, GTK3 is
 # needed for the native "load audio file" dialog (`rfd`), ALSA is needed for

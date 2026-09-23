@@ -8,13 +8,19 @@
 mod align;
 mod audio;
 mod cdg;
+mod ctc;
 mod export;
+mod ffmpeg_path;
 mod font;
 mod fonts;
 mod formats;
 mod lyrics;
+mod mdx;
+mod model_assets;
+mod onnxrt;
 mod project;
 mod recent;
+mod stft;
 mod timeline;
 mod video;
 mod vocals;
@@ -353,8 +359,8 @@ struct KaraokeApp {
     font_picker_open: bool,
     font_search: String,
     /// Whether a video export should mux in a vocals-reduced copy of the
-    /// audio (via [`vocals::remove_vocals_to_file`]) instead of the
-    /// original.
+    /// audio (via [`vocals::load_separator`]/[`vocals::separate`]) instead
+    /// of the original.
     remove_vocals_for_video: bool,
     /// Whether the "Export…" options window is open.
     show_export_dialog: bool,
@@ -363,6 +369,11 @@ struct KaraokeApp {
     export_ultrastar: bool,
     export_video: bool,
     export_instrumental: bool,
+    /// Vocals-only stem, from the same separation pass as
+    /// `export_instrumental` when both are requested together (see
+    /// `start_combined_export`) - never a second, independently expensive
+    /// model run.
+    export_vocals: bool,
     /// Whether an LRC export writes LRC2 word-level tags (from
     /// [`lyrics::word_timings`]) or plain line-level LRC1 - word-level is
     /// more precise but some older/simpler LRC readers only handle LRC1.
@@ -391,9 +402,9 @@ struct KaraokeApp {
     /// for the most recently loaded audio file.
     waveform_job: Option<WaveformJob>,
 
-    /// Language code passed to aeneas for auto-align (see `align.rs`) -
-    /// defaults to English since the app has no other language-awareness.
-    align_language: String,
+    /// Language model used for auto-align (see `align.rs`) - defaults to
+    /// English since the app has no other language-awareness.
+    align_language: align::AlignLanguage,
     /// Set while a background "Auto-align words" run is in progress.
     align_job: Option<AlignJob>,
 
@@ -509,8 +520,8 @@ const ALL_COLOR_PRESETS: [ColorPreset; 5] = [
 ];
 
 /// One output's result from a combined export - a combined export can
-/// partially succeed (e.g. ffmpeg missing but audio-separator present), so
-/// each requested output is tracked and reported independently.
+/// partially succeed (e.g. ffmpeg missing but vocal separation working
+/// fine), so each requested output is tracked and reported independently.
 struct ExportOutcome {
     label: &'static str,
     result: Result<PathBuf, String>,
@@ -572,22 +583,6 @@ struct FontListJob {
     result: FontListResult,
 }
 
-/// Common language presets for the auto-align language picker - aeneas
-/// (via eSpeak/eSpeak NG) supports many more than this by code alone; this
-/// is just a convenient shortlist, not an exhaustive/validated list. The
-/// text field next to it accepts any code directly.
-const ALIGN_LANGUAGES: [(&str, &str); 9] = [
-    ("eng", "English"),
-    ("spa", "Spanish"),
-    ("fra", "French"),
-    ("deu", "German"),
-    ("ita", "Italian"),
-    ("por", "Portuguese"),
-    ("jpn", "Japanese"),
-    ("kor", "Korean"),
-    ("cmn", "Mandarin"),
-];
-
 /// One already-timed line's forced-alignment result, as reported back from
 /// the background thread [`KaraokeApp::start_word_alignment`] spawns - see
 /// [`AlignJob`].
@@ -597,9 +592,10 @@ struct AlignOutcome {
 }
 
 /// A whole-job-level `Err` for something that stopped an auto-align run
-/// before it could even attempt any line (aeneas not installed, no audio
-/// loaded), or `Ok` with one [`AlignOutcome`] per line it tried (which can
-/// still individually fail without taking down the rest of the run).
+/// before it could even attempt any line (the alignment model failed to
+/// load/download, no audio loaded), or `Ok` with one [`AlignOutcome`] per
+/// line it tried (which can still individually fail without taking down
+/// the rest of the run).
 type AlignJobResult = Result<Vec<AlignOutcome>, String>;
 
 /// Shared state for a background "auto-align words" run - see
@@ -680,6 +676,7 @@ impl KaraokeApp {
             export_ultrastar: false,
             export_video: false,
             export_instrumental: false,
+            export_vocals: false,
             lrc_enhanced_words: true,
             export_folder: None,
             export_base_name: String::new(),
@@ -689,7 +686,7 @@ impl KaraokeApp {
             timeline_drag: None,
             waveform: None,
             waveform_job: None,
-            align_language: "eng".to_string(),
+            align_language: align::AlignLanguage::Eng,
             align_job: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -1575,8 +1572,7 @@ impl KaraokeApp {
             return;
         }
 
-        let language = self.align_language.trim();
-        let language = if language.is_empty() { "eng" } else { language }.to_string();
+        let language = self.align_language;
         let total = requests.len();
 
         let progress = Arc::new(AtomicU32::new(0));
@@ -1585,23 +1581,27 @@ impl KaraokeApp {
         let result_clone = result.clone();
 
         self.status = format!(
-            "Auto-aligning {total} line(s)… this shells out to aeneas once per line and can \
-             take a while."
+            "Auto-aligning {total} line(s)… loading the {} alignment model (downloading it the \
+             first time) and can take a while.",
+            language.label()
         );
         self.align_job = Some(AlignJob { progress, result });
 
         std::thread::spawn(move || {
-            if let Err(e) = align::check_aligner_available() {
-                *result_clone.lock().unwrap() = Some(Err(e.to_string()));
-                return;
-            }
+            let mut aligner = match align::Aligner::load(&audio_path, language) {
+                Ok(a) => a,
+                Err(e) => {
+                    *result_clone.lock().unwrap() = Some(Err(e.to_string()));
+                    return;
+                }
+            };
             let mut outcomes = Vec::with_capacity(total);
             for (i, (line_idx, words, window_start, window_end)) in requests.into_iter().enumerate()
             {
                 let word_refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
-                let outcome =
-                    align::align_line(&audio_path, &word_refs, window_start, window_end, &language)
-                        .map_err(|e| e.to_string());
+                let outcome = aligner
+                    .align_line(&word_refs, window_start, window_end)
+                    .map_err(|e| e.to_string());
                 outcomes.push(AlignOutcome {
                     line_idx,
                     result: outcome,
@@ -2309,11 +2309,12 @@ impl KaraokeApp {
                 });
 
                 ui.checkbox(&mut self.export_instrumental, "Instrumental audio");
-                ui.add_enabled_ui(self.export_instrumental, |ui| {
-                    ui.indent("instrumental_opts", |ui| {
+                ui.checkbox(&mut self.export_vocals, "Vocals audio");
+                ui.add_enabled_ui(self.export_instrumental || self.export_vocals, |ui| {
+                    ui.indent("stem_opts", |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Format:");
-                            egui::ComboBox::from_id_source("export_instrumental_format")
+                            egui::ComboBox::from_id_source("export_stem_format")
                                 .selected_text(self.instrumental_format.label())
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
@@ -2331,13 +2332,13 @@ impl KaraokeApp {
                     });
                 });
 
-                if self.export_video || self.export_instrumental {
+                if self.export_video || self.export_instrumental || self.export_vocals {
                     ui.label(
                         egui::RichText::new(
-                            "Vocal removal runs a real ML separation model (UVR-MDX-NET, via \
-                             the audio-separator command-line tool) - needs audio-separator \
-                             installed separately (pip install audio-separator) and can take \
-                             a while, especially without a GPU.",
+                            "Vocal removal runs a real ML separation model (UVR-MDX-NET) \
+                             entirely in-app, on-device - nothing to install separately. It \
+                             can still take a while, especially on a machine without a lot of \
+                             CPU headroom.",
                         )
                         .small()
                         .weak(),
@@ -2404,7 +2405,8 @@ impl KaraokeApp {
                     || self.export_lrc
                     || self.export_ultrastar
                     || self.export_video
-                    || self.export_instrumental)
+                    || self.export_instrumental
+                    || self.export_vocals)
                     && self.export_folder.is_some()
                     && !self.export_base_name.trim().is_empty()
                     && missing_timing.is_none();
@@ -2438,7 +2440,8 @@ impl KaraokeApp {
         let do_ultrastar = self.export_ultrastar;
         let do_video = self.export_video;
         let do_instrumental = self.export_instrumental;
-        if !do_cdg && !do_lrc && !do_ultrastar && !do_video && !do_instrumental {
+        let do_vocals = self.export_vocals;
+        if !do_cdg && !do_lrc && !do_ultrastar && !do_video && !do_instrumental && !do_vocals {
             self.status = "Choose at least one output to export.".to_string();
             return;
         }
@@ -2454,9 +2457,9 @@ impl KaraokeApp {
             .as_ref()
             .and_then(|a| a.path())
             .map(|p| p.to_path_buf());
-        if (do_video || do_instrumental) && audio_path.is_none() {
+        if (do_video || do_instrumental || do_vocals) && audio_path.is_none() {
             self.status =
-                "Load an audio file first - video/instrumental export need it.".to_string();
+                "Load an audio file first - video/instrumental/vocals export need it.".to_string();
             return;
         }
 
@@ -2479,6 +2482,7 @@ impl KaraokeApp {
         let ultrastar_path = folder.join(format!("{base}.txt"));
         let video_path = folder.join(format!("{base}.mp4"));
         let instrumental_path = folder.join(format!("{base}-instrumental.{instrumental_ext}"));
+        let vocals_path = folder.join(format!("{base}-vocals.{instrumental_ext}"));
 
         let progress = Arc::new(AtomicU32::new(0));
         let result: Arc<Mutex<Option<Vec<ExportOutcome>>>> = Arc::new(Mutex::new(None));
@@ -2500,7 +2504,8 @@ impl KaraokeApp {
                 + do_lrc as u32
                 + do_ultrastar as u32
                 + do_video as u32
-                + do_instrumental as u32;
+                + do_instrumental as u32
+                + do_vocals as u32;
             let phase_count = phase_count.max(1);
             let mut phase_index = 0u32;
             let set_progress = move |idx: u32, frac_within: f32| {
@@ -2600,25 +2605,57 @@ impl KaraokeApp {
                 }
             }
 
-            // Vocal separation is shared: if both the instrumental export
-            // and the video's "remove vocals" are requested, run the
-            // (slow) separation model once and reuse it for both, instead
-            // of separating the same song twice.
-            let mut shared_instrumental: Option<PathBuf> = None;
+            // Vocal separation is shared: if the instrumental export, the
+            // vocals export, and/or the video's "remove vocals" are all
+            // requested together, run the (slow) separation model exactly
+            // once - both stems come out of that single pass (see
+            // `vocals.rs`), so there's never a reason to separate the same
+            // song twice, no matter how many of these are picked.
+            let need_separation = do_instrumental || do_vocals || remove_vocals_for_video;
+            let shared_separation: Option<Result<vocals::Separation, String>> = if need_separation {
+                audio_path.as_ref().map(|audio_path| {
+                    vocals::load_separator()
+                        .and_then(|mut sep| vocals::separate(&mut sep, audio_path, |_| {}))
+                        .map_err(|e| e.to_string())
+                })
+            } else {
+                None
+            };
 
             if do_instrumental {
-                if let Some(audio_path) = &audio_path {
-                    let r = vocals::remove_vocals_to_file(audio_path, &instrumental_path);
-                    if r.is_ok() {
-                        shared_instrumental = Some(instrumental_path.clone());
+                let r = match &shared_separation {
+                    Some(Ok(sep)) => vocals::write_stem_to_file(
+                        &sep.instrumental,
+                        sep.sample_rate,
+                        &instrumental_path,
+                    )
+                    .map(|()| instrumental_path.clone())
+                    .map_err(|e| e.to_string()),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Err("no audio loaded".to_string()),
+                };
+                outcomes.push(ExportOutcome {
+                    label: "Instrumental audio",
+                    result: r,
+                });
+                phase_index += 1;
+                set_progress(phase_index, 0.0);
+            }
+
+            if do_vocals {
+                let r = match &shared_separation {
+                    Some(Ok(sep)) => {
+                        vocals::write_stem_to_file(&sep.vocals, sep.sample_rate, &vocals_path)
+                            .map(|()| vocals_path.clone())
+                            .map_err(|e| e.to_string())
                     }
-                    outcomes.push(ExportOutcome {
-                        label: "Instrumental audio",
-                        result: r
-                            .map(|()| instrumental_path.clone())
-                            .map_err(|e| e.to_string()),
-                    });
-                }
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Err("no audio loaded".to_string()),
+                };
+                outcomes.push(ExportOutcome {
+                    label: "Vocals audio",
+                    result: r,
+                });
                 phase_index += 1;
                 set_progress(phase_index, 0.0);
             }
@@ -2631,18 +2668,24 @@ impl KaraokeApp {
 
                     let mut own_temp: Option<PathBuf> = None;
                     let render_audio_path: PathBuf = if remove_vocals_for_video {
-                        if let Some(shared) = &shared_instrumental {
-                            shared.clone()
-                        } else {
-                            let tmp = std::env::temp_dir().join(format!(
-                                "abyssal-cdg-instrumental-{}.wav",
-                                std::process::id()
-                            ));
-                            vocals::remove_vocals_to_file(audio_path, &tmp)
+                        let tmp = std::env::temp_dir().join(format!(
+                            "abyssal-cdg-instrumental-{}.wav",
+                            std::process::id()
+                        ));
+                        match &shared_separation {
+                            Some(Ok(sep)) => {
+                                vocals::write_stem_to_file(
+                                    &sep.instrumental,
+                                    sep.sample_rate,
+                                    &tmp,
+                                )
                                 .map_err(|e| format!("Vocal removal failed: {e}"))?;
-                            own_temp = Some(tmp.clone());
-                            tmp
+                            }
+                            Some(Err(e)) => return Err(format!("Vocal removal failed: {e}")),
+                            None => return Err("Vocal removal failed: no audio loaded".to_string()),
                         }
+                        own_temp = Some(tmp.clone());
+                        tmp
                     } else {
                         audio_path.clone()
                     };
@@ -3934,13 +3977,17 @@ impl eframe::App for KaraokeApp {
                     }
                     ui.label("Language:");
                     egui::ComboBox::from_id_source("align_language")
-                        .selected_text(self.align_language.clone())
+                        .selected_text(format!(
+                            "{} ({})",
+                            self.align_language.label(),
+                            self.align_language.code()
+                        ))
                         .show_ui(ui, |ui| {
-                            for (code, label) in ALIGN_LANGUAGES {
+                            for lang in align::AlignLanguage::ALL {
                                 ui.selectable_value(
                                     &mut self.align_language,
-                                    code.to_string(),
-                                    format!("{label} ({code})"),
+                                    lang,
+                                    format!("{} ({})", lang.label(), lang.code()),
                                 );
                             }
                         });
@@ -3951,12 +3998,13 @@ impl eframe::App for KaraokeApp {
             });
             ui.label(
                 egui::RichText::new(
-                    "Auto-align uses forced alignment (aeneas, run once per already-timed \
-                     line) to fill in every word's timing automatically, replacing any \
-                     existing word timing (estimated or manually tapped) for lines it \
-                     successfully aligns. Needs aeneas installed separately \
-                     (pip install aeneas - see the README). Undo (Ctrl+Z) if a result \
-                     doesn't look right.",
+                    "Auto-align uses a real speech-recognition model (run once per \
+                     already-timed line) to fill in every word's timing automatically, \
+                     replacing any existing word timing (estimated or manually tapped) for \
+                     lines it successfully aligns. Nothing to install separately - the \
+                     selected language's model downloads automatically the first time you \
+                     use it (a one-time, roughly 1.2GB download, then cached). Undo (Ctrl+Z) \
+                     if a result doesn't look right.",
                 )
                 .small()
                 .weak(),

@@ -59,12 +59,14 @@ This covers CDG packet encoding/timing, word-timing math (including per-word sta
 overrides), the countdown-window and sung-line-blanking logic, timecode format/parse
 and start/end overlap validation, duet/screaming color resolution, lyric-file
 import/export (LRC, UltraStar, KOK), video block-splitting, the fine-tuning timeline's
-zoom/drag math, `vocals.rs`'s output-file-resolution logic, `align.rs`'s forced-
-alignment output parsing, project save/load and the crash-recovery autosave, the
-recent-files list, and the playback clock's play/pause/resume/seek state machine -
-all without needing real audio hardware, a display, or `ffmpeg`/`audio-separator`/
-`aeneas` installed (those three are only needed to actually *run* video export/vocal
-removal/auto-align, not to build or test the project).
+zoom/drag math, the vocal-separation STFT/ISTFT round-trip math (`stft.rs`) and its
+chunking constants (`mdx.rs`), the CTC forced-alignment trellis and bundled-vocab
+sanity checks (`ctc.rs`/`align.rs`), project save/load and the crash-recovery
+autosave, the recent-files list, and the playback clock's play/pause/resume/seek
+state machine - all without needing real audio hardware, a display, or `ffmpeg`
+installed, and without needing the actual (not committed to the repo) ffmpeg binary,
+openh264 library, or ONNX model files either (those are only needed to actually *run*
+video export/auto-align/vocal removal, not to build or test the project).
 
 If `cargo build`/`cargo test` fails with a *different* error than the one above, please
 open an issue with the exact output, your `rustc --version`, and your OS.

@@ -9,6 +9,12 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Added
 
+- **THIRD_PARTY_LICENSES.md**: full attribution and license details for every bundled
+  binary/model (ffmpeg, openh264, LAME, ONNX Runtime, the vocal-separation and
+  auto-align models) plus a generated license report for the entire Rust dependency
+  tree - confirmed no GPL/AGPL-only dependency anywhere in it. See the README's new
+  "How this app stays self-contained" section for the bundled-vs-downloaded summary
+  this closes out.
 - **Backing/echo vocals**: a line can have a second vocalist's phrase
   attached to it (the "Echo" button in the timing table) that overlaps
   part of it while it's still being sung - typically the last word or
@@ -89,13 +95,16 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
   (a line that's *entirely* wrapped in square brackets) have them dropped
   automatically, the same as a blank line - so copy-pasting straight from a lyrics
   site doesn't turn each section header into an extra line you'd have to time.
-- **Automatic word-level timing via forced alignment**: "🪄 Auto-align words" shells
-  out to `aeneas` (a separate, non-bundled Python package) once per already-timed
-  line, restricted to that line's own tapped window, to fill in real word-level
-  timing for every word - instead of tapping each one by hand. Runs on a background
-  thread with a progress bar; one bad line doesn't stop the rest, and the whole run
-  undoes in one Ctrl+Z. See the README for an important early accuracy caveat
-  (results against a full music mix have been inconsistent so far).
+- **Automatic word-level timing via forced alignment**: "🪄 Auto-align words" runs a
+  wav2vec2-CTC speech model natively (via ONNX Runtime) once per already-timed line,
+  restricted to that line's own tapped window, to fill in real word-level timing for
+  every word - instead of tapping each one by hand. Nothing to install separately;
+  covers 9 languages (English, Spanish, French, German, Italian, Portuguese,
+  Japanese, Korean, Mandarin), each downloading its own ~1.2GB model on first use and
+  caching it after that. Runs on a background thread with a progress bar; one bad
+  line doesn't stop the rest, and the whole run undoes in one Ctrl+Z. See the README
+  for an important accuracy caveat (results against a full music mix can be
+  inconsistent - a vocals-only stem, via the new "Vocals audio" export, works better).
 - **Auto-rewind on edit**: correcting a timestamp (typing a new value, nudging, or
   dragging a timeline bubble) automatically seeks playback a couple seconds before
   the edited point, so you can immediately hear whether the correction landed right
@@ -128,13 +137,43 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
   (01:05.50) can't be before the previous line ends (01:06.00)") instead of silently
   applied or silently corrupting the ordering - checked wherever a time is set
   (tapping, the per-row "Tap"/"End of line" buttons, and manual entry).
-- **Vocal removal**: "Export instrumental audio…" (standalone `.mp3`/`.wav`) and a
-  "Remove vocals" checkbox on video export, both running real ML source separation
-  (UVR-MDX-NET-Inst_HQ_3, via the `audio-separator` command-line tool) rather than a
-  crude filter. Requires `audio-separator` installed separately - see the README.
+- **Vocal removal**: "Instrumental audio" and "Vocals audio" export checkboxes
+  (standalone `.mp3`/`.wav` each) and a "Remove vocals" checkbox on video export, all
+  running the real UVR-MDX-NET-Inst_HQ_3 ML source separation model rather than a
+  crude filter - natively, via ONNX Runtime, with the model bundled into every
+  installer. Nothing to install separately. Selecting more than one of the three
+  together runs separation exactly once and reuses both stems, rather than
+  re-running the model per output - see the README's "Removing vocals".
 
 ### Changed
 
+- **`ffmpeg` is now bundled, not a system install**: video export and MP3 stem output
+  (vocal removal) both used to require `ffmpeg` installed separately on `PATH`; a
+  packaged release now bundles a custom-built `ffmpeg` instead (nothing to install for
+  an installed copy of the app - `cargo run` dev builds still fall back to a system
+  `ffmpeg` if there's no bundled one). This build is `--disable-gpl` (LGPL v2.1-or-later
+  only - no libx264/libx265, which would otherwise put the whole app under GPL by
+  extension), with H.264 encoding via [openh264](https://github.com/cisco/openh264)
+  (BSD) and MP3 encoding via [LAME](https://lame.sourceforge.io) (LGPL; MP3's patents
+  expired in 2017). The H.264 encoder specifically doesn't bundle a self-compiled
+  openh264 - Cisco's patent-royalty coverage for it only applies to their own
+  separately-distributed binary (confirmed directly against openh264's own binary
+  license, not assumed), so `ffmpeg` links against openh264 at build time for the
+  headers/ABI only, and the actual bundled/downloaded runtime library is Cisco's
+  official binary - the same approach Firefox/Chromium use for the same reason. See
+  the README's "Building" section and `ffmpeg_path.rs`.
+- **ONNX Runtime now loads dynamically on all platforms, including macOS x86_64**:
+  vocal removal and auto-align both switched from linking a downloaded ONNX Runtime
+  binary at build time to loading one at runtime (`ort`'s `load-dynamic` feature),
+  bundled the same way the ML model weights already are. This closes a real gap -
+  ONNX Runtime's own prebuilt binaries don't cover macOS x86_64 (Intel) at all
+  (dropped upstream between versions 1.23 and 1.25) - by having the release workflow
+  build ONNX Runtime from source for that one target (cross-compiled on an Apple
+  Silicon runner) and bundling it exactly like the other three targets' downloaded
+  binaries, rather than leaving Intel Mac without these two features or without a
+  working build at all. A side effect: `cargo build`/`cargo test` no longer make any
+  network request at all (previously `download-binaries` fetched a prebuilt ONNX
+  Runtime on every build).
 - The live preview now shows the same multi-line verse blocks as the video export
   (previously it only ever showed one current line at a time, like the more
   constrained `.cdg` layout) - see the README's "Live preview vs. the exported file"

@@ -130,8 +130,9 @@ accidental close.
 - **`.mp4`** is a real video file (H.264 + AAC, at your choice of 1080p or
   4K) with proper anti-aliased text - this is the "looks like a modern
   KaraFun/karadeo.com video" option, and it has no resolution ceiling at
-  all. It's a much heavier file and needs `ffmpeg` installed (see
-  Building, below), but it'll look sharp on any screen. Unlike the `.cdg`
+  all. It's a much heavier file and needs `ffmpeg` (bundled with an
+  installed copy of the app - see Building, below, for a dev build), but
+  it'll look sharp on any screen. Unlike the `.cdg`
   path (which only has room for one current line + a one-line preview),
   the video groups lines into verse-style blocks of up to 5 lines, split
   **exactly wherever you left a blank line in your pasted lyrics** - so if
@@ -198,32 +199,28 @@ sync automatically, however you choose to work:
 
 ### Removing vocals
 
-Two export options produce a vocals-reduced copy of the loaded audio, for
-singing/timing against an instrumental instead of the original track
-without having to build a second project:
+Three export options produce a vocals-reduced or vocals-only copy of the
+loaded audio, for singing/timing against an instrumental (or reviewing the
+isolated vocal) instead of the original track, without having to build a
+second project:
 
-- **"Export instrumental audio…"** saves a standalone `.mp3`/`.wav`.
+- **"Instrumental audio" checkbox** saves a standalone `.mp3`/`.wav` with
+  the vocals removed.
+- **"Vocals audio" checkbox** saves a standalone `.mp3`/`.wav` of the
+  isolated vocals, from the same separation pass.
 - **"Remove vocals" checkbox** on the video export mixes the instrumental
   copy into the exported `.mp4` instead of the original audio.
 
-Both run real ML source separation (the UVR-MDX-NET-Inst_HQ_3 model via the
-[`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator)
-command-line tool) rather than a crude filter trick, but **this requires
-`audio-separator` installed separately - it is not bundled with this app**:
-
-```bash
-pip install audio-separator          # CPU
-pip install "audio-separator[gpu]"   # faster, needs a compatible Nvidia GPU
-```
-
-The app checks for `audio-separator` before starting and gives a clear
-install message if it's missing, the same way it does for `ffmpeg`. The
-separation model file (~100+MB) downloads automatically on first use
-(needs internet once) and is cached by `audio-separator` itself for later
-runs. Separation is much slower than the app's other exports - anywhere
-from several seconds to a few minutes depending on song length and whether
-GPU acceleration is available - since it's running an actual neural network
-over the audio, not a quick filter pass.
+All three run the real UVR-MDX-NET-Inst_HQ_3 ML source separation model
+(not a crude filter trick) entirely in-app via [ONNX
+Runtime](https://onnxruntime.ai/) - the model ships with the app, so
+**there is nothing to install separately**. If more than one of the three
+is selected together, separation runs exactly once and both stems (the
+instrumental and the vocals) are reused for whichever outputs were asked
+for, instead of re-running the model per output. Separation is much slower
+than the app's other exports - anywhere from several seconds to a couple
+of minutes depending on song length and CPU - since it's running an actual
+neural network over the audio, not a quick filter pass.
 
 ### Auto-aligning word timing
 
@@ -234,8 +231,8 @@ all timing") replaces that estimate - and any earlier manual per-word
 taps - with real, audio-derived timing for every word in every
 already-timed line, in one click.
 
-It works by shelling out to
-[`aeneas`](https://github.com/readbeyond/aeneas), a forced-alignment tool,
+It works by running a real speech-recognition model (wav2vec2-CTC, via
+[ONNX Runtime](https://onnxruntime.ai/) - see ARCHITECTURE.md) natively,
 once per already-timed line - each call is restricted to that line's own
 tapped `[start, end)` window (with a little padding), so it only has to
 figure out *where within a few seconds of audio* each of that line's own
@@ -244,45 +241,33 @@ words falls, rather than aligning an entire song at once. This means
 timing, or badly mistimed timing, has no window to search and won't get
 useful word-level results, so tap along first.
 
-This requires `aeneas` installed separately - it is not bundled with this
-app:
+There's nothing to install separately: the language you pick (Language
+dropdown, next to the button) downloads its model automatically the first
+time you use it (a one-time, roughly 1.2GB download per language, then
+cached) - **only the 9 listed languages are supported**, unlike some
+general-purpose speech-alignment tools that can work with dozens of
+languages via a text-to-speech engine's phoneme output. A run makes one
+model call per timed multi-word line, so it can take a while for a long
+song, especially the very first line (the model download/load) - there's
+a progress bar, and each line either succeeds or fails independently (one
+bad line doesn't stop the rest). Forced alignment is good, not perfect -
+review the result and fine-tune anything that's off the same way you
+would manually-tapped timing; Ctrl+Z undoes the whole run in one step if
+it doesn't help.
 
-```bash
-# aeneas also needs eSpeak (or eSpeak NG) and ffmpeg on the system
-pip install aeneas
-```
-
-See the [aeneas repo](https://github.com/readbeyond/aeneas) for
-OS-specific setup notes (eSpeak's Windows situation in particular is a bit
-more involved). A run shells out once per timed multi-word line, so it can
-take a while for a long song - there's a progress bar, and each line
-either succeeds or fails independently (one bad line doesn't stop the
-rest). Forced alignment is good, not perfect - review the result and
-fine-tune anything that's off the same way you would manually-tapped
-timing; Ctrl+Z undoes the whole run in one step if it doesn't help.
-
-**Real-world accuracy caveat:** early testing against a normal mixed
-track (vocals + full instrumentation) has been inconsistent - `aeneas` is
-a general speech-alignment tool, not something built or trained for
-singing over music, and it seems to want a clean, speech-like audio
-sample rather than a produced song with a beat and instruments sitting on
-top of the vocal. If you try it and the result is spotty, that matches
-what we've seen so far too - it's not just you. A more promising setup we
-haven't confirmed yet: run it against an *isolated vocal stem* instead of
-the full mix. This app already shells out to `audio-separator` elsewhere
-(see "Removing vocals" above) to pull an instrumental stem out of a song -
-the same tool can extract the *opposite* stem (vocals-only, via its
-`--single_stem Vocals` option), which in principle should look a lot more
-like the kind of clean, single-voice audio `aeneas` is meant for. Auto-align
-doesn't do this automatically yet - it aligns whichever audio file is
-currently loaded, as-is, with no separate "alignment source" option. As a
-manual workaround today, you could extract a vocals-only file yourself
-(e.g. with `audio-separator` directly, or another tool), temporarily
-**Load Audio…** that file instead of the full mix, run auto-align, then
-switch back to the original mixed audio for playback/export - your
-tapped/aligned timing stays on the lines, since it's independent of which
-audio file happens to be loaded. If that turns out to noticeably improve
-results, automating that swap (extract vocals, align, discard the
+**Real-world accuracy caveat:** this model, like most speech-recognition
+models, is trained on clean, speech-only audio - it wasn't built or
+trained for singing over a full musical mix, so accuracy against a normal
+mixed track (vocals + full instrumentation) can be inconsistent. A more
+reliable setup: align against an *isolated vocal stem* instead of the
+full mix. Extract one first with the "Vocals audio" export option (see
+"Removing vocals" above, which uses the same native separation this app
+already runs), temporarily **Load Audio…** that file instead of the full
+mix, run auto-align, then switch back to the original mixed audio for
+playback/export - your tapped/aligned timing stays on the lines, since
+it's independent of which audio file happens to be loaded. Auto-align
+doesn't do this swap automatically yet; if it turns out to reliably
+improve results, automating it (extract vocals, align, discard the
 temporary file) as part of auto-align itself would be a reasonable next
 step.
 
@@ -381,11 +366,47 @@ pairing, the loaded audio is copied alongside either one under the
 matching base filename if you have it loaded, ready to drop into a
 folder-based player/game library.
 
+## How this app stays self-contained
+
+A prebuilt release needs nothing installed separately to use *any* feature -
+no Python, no system `ffmpeg`, no manually-installed ML runtime. Everything
+each feature needs is either bundled into the installer or fetched
+automatically by the app itself, on a deliberate per-feature basis:
+
+- **Always bundled in the installer** (works offline, first launch on):
+  vocal removal's separation model (~65MB), a custom-built `ffmpeg` (LGPL-
+  only, no GPL components - see "Building" below) plus the openh264 library
+  its H.264 encoder needs, and the ONNX Runtime library both ML features
+  depend on. This is why the installer itself is a bit over 100MB rather
+  than a typical small desktop app's few MB, and it's a deliberate
+  trade-off: these are either small enough to bundle without a noticeably
+  bigger download (the separation model, ffmpeg, ONNX Runtime) or otherwise
+  awkward to fetch piecemeal (openh264, tied to the exact ffmpeg build it's
+  linked against).
+- **Downloaded automatically on first use, then cached**: auto-align's
+  per-language models. At ~1.2GB *each* for 9 languages, bundling all of
+  them into every installer (~11GB) wasn't a reasonable trade-off against
+  bundling the one language you'll actually use - so only your selected
+  language downloads, the first time you run auto-align with it, and stays
+  cached after that.
+
+See `ARCHITECTURE.md`'s "Bundled binaries and models" section and
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for exactly what's
+bundled/downloaded, its license, and where it comes from.
+
 ## Installing a prebuilt release
 
 Each [GitHub release](../../releases) includes a `.dmg` (macOS), `.msi`/`.exe`
 installer (Windows), and `.AppImage`/`.deb` (Linux) - no Rust toolchain or
-build step needed. Two things to know before you install one:
+build step needed, and (per "How this app stays self-contained" above)
+nothing else to separately install either: vocal removal, video export, and
+the ONNX Runtime/ffmpeg they both depend on are all bundled in, which is why
+the installer itself runs a bit over 100MB rather than the few MB a typical
+small desktop app's installer would be. Auto-align's language models
+(~1.2GB each) are the one exception, kept out of the base installer
+deliberately - see "Auto-aligning word timing" above for why, and expect a
+real download the first time you use a given language. Two things to know
+before you install the base installer itself:
 
 - **macOS: "Apple could not verify... is free of malware."** This app isn't
   currently signed with a paid Apple Developer ID or notarized by Apple (that
@@ -418,8 +439,12 @@ You need a normal, reasonably current Rust toolchain (install via
 [rustup](https://rustup.rs) if you don't have one - `rustc --version`
 should be 1.75 or newer, ideally current stable).
 
-**For MP4 video export**, you'll also need `ffmpeg` installed and on your
-PATH (the `.cdg` export doesn't need it):
+**MP4 video export and MP3 stem output** need `ffmpeg` (the `.cdg` export
+and WAV output don't). A packaged release bundles its own custom-built
+`ffmpeg` (LGPL-only, no GPL components - see "Building" below), so this
+is nothing to install for an installed copy of the app. A `cargo run` dev
+build has no such bundle, so it falls back to a system-installed `ffmpeg`
+on PATH:
 
 ```bash
 # Debian/Ubuntu
@@ -430,21 +455,62 @@ brew install ffmpeg
 ```
 
 The app checks for `ffmpeg` before starting a video export and will tell
-you clearly if it's missing, rather than failing silently.
+you clearly if neither is available, rather than failing silently.
 
-**For vocal removal** ("Export instrumental audio…" and the video export's
-"Remove vocals" checkbox), you'll also need
-[`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator)
-installed and on your PATH - see "Removing vocals" above.
+**The bundled `ffmpeg` itself** is a custom build this project compiles
+from source (see `scripts/build-ffmpeg.sh` and the release workflow),
+deliberately *not* one of the common prebuilt static binaries - those are
+almost universally built with `--enable-gpl` (bundling libx264/libx265),
+which would put the whole app under GPL by extension. This build instead
+uses `--disable-gpl` (LGPL v2.1-or-later only) with H.264 encoding via
+[openh264](https://github.com/cisco/openh264) (BSD-licensed) and MP3
+encoding via [LAME](https://lame.sourceforge.io) (LGPL; MP3's own patents
+expired in 2017, so no separate patent question there). openh264's own
+patent-royalty coverage from Cisco only applies to *Cisco's own*
+separately-distributed binary, not a recompiled copy - so this build links
+against openh264 at build time (for the headers/ABI) but the actual
+runtime library is Cisco's official binary, downloaded separately (see
+`ffmpeg_path.rs`), the same approach Firefox/Chromium use for the same
+reason.
 
-**For auto-aligning word timing** ("🪄 Auto-align words"), you'll also need
-[`aeneas`](https://github.com/readbeyond/aeneas) importable by `python3` -
-see "Auto-aligning word timing" above.
+**Vocal removal** ("Instrumental audio"/"Vocals audio" checkboxes and the
+video export's "Remove vocals" checkbox) needs nothing extra - it runs the
+UVR-MDX-NET-Inst_HQ_3 model in-process via ONNX Runtime, and the model
+ships bundled with the app. See "Removing vocals" above.
 
-None of `ffmpeg`, `audio-separator`, or `aeneas` is a *build*-time
-dependency (`cargo build`/`cargo test` don't need any of them); they're
-only checked at runtime, right before the feature that needs them actually
-runs.
+**Auto-aligning word timing** ("🪄 Auto-align words") also needs nothing
+extra - it runs a wav2vec2-CTC model in-process via ONNX Runtime, same as
+vocal removal. Unlike the separation model, the 9 alignment language
+models aren't bundled (each is ~1.2GB - bundling all 9 into every
+installer isn't practical); the selected language downloads and caches on
+first use instead. See "Auto-aligning word timing" above.
+
+Both features also need the ONNX Runtime shared library itself
+(`libonnxruntime.so`/`.dylib`/`onnxruntime.dll`) - loaded dynamically at
+runtime (`ort`'s `load-dynamic` feature, not linked in at build time), and
+bundled into every installer alongside the separation model (see
+`onnxrt.rs`). The one target ONNX Runtime doesn't publish a prebuilt
+binary for at all - macOS x86_64 (Intel), dropped upstream between
+versions 1.23 and 1.25 - gets one built from source by the release
+workflow instead (cross-compiled on an Apple Silicon runner), bundled the
+same way as the other three targets.
+
+`ffmpeg` itself is also bundled, not a subprocess dependency on a system
+install anymore either - see "Building" below for the LGPL-only,
+openh264-based build this project compiles from source, and
+`ffmpeg_path.rs` for how it's located/loaded, the same pattern as the ONNX
+models above. None of `ffmpeg`, either ONNX Runtime/model file is a
+*build*-time dependency (`cargo build`/`cargo test` need none of them);
+they're only checked/fetched at runtime, right before the feature that
+needs them actually runs. A `cargo run` dev build has no bundled resources
+at all, so it falls back to a local cache directory for everything -
+downloaded automatically for the separation model and the ONNX Runtime
+library itself (except on macOS x86_64, which has nothing to auto-download
+and needs a one-time manual build - see `onnxrt.rs`'s error message for
+exact steps if you hit this); alignment
+language models always download into that same cache on first use,
+bundled release or not, since bundling all 9 (~1.2GB each) isn't
+practical.
 
 The fonts used for video export (DejaVu Sans / DejaVu Sans Bold) are
 bundled in `assets/` under the permissive Bitstream Vera license (see
@@ -529,17 +595,28 @@ cargo test
   same `lyrics.rs` timing/countdown/title-card logic as the CDG path, then
   pipes frames into an `ffmpeg` subprocess (muxed with your loaded audio)
   to produce the final MP4. It runs on a background thread with a progress
-  callback so the GUI stays responsive during longer encodes.
+  callback so the GUI stays responsive during longer encodes. `ffmpeg`
+  itself is bundled (a custom LGPL-only build, not a system install - see
+  "Building" above); `src/ffmpeg_path.rs` locates it (and the openh264
+  library its H.264 encoder needs) the same way `model_assets.rs`/
+  `onnxrt.rs` locate the ML models/ONNX Runtime.
 - `src/timeline.rs` is the pure time<->pixel math, zoom/drag bounds, and
   drag-mode classification behind the fine-tuning timeline - kept separate
   from the egui widget/painting code in `main.rs` so it's unit-testable
   without a running GUI.
-- `src/vocals.rs` shells out to the `audio-separator` CLI to produce an
-  instrumental copy of the loaded audio (see "Removing vocals" above).
-- `src/align.rs` shells out to `aeneas` once per already-timed line,
-  restricted to that line's own tapped window, to fill in real word-level
-  timing instead of the character-count estimate (see "Auto-aligning word
-  timing" above).
+- `src/vocals.rs`, `src/mdx.rs`, and `src/stft.rs` run the
+  UVR-MDX-NET-Inst_HQ_3 separation model natively via ONNX Runtime (`ort`)
+  to produce instrumental and vocals stems from the loaded audio (see
+  "Removing vocals" above); `src/model_assets.rs` locates a bundled model
+  file (or downloads it to a cache directory in a dev build), and
+  `src/onnxrt.rs` locates/loads the ONNX Runtime shared library itself
+  that both this and auto-align need.
+- `src/align.rs` and `src/ctc.rs` run a wav2vec2-CTC speech model natively
+  via ONNX Runtime once per already-timed line, restricted to that line's
+  own tapped window, to fill in real word-level timing instead of the
+  character-count estimate (see "Auto-aligning word timing" above);
+  `ctc.rs` is the CTC forced-alignment trellis/tokenization math, kept
+  separate so it's unit-testable without an ONNX model.
 - `src/main.rs` is the GUI: it also has a **live preview** panel that reads
   the same timing data as `export.rs`/`video.rs` to show a real-time
   mockup of what the exported files will look like as the song plays, the
@@ -569,11 +646,11 @@ cargo test
   not the exported `.cdg`/`.mp4` - it's purely a visual aid for aligning
   bubbles against actual vocal onsets, not a preview of anything in the
   output files themselves.
-- Forced alignment (`aeneas`) is a real speech-alignment tool, not
-  something written or trained for singing over music - results against a
-  normal full mix have been inconsistent in our own testing so far (see
-  the accuracy caveat under "Auto-aligning word timing" above). It can
-  also misfire on heavily melismatic/stylized vocals, overlapping voices,
+- Forced alignment (the wav2vec2-CTC model) is a real speech-recognition
+  model, not something written or trained for singing over music - results
+  against a normal full mix can be inconsistent (see the accuracy caveat
+  under "Auto-aligning word timing" above). It can also misfire on heavily
+  melismatic/stylized vocals, overlapping voices,
   or a line whose tapped window doesn't actually contain all of its
   words. Treat its result the same as an estimate: worth reviewing, easy
   to fix by hand (or re-tap the line and run it again) where it's off.
@@ -592,7 +669,7 @@ cargo test
   file" above.
 - Vocal removal always uses one hardcoded model
   (`UVR-MDX-NET-Inst_HQ_3.onnx`) - there's no in-app way to pick a
-  different `audio-separator` model or tune its parameters (segment size,
+  different separation model or tune its parameters (segment size,
   overlap, etc.) yet.
 
 ## More documentation
@@ -606,6 +683,9 @@ cargo test
 - [CHANGELOG.md](CHANGELOG.md) - notable changes by version.
 - [BUILD_TROUBLESHOOTING.md](BUILD_TROUBLESHOOTING.md) - the most common
   build failure (an old Rust toolchain) and how to fix it.
+- [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) - every bundled
+  binary/model (ffmpeg, openh264, LAME, ONNX Runtime, the ML models) and
+  their licenses, plus a full Rust dependency license report.
 
 
 ## Support the Project

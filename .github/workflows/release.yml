@@ -14,27 +14,92 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ONNX Runtime's own prebuilt binaries cover this target
+          # (`ort_platform`/`ort_archive_ext` name the release asset to
+          # download - see the "Fetch ONNX Runtime" step). `openh264_os`/
+          # `openh264_arch` are openh264's own build-system names (see
+          # scripts/build-ffmpeg.sh); `openh264_dl_url` is Cisco's own
+          # official binary for the *runtime* library ffmpeg loads (see
+          # ffmpeg_path.rs for why that's a separate download from the
+          # build-time openh264 the script above compiles).
           - platform: macos-latest
             target: aarch64-apple-darwin
             arch: aarch64
             formats: dmg
+            ort_platform: osx-arm64
+            ort_archive_ext: tgz
+            ort_lib_name: libonnxruntime.dylib
+            openh264_os: darwin
+            openh264_arch: arm64
+            openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-arm64.dylib.bz2
+            # -rpath,@executable_path: openh264 is linked with an
+            # @rpath-relative install name (see scripts/build-ffmpeg.sh),
+            # so ffmpeg needs to know @rpath means "next to me" - i.e.
+            # wherever assets/ffmpeg/ ends up bundled, since that's where
+            # both ffmpeg and libopenh264.dylib are placed together.
+            ffmpeg_configure_extra: "--extra-ldflags=-Wl,-rpath,@executable_path"
 
+          # ONNX Runtime dropped prebuilt macOS x86_64 binaries between
+          # 1.23 and 1.25 (confirmed directly against the release asset
+          # list - no `onnxruntime-osx-x64-*` exists for the 1.28.0 this
+          # app targets). `ort_platform` is left empty so the download
+          # step is skipped; the "Build ONNX Runtime from source" step
+          # (gated on this exact target) cross-compiles one instead, on
+          # this same arm64 runner - ONNX Runtime's own CI does the same
+          # cross-compile for its coreml/webgpu macOS x86_64 jobs, so this
+          # is a proven, not experimental, approach.
           - platform: macos-latest
             target: x86_64-apple-darwin
             arch: x64
             formats: dmg
+            ort_platform: ""
+            ort_archive_ext: ""
+            ort_lib_name: libonnxruntime.dylib
+            openh264_os: darwin
+            openh264_arch: x86_64
+            openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-x64.dylib.bz2
+            # Cross-compiled on this same arm64 runner, mirroring the
+            # ONNX Runtime cross-compile above - clang's own cross-arch
+            # support handles this without needing a separate toolchain.
+            # -rpath,@executable_path: see the arm64 entry's comment above.
+            ffmpeg_configure_extra: "--arch=x86_64 --enable-cross-compile --cc=clang --extra-cflags=-arch\\ x86_64 --extra-ldflags=-arch\\ x86_64\\ -Wl,-rpath,@executable_path"
+            # LAME is a completely separate autotools build from ffmpeg,
+            # so it needs its own cross-compile flags independently of
+            # ffmpeg_configure_extra above - --host triggers autotools'
+            # cross mode, lame_cc forces the actual compiler invocation to
+            # target x86_64 too (both consumed by scripts/build-ffmpeg.sh).
+            lame_configure_extra: "--host=x86_64-apple-darwin"
+            lame_cc: "clang -arch x86_64"
 
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             arch: amd64
             formats: deb,appimage
+            ort_platform: linux-x64
+            ort_archive_ext: tgz
+            ort_lib_name: libonnxruntime.so
+            openh264_os: linux
+            openh264_arch: x86_64
+            openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2
+            ffmpeg_configure_extra: ""
 
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             arch: x64
             formats: nsis,wix
+            ort_platform: win-x64
+            ort_archive_ext: zip
+            ort_lib_name: onnxruntime.dll
+            openh264_os: msys
+            openh264_arch: x86_64
+            openh264_dl_url: http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2
+            ffmpeg_configure_extra: "--target-os=mingw32 --arch=x86_64"
 
     runs-on: ${{ matrix.platform }}
+    # The macOS x86_64 from-source ONNX Runtime build is the slow one here
+    # (everything else in this job finishes in single-digit minutes) - a
+    # full onnxruntime build can reasonably take over an hour.
+    timeout-minutes: 150
 
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +116,84 @@ jobs:
             libfontconfig1-dev \
             libfreetype6-dev \
             pkg-config \
-            libfuse2
+            libfuse2 \
+            nasm
+
+      - name: Install macOS ffmpeg build dependencies
+        if: matrix.platform == 'macos-latest'
+        run: brew install nasm
+
+      - name: Set up MSYS2 (Windows ffmpeg build)
+        if: matrix.platform == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            nasm
+            make
+            pkgconf
+            diffutils
+            git
+
+      - name: Build ffmpeg (Linux/macOS)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        env:
+          OPENH264_OS: ${{ matrix.openh264_os }}
+          OPENH264_ARCH: ${{ matrix.openh264_arch }}
+          FFMPEG_CONFIGURE_EXTRA: ${{ matrix.ffmpeg_configure_extra }}
+          LAME_CONFIGURE_EXTRA: ${{ matrix.lame_configure_extra }}
+          CC: ${{ matrix.lame_cc }}
+          OUT_DIR: assets/ffmpeg
+        run: ./scripts/build-ffmpeg.sh
+
+      - name: Build ffmpeg (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: msys2 {0}
+        env:
+          OPENH264_OS: ${{ matrix.openh264_os }}
+          OPENH264_ARCH: ${{ matrix.openh264_arch }}
+          FFMPEG_CONFIGURE_EXTRA: ${{ matrix.ffmpeg_configure_extra }}
+          FFMPEG_EXE_NAME: ffmpeg.exe
+          OUT_DIR: assets/ffmpeg
+        # Runs from the MSYS2 shell, which has its own $PATH/tool search -
+        # actions/checkout above already put the repo (and this script) on
+        # disk, MSYS2 just needs pointing at it.
+        run: ./scripts/build-ffmpeg.sh
+
+      - name: Fetch openh264 runtime library
+        shell: bash
+        # The library ffmpeg actually loads at runtime (see ffmpeg_path.rs
+        # for why this is Cisco's official binary, not the one
+        # scripts/build-ffmpeg.sh just compiled) - same "ffmpeg/" resource
+        # folder as the binary above, same retry pattern as the other
+        # downloads in this workflow. Renamed to exactly the filename
+        # ffmpeg_path.rs's `openh264_filename()` looks for - not Cisco's
+        # own name in every case: their Windows binary is "openh264.dll"
+        # (no "lib" prefix, since they build it with MSVC), but this
+        # app's MinGW-built ffmpeg imports "libopenh264.dll" (MinGW's
+        # default naming, verified against scripts/build-ffmpeg.sh's own
+        # output) - same file, just needs the rename to be found.
+        run: |
+          set -e
+          case "${{ matrix.platform }}" in
+            windows-latest) out_name="libopenh264.dll" ;;
+            macos-latest) out_name="libopenh264.dylib" ;;
+            *) out_name="libopenh264.so" ;;
+          esac
+          for attempt in 1 2 3; do
+            if curl -fL --retry 3 -o "assets/ffmpeg/openh264.bz2" "${{ matrix.openh264_dl_url }}"; then
+              break
+            fi
+            echo "openh264 download failed (attempt $attempt/3)"
+            sleep $((attempt * 15))
+            [ "$attempt" = "3" ] && exit 1
+          done
+          bunzip2 -f "assets/ffmpeg/openh264.bz2"
+          mv "assets/ffmpeg/openh264" "assets/ffmpeg/$out_name"
+          chmod +x "assets/ffmpeg/$out_name" 2>/dev/null || true
+          ls -la assets/ffmpeg/
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -62,6 +204,99 @@ jobs:
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
+
+      - name: Fetch bundled ML models
+        shell: bash
+        # Not checked into git (multi-tens-of-MB binaries) - downloaded
+        # here into the path `cargo packager`'s `resources` config (see
+        # Cargo.toml) bundles into every installer, so the shipped app
+        # never needs this at runtime. Retried like the packaging step
+        # below, for the same reason (transient CDN blips).
+        run: |
+          mkdir -p assets/models
+          url="https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx"
+          dest="assets/models/UVR-MDX-NET-Inst_HQ_3.onnx"
+          for attempt in 1 2 3; do
+            if curl -fL --retry 3 -o "$dest" "$url"; then
+              exit 0
+            fi
+            echo "model download failed (attempt $attempt/3)"
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Fetch ONNX Runtime (prebuilt)
+        # Skipped for macOS x86_64, which has no prebuilt binary to fetch
+        # - see the next step and the matrix comment above.
+        if: matrix.ort_platform != ''
+        shell: bash
+        run: |
+          set -e
+          mkdir -p assets/onnxruntime ort_extracted
+          version="1.28.0"
+          url="https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-${{ matrix.ort_platform }}-${version}.${{ matrix.ort_archive_ext }}"
+          archive="ort_download.${{ matrix.ort_archive_ext }}"
+          ok=0
+          for attempt in 1 2 3; do
+            if curl -fL --retry 3 -o "$archive" "$url"; then
+              ok=1
+              break
+            fi
+            echo "ONNX Runtime download failed (attempt $attempt/3)"
+            sleep $((attempt * 15))
+          done
+          if [ "$ok" != "1" ]; then exit 1; fi
+          if [ "${{ matrix.ort_archive_ext }}" = "zip" ]; then
+            unzip -q -o "$archive" -d ort_extracted
+          else
+            tar xzf "$archive" -C ort_extracted
+          fi
+          # The lib is a versioned symlink chain in the linux/macOS
+          # archives (e.g. libonnxruntime.so -> libonnxruntime.so.1 ->
+          # libonnxruntime.so.1.28.0) - `cp -L` dereferences it into a
+          # single real file at the exact name onnxrt.rs looks for.
+          found="$(find ort_extracted -name '${{ matrix.ort_lib_name }}' | head -n1)"
+          test -n "$found"
+          cp -L "$found" "assets/onnxruntime/${{ matrix.ort_lib_name }}"
+          rm -rf ort_extracted "$archive"
+          test -f "assets/onnxruntime/${{ matrix.ort_lib_name }}"
+
+      - name: Build ONNX Runtime from source (macOS x86_64)
+        # The one target with no prebuilt binary to fetch (see the matrix
+        # comment above) - cross-compiled on this arm64 runner, the same
+        # way ONNX Runtime's own CI cross-compiles its macOS x86_64
+        # coreml/webgpu jobs (.github/workflows/macos-ci-build-and-test-workflow.yml
+        # in the microsoft/onnxruntime repo, `--osx_arch x86_64` on an
+        # arm64 `machine`). This step is the slow part of this whole
+        # workflow (see the job's timeout-minutes above) and, unlike
+        # everything else here, hasn't been dry-run outside real CI - if
+        # it needs adjusting, ONNX Runtime's own macOS CI workflow (linked
+        # above) is the authoritative reference for current build flags.
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -e
+          brew install cmake ninja
+          version="1.28.0"
+          git clone --branch "v${version}" --depth 1 --recursive --shallow-submodules \
+            https://github.com/microsoft/onnxruntime.git /tmp/onnxruntime-src
+          cd /tmp/onnxruntime-src
+          python3 -m pip install --break-system-packages -r requirements.txt
+          python3 ./tools/ci_build/build.py \
+            --build_dir ./build \
+            --config Release \
+            --parallel \
+            --skip_submodule_sync \
+            --skip_tests \
+            --build_shared_lib \
+            --compile_no_warning_as_error \
+            --osx_arch x86_64 \
+            --update --build
+          mkdir -p "$GITHUB_WORKSPACE/assets/onnxruntime"
+          found="$(find ./build -maxdepth 2 -name 'libonnxruntime*.dylib' ! -path '*.dSYM*' | head -n1)"
+          test -n "$found"
+          cp -L "$found" "$GITHUB_WORKSPACE/assets/onnxruntime/libonnxruntime.dylib"
+          test -f "$GITHUB_WORKSPACE/assets/onnxruntime/libonnxruntime.dylib"
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
