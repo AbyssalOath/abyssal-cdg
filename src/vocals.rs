@@ -20,7 +20,7 @@ use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Fft, FixedSync, Resampler, WindowFunction};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 const MODEL_FILENAME: &str = "UVR-MDX-NET-Inst_HQ_3.onnx";
@@ -68,6 +68,29 @@ pub fn separate(
         instrumental: result.instrumental,
         vocals: result.vocals,
     })
+}
+
+/// Separates `input_path` and writes just the vocals stem out to a fresh
+/// temp WAV file, returning its path - used by `align.rs`'s auto-align
+/// (via `main.rs`'s `start_word_alignment`) to run forced alignment
+/// against isolated vocals instead of the full mix, since the CTC speech
+/// model aligns more reliably without instrumentation underneath the
+/// singing. The caller owns the returned path and is responsible for
+/// deleting it once alignment is done with it (this doesn't clean up
+/// after itself, the same way `write_stem_to_file`'s own intermediate
+/// `.wav.tmp` only cleans up the one it makes internally, not this one).
+pub fn separate_vocals_to_temp_wav(
+    input_path: &Path,
+    on_progress: impl FnMut(f32),
+) -> Result<PathBuf> {
+    let mut separator = load_separator()?;
+    let separation = separate(&mut separator, input_path, on_progress)?;
+    let tmp_path = std::env::temp_dir().join(format!(
+        "abyssal-cdg-align-vocals-{}.wav",
+        std::process::id()
+    ));
+    write_stem_to_file(&separation.vocals, separation.sample_rate, &tmp_path)?;
+    Ok(tmp_path)
 }
 
 /// Writes one stem to `output_path` (format inferred from its extension -

@@ -1581,16 +1581,48 @@ impl KaraokeApp {
         let result_clone = result.clone();
 
         self.status = format!(
-            "Auto-aligning {total} line(s)… loading the {} alignment model (downloading it the \
-             first time) and can take a while.",
+            "Auto-aligning {total} line(s)… separating vocals, loading the {} alignment model \
+             (downloading it the first time), and can take a while.",
             language.label()
         );
         self.align_job = Some(AlignJob { progress, result });
 
         std::thread::spawn(move || {
-            let mut aligner = match align::Aligner::load(&audio_path, language) {
+            // Isolate vocals first and align against that instead of the
+            // full mix - the CTC speech model tracks singing far more
+            // reliably without instrumentation underneath it, and the
+            // separation model is already bundled with every release (see
+            // vocals.rs), so this costs extra compute time but no new
+            // download. Best-effort: if separation fails for any reason,
+            // fall back to aligning against the original audio rather than
+            // failing the whole run over what's meant to be an accuracy
+            // improvement, not a hard requirement. Takes the first half of
+            // the progress bar; alignment itself takes the second half.
+            // The original audio the user was tapping timestamps against
+            // (self.audio, used for playback) is never touched by any of
+            // this - it only ever decodes its own separate copy here, on
+            // this background thread, from whichever file path is chosen.
+            let mut vocals_tmp: Option<PathBuf> = None;
+            let align_source: PathBuf = {
+                let progress_for_separation = progress_clone.clone();
+                match vocals::separate_vocals_to_temp_wav(&audio_path, move |p| {
+                    progress_for_separation.store((p * 500.0) as u32, Ordering::Relaxed);
+                }) {
+                    Ok(path) => {
+                        vocals_tmp = Some(path.clone());
+                        path
+                    }
+                    Err(_) => audio_path.clone(),
+                }
+            };
+            progress_clone.store(500, Ordering::Relaxed);
+
+            let mut aligner = match align::Aligner::load(&align_source, language) {
                 Ok(a) => a,
                 Err(e) => {
+                    if let Some(p) = &vocals_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     *result_clone.lock().unwrap() = Some(Err(e.to_string()));
                     return;
                 }
@@ -1607,9 +1639,12 @@ impl KaraokeApp {
                     result: outcome,
                 });
                 progress_clone.store(
-                    (((i + 1) as f32 / total as f32) * 1000.0) as u32,
+                    500 + (((i + 1) as f32 / total as f32) * 500.0) as u32,
                     Ordering::Relaxed,
                 );
+            }
+            if let Some(p) = &vocals_tmp {
+                let _ = std::fs::remove_file(p);
             }
             *result_clone.lock().unwrap() = Some(Ok(outcomes));
         });
@@ -3998,13 +4033,14 @@ impl eframe::App for KaraokeApp {
             });
             ui.label(
                 egui::RichText::new(
-                    "Auto-align uses a real speech-recognition model (run once per \
-                     already-timed line) to fill in every word's timing automatically, \
-                     replacing any existing word timing (estimated or manually tapped) for \
-                     lines it successfully aligns. Nothing to install separately - the \
-                     selected language's model downloads automatically the first time you \
-                     use it (a one-time, roughly 1.2GB download, then cached). Undo (Ctrl+Z) \
-                     if a result doesn't look right.",
+                    "Auto-align isolates vocals first, then runs a real speech-recognition \
+                     model (once per already-timed line) against just the singing to fill in \
+                     every word's timing automatically, replacing any existing word timing \
+                     (estimated or manually tapped) for lines it successfully aligns - the song \
+                     you hear back and tap timestamps against is unaffected either way. Nothing \
+                     to install separately - the selected language's model downloads \
+                     automatically the first time you use it (a one-time, roughly 1.2GB \
+                     download, then cached). Undo (Ctrl+Z) if a result doesn't look right.",
                 )
                 .small()
                 .weak(),
