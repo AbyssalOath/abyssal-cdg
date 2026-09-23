@@ -90,17 +90,30 @@ soname_suffix_override=""
 case "$OPENH264_OS" in
 	linux) soname_suffix_override="SHAREDLIBSUFFIXMAJORVER=so" ;;
 esac
-# USE_ASM=No: this copy of openh264 is never shipped or executed - only
-# linked against for headers/ABI (see the module docs in ffmpeg_path.rs) -
-# so its own codegen speed doesn't matter, only that it builds. Its NEON
-# AArch64 assembly failed to compile on the macOS arm64 GitHub Actions
-# runner's toolchain (multiple .o files silently missing, then `ar`
-# erroring that they don't exist - a known openh264/Apple Silicon
-# toolchain issue, see cisco/openh264#3353) on the first real CI run of
-# this script. Disabling asm entirely sidesteps that whole class of
-# toolchain fragility for every platform, at zero cost.
+# USE_ASM=No (darwin/arm64 only): this copy of openh264 is never shipped
+# or executed - only linked against for headers/ABI (see the module docs
+# in ffmpeg_path.rs) - so its own codegen speed doesn't matter, only that
+# it builds. Its NEON AArch64 assembly failed to compile on the macOS
+# arm64 GitHub Actions runner's toolchain (multiple .o files silently
+# missing, then `ar` erroring that they don't exist - a known openh264/
+# Apple Silicon toolchain issue, see cisco/openh264#3353), so asm is
+# disabled for just this combination. NOT applied more broadly: disabling
+# it for the macOS x86_64 cross-compile target broke that build instead -
+# build/platform-darwin.mk only adds `-arch x86_64` to CFLAGS/LDFLAGS
+# inside its `ASM_ARCH == x86` branch (arm64 gets `-arch arm64`
+# unconditionally, an asymmetry in openh264's own Makefile), and
+# ASM_ARCH is only set when USE_ASM=Yes - so disabling asm there silently
+# dropped the arch flag entirely, producing a host-arch (arm64) library
+# that ffmpeg's `require_pkg_config` link-tested against `-arch x86_64`
+# and rejected as "openh264 >= 1.3.0 not found using pkg-config" (a
+# generic error covering both real absence and this kind of functional
+# check failure) on the first real CI run after the fix above.
+openh264_asm_override=""
+if [ "$OPENH264_OS" = "darwin" ] && [ "$OPENH264_ARCH" = "arm64" ]; then
+	openh264_asm_override="USE_ASM=No"
+fi
 # shellcheck disable=SC2086
-make -C "$work/openh264" OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" USE_ASM=No $soname_suffix_override -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+make -C "$work/openh264" OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" $openh264_asm_override $soname_suffix_override -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 if [ "$OPENH264_OS" = "linux" ]; then
 	# The Makefile's own symlink chain assumes the majorver suffix and
 	# the plain suffix differ (`.so -> .so.MAJORVER -> .so.FULLVER`) -
@@ -110,7 +123,7 @@ if [ "$OPENH264_OS" = "linux" ]; then
 	ln -sf "$(basename "$real")" "$work/openh264/libopenh264.so"
 fi
 # shellcheck disable=SC2086
-make -C "$work/openh264" install OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" USE_ASM=No $soname_suffix_override PREFIX="$work/openh264-install"
+make -C "$work/openh264" install OS="$OPENH264_OS" ARCH="$OPENH264_ARCH" $openh264_asm_override $soname_suffix_override PREFIX="$work/openh264-install"
 if [ "$OPENH264_OS" = "darwin" ]; then
 	dylib="$(find "$work/openh264-install" -name 'libopenh264*.dylib' -not -name '*.dylib.dSYM' | head -n1)"
 	install_name_tool -id "@rpath/libopenh264.dylib" "$dylib"
