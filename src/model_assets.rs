@@ -24,6 +24,14 @@ use std::path::{Path, PathBuf};
 /// on) means this doesn't have to be perfectly right about a packaging
 /// layout that can't be built-and-run from this dev machine - any one of
 /// them matching is enough.
+/// `cargo-packager`'s Linux `.deb`/AppImage layout installs the binary at
+/// `usr/bin/<pkg>` and bundles resources at `usr/lib/<pkg>/<relative>` -
+/// confirmed directly against a real CI packaging run's AppImage build log
+/// (which also showed the AppImage stage reusing the `.deb` stage's own
+/// `usr/` tree wholesale, so both installs share this exact layout). This
+/// app's own crate name is that `<pkg>` path segment.
+const LINUX_PKG_DIR: &str = env!("CARGO_PKG_NAME");
+
 pub(crate) fn bundled_resource_candidates(relative: &str) -> Vec<PathBuf> {
     let Ok(exe) = std::env::current_exe() else {
         return Vec::new();
@@ -37,13 +45,28 @@ pub(crate) fn bundled_resource_candidates(relative: &str) -> Vec<PathBuf> {
         exe_dir.join("resources").join(relative),
         exe_dir.join("lib").join(relative),
     ];
+    if let Some(usr) = exe_dir.parent() {
+        // Linux .deb/AppImage: exe is at usr/bin/<pkg>, resources at
+        // usr/lib/<pkg>/<relative> - a sibling of bin/, not a child of it,
+        // and one directory level deeper than the generic "lib" candidate
+        // above (missing the <pkg> segment is what silently broke this on
+        // the first real Linux packaged release - see LINUX_PKG_DIR docs).
+        candidates.push(usr.join("lib").join(LINUX_PKG_DIR).join(relative));
+    }
     if let Some(macos_contents) = exe_dir.parent() {
         candidates.push(macos_contents.join("Resources").join(relative));
     }
     // AppImage mounts itself and points $APPDIR at the mount root at
-    // runtime - resources bundled at usr/lib live under there.
+    // runtime - kept as a fallback alongside the exe-relative candidate
+    // above, in case AppImage's exec wrapper ever makes current_exe()
+    // resolve somewhere other than the real mounted path.
     if let Ok(appdir) = std::env::var("APPDIR") {
-        candidates.push(Path::new(&appdir).join("usr/lib").join(relative));
+        candidates.push(
+            Path::new(&appdir)
+                .join("usr/lib")
+                .join(LINUX_PKG_DIR)
+                .join(relative),
+        );
     }
     candidates
 }
