@@ -4309,9 +4309,7 @@ impl eframe::App for KaraokeApp {
                                     );
                                     match &self.font_list {
                                         None => {
-                                            ui.label(
-                                                egui::RichText::new("Loading fonts…").weak(),
-                                            );
+                                            ui.label(egui::RichText::new("Loading fonts…").weak());
                                         }
                                         Some(list) => {
                                             // Cloned to a plain owned Vec so
@@ -4342,10 +4340,9 @@ impl eframe::App for KaraokeApp {
                                                 .id_source("font_picker_scroll")
                                                 .show(ui, |ui| {
                                                     for name in &filtered {
-                                                        let selected = self
-                                                            .selected_font_family
-                                                            .as_deref()
-                                                            == Some(name.as_str());
+                                                        let selected =
+                                                            self.selected_font_family.as_deref()
+                                                                == Some(name.as_str());
                                                         if ui
                                                             .selectable_label(
                                                                 selected,
@@ -5033,19 +5030,13 @@ mod tests {
         let mut selected = std::collections::BTreeSet::new();
         let mut anchor = Some(2);
         apply_row_selection_click(&mut selected, &mut anchor, 5, true, false);
-        assert_eq!(
-            selected,
-            std::collections::BTreeSet::from([2, 3, 4, 5])
-        );
+        assert_eq!(selected, std::collections::BTreeSet::from([2, 3, 4, 5]));
 
         // Works in either direction (clicking above the anchor, not just below).
         let mut anchor2 = Some(5);
         let mut selected2 = std::collections::BTreeSet::new();
         apply_row_selection_click(&mut selected2, &mut anchor2, 2, true, false);
-        assert_eq!(
-            selected2,
-            std::collections::BTreeSet::from([2, 3, 4, 5])
-        );
+        assert_eq!(selected2, std::collections::BTreeSet::from([2, 3, 4, 5]));
     }
 
     #[test]

@@ -1436,7 +1436,16 @@ mod tests {
             let mut canvas = Canvas::new(w, h);
             canvas.fill(palette.background);
             render_frame(
-                &mut canvas, &regular, &bold, &timed, &blocks, &palette, None, None, card_end, t,
+                &mut canvas,
+                &regular,
+                &bold,
+                &timed,
+                &blocks,
+                &palette,
+                None,
+                None,
+                card_end,
+                t,
             );
             canvas
         };
@@ -1476,7 +1485,16 @@ mod tests {
         // window (were it not suppressed) would be [26.0, 30.0) - sample
         // well inside that window, still within the line's own [0, 30) span.
         render_frame(
-            &mut canvas, &regular, &bold, &timed, &blocks, &palette, None, None, card_end, 28.0,
+            &mut canvas,
+            &regular,
+            &bold,
+            &timed,
+            &blocks,
+            &palette,
+            None,
+            None,
+            card_end,
+            28.0,
         );
 
         assert!(
@@ -1502,7 +1520,16 @@ mod tests {
         canvas.fill(palette.background);
 
         render_frame(
-            &mut canvas, &regular, &bold, &timed, &blocks, &palette, None, None, card_end, 18.0,
+            &mut canvas,
+            &regular,
+            &bold,
+            &timed,
+            &blocks,
+            &palette,
+            None,
+            None,
+            card_end,
+            18.0,
         );
 
         assert!(

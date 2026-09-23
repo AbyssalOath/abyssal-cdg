@@ -475,10 +475,7 @@ pub fn merge_reparsed_lyrics(old: &[LyricLine], raw: &str) -> (Vec<LyricLine>, R
     let mut new_pos = 0usize;
 
     for seg in 0..=anchors.len() {
-        let (old_end, new_end) = anchors
-            .get(seg)
-            .copied()
-            .unwrap_or((old.len(), new.len()));
+        let (old_end, new_end) = anchors.get(seg).copied().unwrap_or((old.len(), new.len()));
 
         // The gap before this anchor (or, on the final pass, before the
         // end of both lists): best-effort positional pairing between

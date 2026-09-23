@@ -102,14 +102,21 @@ mod tests {
         ];
         assert_eq!(
             dedup_sorted(names),
-            vec!["Arial".to_string(), "Consolas".to_string(), "Verdana".to_string()]
+            vec![
+                "Arial".to_string(),
+                "Consolas".to_string(),
+                "Verdana".to_string()
+            ]
         );
     }
 
     #[test]
     fn dedup_sorted_handles_empty_and_single_entry_lists() {
         assert_eq!(dedup_sorted(vec![]), Vec::<String>::new());
-        assert_eq!(dedup_sorted(vec!["Arial".to_string()]), vec!["Arial".to_string()]);
+        assert_eq!(
+            dedup_sorted(vec!["Arial".to_string()]),
+            vec!["Arial".to_string()]
+        );
     }
 
     #[test]
