@@ -122,3 +122,21 @@ resources = ["assets/models", "assets/onnxruntime", "assets/ffmpeg"]
 # works out of the box rather than silently finding no fonts.
 [package.metadata.packager.deb]
 depends = ["libgtk-3-0", "libasound2", "libx11-6", "libxkbcommon0", "libfontconfig1"]
+
+# "-" is codesign's own ad-hoc identity (no paid Apple Developer account
+# needed) - load-bearing, not cosmetic, and only for Apple Silicon: without
+# *any* signature, an arm64 .app fails to launch at all ("... is damaged
+# and can't be opened"), because Apple Silicon's kernel-level code-signing
+# enforcement (AMFI) requires every executable to carry at least a valid
+# ad-hoc signature just to be loaded - a stricter, separate check from
+# Gatekeeper's own "unidentified developer" quarantine policy (the one the
+# README's right-click-Open/xattr workaround addresses). An unsigned
+# x86_64 build has no such kernel-level requirement (confirmed directly:
+# it already ran fine, quarantine warning and all, before this was added),
+# which is also why it runs fine via Rosetta 2 on an Apple Silicon Mac -
+# only a *native* arm64 launch hits AMFI's requirement. Ad-hoc signing
+# doesn't remove the Gatekeeper prompt (that still needs the README's
+# workaround, or a paid Developer ID + notarization, neither set up here)
+# - it only makes the arm64 build launchable at all in the first place.
+[package.metadata.packager.macos]
+signing-identity = "-"
