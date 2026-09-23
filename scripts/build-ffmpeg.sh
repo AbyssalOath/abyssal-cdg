@@ -16,11 +16,21 @@
 # workflow's comments.
 #
 # Required env vars:
-#   OPENH264_OS       - openh264's own OS name: linux, darwin, or the
-#                        MSYS2-detected name on Windows (e.g. msys)
 #   OPENH264_ARCH      - x86_64 or arm64
 #   OUT_DIR            - where to copy the final ffmpeg binary
 # Optional env vars:
+#   OPENH264_OS        - openh264's own OS name (linux, darwin, mingw_nt,
+#                         ...). Auto-detected by default, using the *exact*
+#                         same `uname`-based formula openh264's own
+#                         Makefile uses internally (`uname | tr A-Z a-z |
+#                         tr -d '-0-9.' | ...`) - guessing this string
+#                         instead (e.g. "msys" for a Windows/MSYS2 build)
+#                         is what broke the first real CI run of this
+#                         script: MSYS2's `uname` actually reports
+#                         something like "MINGW64_NT-10.0-XXXXX", which
+#                         that formula reduces to "mingw_nt", not "msys".
+#                         Only override this if auto-detection is ever
+#                         wrong for a new environment.
 #   FFMPEG_CONFIGURE_EXTRA - extra ./configure flags (e.g. cross-compile
 #                             flags for macOS x86_64-on-arm64, or
 #                             --target-os=mingw32 for Windows)
@@ -40,11 +50,15 @@
 
 set -euo pipefail
 
-: "${OPENH264_OS:?}"
 : "${OPENH264_ARCH:?}"
 : "${OUT_DIR:?}"
 FFMPEG_CONFIGURE_EXTRA="${FFMPEG_CONFIGURE_EXTRA:-}"
 LAME_CONFIGURE_EXTRA="${LAME_CONFIGURE_EXTRA:-}"
+# Exactly openh264's own Makefile's OS-detection formula (see the comment
+# above) - not guessed independently, so it can't drift out of sync with
+# whatever that Makefile actually expects.
+OPENH264_OS="${OPENH264_OS:-$(uname | tr 'A-Z' 'a-z' | tr -d -- '-0-9.' | sed -E 's/^(net|open|free)bsd/bsd/')}"
+echo "Detected OPENH264_OS=$OPENH264_OS (uname: $(uname))"
 
 : "${OPENH264_VERSION:=2.6.0}"
 : "${FFMPEG_VERSION:=n7.1}"
@@ -98,8 +112,13 @@ curl -sL "https://sourceforge.net/projects/lame/files/lame/${LAME_VERSION}/lame-
 tar xzf "$work/lame.tar.gz" -C "$work"
 (
 	cd "$work/lame-${LAME_VERSION}"
-	# shellcheck disable=SC2086
-	./configure --prefix="$work/lame-install" --enable-static --disable-shared --disable-frontend $LAME_CONFIGURE_EXTRA
+	# `eval` (not a plain unquoted expansion) so a value in
+	# LAME_CONFIGURE_EXTRA can itself contain a quoted, space-containing
+	# argument (e.g. --cc="clang -arch x86_64") and have that quoting
+	# actually respected, rather than being word-split on every space
+	# regardless of quotes - which is exactly what broke the first real
+	# CI run of this script for the macOS cross-compile case.
+	eval ./configure --prefix="$work/lame-install" --enable-static --disable-shared --disable-frontend "$LAME_CONFIGURE_EXTRA"
 	make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 	make install
 )
@@ -118,8 +137,16 @@ git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.
 	# including at least one nonfree codec none of our own flags
 	# requested). This flag makes `configure` use only the libraries
 	# explicitly `--enable-`d below, nothing auto-discovered.
-	# shellcheck disable=SC2086
-	./configure \
+	#
+	# `eval` (not a plain unquoted expansion) for the same reason as
+	# LAME's configure above - lets a value in FFMPEG_CONFIGURE_EXTRA
+	# quote its own space-containing argument correctly (e.g.
+	# --cc="clang -arch x86_64" for the macOS cross-compile case) instead
+	# of every space in it being treated as a new-argument boundary
+	# regardless of quoting, which broke the first real CI run of this
+	# exact case ("Unknown option \"x86_64\"." - the value's own quotes
+	# were being word-split away instead of respected).
+	eval ./configure \
 		--disable-autodetect \
 		--disable-gpl \
 		--disable-nonfree \
@@ -134,7 +161,7 @@ git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.
 		--disable-debug \
 		--disable-ffplay \
 		--disable-ffprobe \
-		$FFMPEG_CONFIGURE_EXTRA
+		"$FFMPEG_CONFIGURE_EXTRA"
 	make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 )
 

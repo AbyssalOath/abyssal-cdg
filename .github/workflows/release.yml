@@ -16,9 +16,12 @@ jobs:
         include:
           # ONNX Runtime's own prebuilt binaries cover this target
           # (`ort_platform`/`ort_archive_ext` name the release asset to
-          # download - see the "Fetch ONNX Runtime" step). `openh264_os`/
-          # `openh264_arch` are openh264's own build-system names (see
-          # scripts/build-ffmpeg.sh); `openh264_dl_url` is Cisco's own
+          # download - see the "Fetch ONNX Runtime" step). `openh264_arch`
+          # is openh264's own build-system arch name (see
+          # scripts/build-ffmpeg.sh, which auto-detects the OS name the
+          # same way openh264's own Makefile does - no matrix field for
+          # that, after guessing it wrong on the first real CI run: MSYS2's
+          # `uname` doesn't say "msys"); `openh264_dl_url` is Cisco's own
           # official binary for the *runtime* library ffmpeg loads (see
           # ffmpeg_path.rs for why that's a separate download from the
           # build-time openh264 the script above compiles).
@@ -29,7 +32,6 @@ jobs:
             ort_platform: osx-arm64
             ort_archive_ext: tgz
             ort_lib_name: libonnxruntime.dylib
-            openh264_os: darwin
             openh264_arch: arm64
             openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-arm64.dylib.bz2
             # -rpath,@executable_path: openh264 is linked with an
@@ -55,14 +57,22 @@ jobs:
             ort_platform: ""
             ort_archive_ext: ""
             ort_lib_name: libonnxruntime.dylib
-            openh264_os: darwin
             openh264_arch: x86_64
             openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-x64.dylib.bz2
             # Cross-compiled on this same arm64 runner, mirroring the
             # ONNX Runtime cross-compile above - clang's own cross-arch
             # support handles this without needing a separate toolchain.
-            # -rpath,@executable_path: see the arm64 entry's comment above.
-            ffmpeg_configure_extra: "--arch=x86_64 --enable-cross-compile --cc=clang --extra-cflags=-arch\\ x86_64 --extra-ldflags=-arch\\ x86_64\\ -Wl,-rpath,@executable_path"
+            # --cc is a compound command ("clang -arch x86_64"), so every
+            # compile *and* link step already gets -arch x86_64 through
+            # it - no separate --extra-cflags/--extra-ldflags needed just
+            # for that. -rpath,@executable_path: see the arm64 entry's
+            # comment above. (YAML single-quotes the whole value so the
+            # inner "..." are literal double-quotes passed straight to the
+            # shell - scripts/build-ffmpeg.sh `eval`s this value
+            # specifically so that quoting is honored instead of every
+            # space inside it being treated as a new argument, which is
+            # what the previous backslash-escaped version got wrong.)
+            ffmpeg_configure_extra: '--arch=x86_64 --enable-cross-compile --cc="clang -arch x86_64" --extra-ldflags="-Wl,-rpath,@executable_path"'
             # LAME is a completely separate autotools build from ffmpeg,
             # so it needs its own cross-compile flags independently of
             # ffmpeg_configure_extra above - --host triggers autotools'
@@ -78,10 +88,22 @@ jobs:
             ort_platform: linux-x64
             ort_archive_ext: tgz
             ort_lib_name: libonnxruntime.so
-            openh264_os: linux
             openh264_arch: x86_64
             openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2
-            ffmpeg_configure_extra: ""
+            # -rpath,$ORIGIN: without this, the built ffmpeg records a
+            # bare "libopenh264.so" NEEDED entry with no hint where to
+            # find it - fine for this app's own runtime (ffmpeg_path.rs
+            # sets LD_LIBRARY_PATH before ever spawning ffmpeg), but
+            # `cargo packager`'s AppImage step (linuxdeploy) inspects the
+            # binary's own dependencies *before* that, with no
+            # LD_LIBRARY_PATH of ours in effect, and failed to find it
+            # ("ERROR: Could not find dependency: libopenh264.so") on the
+            # first real CI run. $ORIGIN is GNU ld's own "directory
+            # containing this binary" token, resolved at load time, not a
+            # shell variable - the backslash keeps it that way through
+            # eval in scripts/build-ffmpeg.sh (see the macOS entries'
+            # comments for the same quoting mechanism).
+            ffmpeg_configure_extra: '--extra-ldflags="-Wl,-rpath,\$ORIGIN"'
 
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
@@ -90,7 +112,6 @@ jobs:
             ort_platform: win-x64
             ort_archive_ext: zip
             ort_lib_name: onnxruntime.dll
-            openh264_os: msys
             openh264_arch: x86_64
             openh264_dl_url: http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2
             ffmpeg_configure_extra: "--target-os=mingw32 --arch=x86_64"
@@ -140,7 +161,6 @@ jobs:
         if: matrix.platform != 'windows-latest'
         shell: bash
         env:
-          OPENH264_OS: ${{ matrix.openh264_os }}
           OPENH264_ARCH: ${{ matrix.openh264_arch }}
           FFMPEG_CONFIGURE_EXTRA: ${{ matrix.ffmpeg_configure_extra }}
           LAME_CONFIGURE_EXTRA: ${{ matrix.lame_configure_extra }}
@@ -152,7 +172,6 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: msys2 {0}
         env:
-          OPENH264_OS: ${{ matrix.openh264_os }}
           OPENH264_ARCH: ${{ matrix.openh264_arch }}
           FFMPEG_CONFIGURE_EXTRA: ${{ matrix.ffmpeg_configure_extra }}
           FFMPEG_EXE_NAME: ffmpeg.exe
