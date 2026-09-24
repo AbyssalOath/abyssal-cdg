@@ -2,17 +2,24 @@
 
 ## "It fails to compile" / dependency resolution errors
 
-This project, as configured, **will fail to compile on any Rust toolchain older than
-1.85** (released Feb 2025) - this is a dependency issue, not a bug in this project's own
-code.
+This project, as configured (via the committed `Cargo.lock`), **will fail to compile on
+any Rust toolchain older than 1.88** - this is a dependency issue, not a bug in this
+project's own code. That floor is the strictest `rust-version` declared by any locked
+dependency (`image`/`libloading`, both 1.88 - re-check with `cargo metadata --format-version
+1 | jq -r '.packages[] | select(.rust_version) | "\(.rust_version) \(.name)"' | sort -rV |
+head` if a future dependency bump changes it) - a toolchain below that fails outright
+with an error like:
 
-`eframe`/`egui` 0.28 pull in `egui-winit`, which unconditionally depends on
-`smithay-clipboard` -> `smithay-client-toolkit ^0.20` -> `wayland-protocols`. The
-published patch of `wayland-protocols` in that range requires Cargo's `edition2024`
-feature, which only stabilized in Rust 1.85. If your `rustc`/`cargo` is older than that
-(common - e.g. Ubuntu 24.04's `apt` package ships rustc 1.75, Debian stable is often
-older still, and some `rustup` installs go stale), `cargo build` fails immediately with
-an error like:
+```
+error: package `image v0.25.10` cannot be built because it requires rustc 1.88.0 or newer,
+while the currently active rustc version is 1.85.0
+```
+
+**If your toolchain is even older (below 1.85, released Feb 2025)**, you'll hit a
+different, more confusing error first: `eframe`/`egui` 0.28 pull in `egui-winit`, which
+unconditionally depends on `smithay-clipboard` -> `smithay-client-toolkit ^0.20` ->
+`wayland-protocols`. The published patch of `wayland-protocols` in that range requires
+Cargo's `edition2024` feature, which only stabilized in Rust 1.85:
 
 ```
 error: failed to download replaced source registry `crates-io`
@@ -22,33 +29,27 @@ Caused by:
   feature `edition2024` is required
 ```
 
-**Fix - the simple path:** update your Rust toolchain.
+Either way, the fix is the same:
 
 ```bash
 rustup update stable
-rustc --version   # confirm 1.85 or newer
+rustc --version   # confirm 1.88 or newer
 cargo build --release
 ```
 
-If you installed Rust via your OS package manager instead of `rustup`, switch to
-[rustup](https://rustup.rs) - distro packages lag behind, and this project (like most
-current `egui`-based apps) expects a reasonably current stable toolchain.
-
-**Fix - if you can't upgrade Rust:** pin `eframe`/`egui` to 0.27 and drop the `wayland`
-feature (X11-only fallback). This combination is known to resolve and compile cleanly on
-Rust 1.75:
-
-```toml
-eframe = { version = "0.27", default-features = false, features = ["glow", "default_fonts", "persistence", "x11"] }
-egui = "0.27"
-```
+(Common on Ubuntu 24.04's `apt` package, which ships rustc 1.75; Debian stable is often
+older still; some `rustup` installs go stale too.) If you installed Rust via your OS
+package manager instead of `rustup`, switch to [rustup](https://rustup.rs) - distro
+packages lag behind, and this project (like most current `egui`-based apps) expects a
+reasonably current stable toolchain.
 
 ## Verifying core logic without a display or audio device
 
 `main.rs` and `audio.rs`'s device initialization are the only code that touches
 `eframe`/`egui`/`rodio` directly - `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`,
 `formats.rs`, `video.rs`, `timeline.rs`, `project.rs`, `recent.rs`, `waveform.rs`,
-and `align.rs` are pure logic with no GUI dependency, and are fully covered by the
+`align.rs`, `ctc.rs`, `vocals.rs`, `mdx.rs`, `stft.rs`, `model_assets.rs`, and
+`onnxrt.rs` are pure logic with no GUI dependency, and are fully covered by the
 unit test suite:
 
 ```bash
@@ -61,12 +62,15 @@ and start/end overlap validation, duet/screaming color resolution, lyric-file
 import/export (LRC, UltraStar, KOK), video block-splitting, the fine-tuning timeline's
 zoom/drag math, the vocal-separation STFT/ISTFT round-trip math (`stft.rs`) and its
 chunking constants (`mdx.rs`), the CTC forced-alignment trellis and bundled-vocab
-sanity checks (`ctc.rs`/`align.rs`), project save/load and the crash-recovery
-autosave, the recent-files list, and the playback clock's play/pause/resume/seek
-state machine - all without needing real audio hardware, a display, or `ffmpeg`
-installed, and without needing the actual (not committed to the repo) ffmpeg binary,
-openh264 library, or ONNX model files either (those are only needed to actually *run*
-video export/auto-align/vocal removal, not to build or test the project).
+sanity checks (`ctc.rs`/`align.rs`), bundled/cached resource path resolution
+(`model_assets.rs`/`onnxrt.rs` - see ARCHITECTURE.md's "Bundled binaries and models"),
+WAV round-tripping and missing-file handling (`vocals.rs`), project save/load and the
+crash-recovery autosave, the recent-files list, and the playback clock's
+play/pause/resume/seek state machine - all without needing real audio hardware, a
+display, or `ffmpeg` installed, and without needing the actual (not committed to the
+repo) ffmpeg binary, openh264 library, or ONNX model files either (those are only
+needed to actually *run* video export/auto-align/vocal removal, not to build or test
+the project).
 
 If `cargo build`/`cargo test` fails with a *different* error than the one above, please
 open an issue with the exact output, your `rustc --version`, and your OS.

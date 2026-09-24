@@ -58,11 +58,15 @@ what a "vulnerability" can mean here.
   opposed to openh264) deliberately do *not* auto-download - see the note below.
 - Path handling bugs that write or read outside of what the user selected (in a file
   dialog, dropped onto the window, or picked from the "Recent" list), including the
-  throwaway temp directories `vocals.rs` creates (under the OS temp dir with a
-  per-process/per-call unique name, removed after use), the per-user cache directories
-  `model_assets.rs`/`ffmpeg_path.rs` download into, and the app's own per-user data
-  directory (`eframe::storage_dir`) used for the crash-recovery autosave and the
-  recent-files list.
+  throwaway temp files `vocals.rs`/`main.rs` create (under the OS temp dir, named with
+  just the current process ID - e.g. `abyssal-cdg-align-vocals-<pid>.wav`,
+  `abyssal-cdg-instrumental-<pid>.wav` - not a per-call-unique name, so two sequential
+  calls in the same process reuse the same path; each is removed after use and this
+  app never makes concurrent calls that could collide on one, so it's not a real
+  vulnerability, just worth knowing if you add a new one of these), the per-user cache
+  directories `model_assets.rs`/`ffmpeg_path.rs` download into, and the app's own
+  per-user data directory (`eframe::storage_dir`) used for the crash-recovery autosave
+  and the recent-files list.
 - Anything in `mdx.rs`/`stft.rs`/`ctc.rs` that could turn a malformed/adversarial
   audio file (or, for `ctc.rs`, adversarial lyric text) into memory corruption
   (buffer over-/under-read in the manual chunking/indexing/trellis math) - this is
@@ -118,8 +122,8 @@ security issue):**
   as individual `Command::arg`s - never interpolated into a shell string. Keep it that
   way; if you add a new argument, add it as its own `.arg(...)` call. `ffmpeg` itself
   is a binary this project builds from source and bundles (`ffmpeg_path.rs`), not a
-  system install anymore - see "Building" in the README for the LGPL-only/openh264/
-  LAME configuration.
+  system install anymore - see "Bundled binaries and models" in ARCHITECTURE.md for
+  the LGPL-only/openh264/LAME configuration.
 - Vocal removal (`vocals.rs`/`mdx.rs`) and auto-align (`align.rs`/`ctc.rs`) both run
   their ONNX model in-process via `ort` (ONNX Runtime) - no subprocess, no separately
   installed tool for either. Neither shells out to Python/`audio-separator`/`aeneas`

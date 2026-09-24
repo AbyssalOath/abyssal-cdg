@@ -33,8 +33,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Stdio;
 
-static DEJAVU_REGULAR: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
-static DEJAVU_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
+static DEJAVU_REGULAR: &[u8] = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
+static DEJAVU_BOLD: &[u8] = include_bytes!("../assets/fonts/dejavu/DejaVuSans-Bold.ttf");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Resolution {

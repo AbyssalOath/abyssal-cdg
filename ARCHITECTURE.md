@@ -3,8 +3,8 @@
 Abyssal CDG Creator is a single-binary desktop app: a GUI shell (`main.rs`) driving a
 set of pure-logic modules that turn timed lyrics into a legacy `.cdg` file, a modern
 `.mp4` video, and/or a portable `.lrc`/UltraStar `.txt` lyrics file. This doc describes
-how the pieces fit together; see the README for what the app actually does from a
-user's perspective.
+how the pieces fit together; see [FEATURES.md](FEATURES.md) for what the app
+actually does from a user's perspective, or the README for a quick overview.
 
 ## Module map
 
@@ -99,8 +99,14 @@ onnxrt.rs    Locates and loads the ONNX Runtime shared library itself (not a
 align.rs     Runs a wav2vec2-CTC speech model natively (via `ort`, same as
              vocals.rs) once per already-timed line, restricted to that line's own
              tapped window, to fill in real word-level timing via forced alignment
-             - "🪄 Auto-align words". The model isn't bundled (each language is
-             ~1.2GB) - downloaded/cached via model_assets.rs on first use instead.
+             - "🪄 Auto-align words". main.rs's `start_word_alignment` isolates
+             vocals first (`vocals::separate_vocals_to_temp_wav`) and aligns
+             against that stem instead of the full mix - the CTC model tracks
+             singing more reliably without instrumentation underneath it - falling
+             back to the original mixed audio if separation itself fails, rather
+             than failing the whole run over what's an accuracy improvement, not a
+             hard requirement. The model isn't bundled (each language is ~1.2GB) -
+             downloaded/cached via model_assets.rs on first use instead.
 ctc.rs       The CTC forced-alignment trellis algorithm and vocab/tokenization
              logic behind align.rs - kept separate so it's unit-tested with
              synthetic emission matrices, no ONNX model needed.
@@ -148,7 +154,7 @@ ctc.rs       The CTC forced-alignment trellis algorithm and vocab/tokenization
    (CDG's fixed 300x216 tile canvas vs. an arbitrary-resolution RGB frame buffer).
 6. `main.rs`'s live preview is a *third* consumer of the same `TimedLine`/`word_timings`/
    `countdown_window` data (using `video.rs`'s multi-line block grouping, not the CDG
-   layout - see the README's "Live preview vs. the exported file" section). The
+   layout - see FEATURES.md's "Live preview vs. the exported file" section). The
    fine-tuning timeline is a *fourth* consumer, plus a *producer*: it reads the
    resolved timing to position bubbles, and writes back into the same `LyricLine`
    fields when a bubble is dragged - see `TimelineDrag`/`DragSession` in `main.rs`/
@@ -241,12 +247,16 @@ still in progress (so the caller knows to keep calling `ctx.request_repaint()`).
   `poll_waveform_job`) decodes the loaded audio into peaks on its own background
   thread whenever a new file is loaded (manually, via drag-and-drop, or via
   project load/recovery).
-- **Auto-align** (`start_word_alignment` / `AlignJob` / `poll_align_job`) loads
-  one `align::Aligner` (decodes the audio and loads the selected language's
-  model once) and calls `align_line` per already-timed multi-word line,
-  sequentially, on a single background thread, updating progress after each
-  line. A whole-job-level failure (model failed to load/download) short-circuits
-  before attempting any line; a per-line failure doesn't stop the rest.
+- **Auto-align** (`start_word_alignment` / `AlignJob` / `poll_align_job`) runs
+  entirely on a single background thread, in two phases against one shared
+  progress value (0-500 = separation, 500-1000 = alignment): first isolates
+  vocals into a temp WAV (`vocals::separate_vocals_to_temp_wav`, falling back to
+  the original audio if that fails), then loads one `align::Aligner` against
+  whichever audio was chosen (decodes it and loads the selected language's model
+  once) and calls `align_line` per already-timed multi-word line, sequentially,
+  updating progress after each line, before deleting the temp file. A
+  whole-job-level failure (model failed to load/download) short-circuits before
+  attempting any line; a per-line failure doesn't stop the rest.
 
 Audio playback itself runs on `rodio`'s own output thread; `AudioPlayer` only
 tracks a wall-clock position (`PlaybackClock`) on the main thread, deliberately

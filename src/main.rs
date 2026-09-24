@@ -484,39 +484,53 @@ impl InstrumentalFormat {
 enum ColorPreset {
     #[default]
     Classic,
+    Abyssal,
     HighContrast,
     Sunset,
     Ocean,
-    Abyssal,
 }
 
 impl ColorPreset {
     fn label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
+            Self::Abyssal => "Abyssal",
             Self::HighContrast => "High Contrast",
             Self::Sunset => "Sunset",
             Self::Ocean => "Ocean",
-            Self::Abyssal => "Abyssal",
         }
     }
 
     fn palette(self) -> Palette {
         match self {
             Self::Classic => Palette::default(),
+            Self::Abyssal => Palette::abyssal(),
             Self::HighContrast => Palette::high_contrast(),
             Self::Sunset => Palette::sunset(),
             Self::Ocean => Palette::ocean(),
-            Self::Abyssal => Palette::abyssal(),
+        }
+    }
+
+    /// This preset's own bundled default lyric-text font, if it has one -
+    /// applied once, alongside the colors, by `apply_color_preset` (see
+    /// `fonts.rs`'s `BUNDLED_FONTS` docs for why "Nosifer" specifically is
+    /// bundled rather than a system font lookup). `None` for every other
+    /// preset: they intentionally leave whatever font is already selected
+    /// alone, the same "set it now, don't keep enforcing it" behavior the
+    /// colors themselves already have.
+    fn default_font(self) -> Option<&'static str> {
+        match self {
+            Self::Abyssal => Some("Nosifer"),
+            Self::Classic | Self::HighContrast | Self::Sunset | Self::Ocean => None,
         }
     }
 }
 const ALL_COLOR_PRESETS: [ColorPreset; 5] = [
     ColorPreset::Classic,
+    ColorPreset::Abyssal,
     ColorPreset::HighContrast,
     ColorPreset::Sunset,
     ColorPreset::Ocean,
-    ColorPreset::Abyssal,
 ];
 
 /// One output's result from a combined export - a combined export can
@@ -770,6 +784,11 @@ impl KaraokeApp {
         self.color_screaming_unsung = color32_from_cdg(p.screaming_unsung);
         self.color_screaming_highlight = color32_from_cdg(p.screaming_highlight);
         self.color_preset = preset;
+        if let Some(font_name) = preset.default_font() {
+            self.selected_font_family = Some(font_name.to_string());
+            self.font_bytes = None;
+            self.font_load_error = None;
+        }
     }
 
     /// Resolve current lyric timing into a `(timed_lines, total_duration)`
@@ -1683,6 +1702,25 @@ impl KaraokeApp {
                                         *slot = Some(w.end);
                                     }
                                 }
+                                // Keep the line's own start/sing_end in
+                                // sync with the first/last aligned word,
+                                // the same tracking behavior manual
+                                // tapping/dragging have (see
+                                // tap_word_start/tap_word_end and the
+                                // timeline drag handler) - otherwise
+                                // aligned word timing can land outside the
+                                // line's own start/end, needing a second
+                                // manual fix. Safe unconditionally: each
+                                // word's timestamp already comes from
+                                // align_line's own analysis window
+                                // (`window_start`/`window_end` in
+                                // start_word_alignment), which is itself
+                                // already clamped to the neighboring
+                                // lines' own bounds.
+                                if let (Some(first), Some(last)) = (words.first(), words.last()) {
+                                    line.start = Some(first.start);
+                                    line.sing_end_override = Some(last.end);
+                                }
                                 aligned_lines += 1;
                                 aligned_words += words.len();
                             }
@@ -2172,6 +2210,13 @@ impl KaraokeApp {
         self.status = "Timing cleared.".to_string();
     }
 
+    /// Tapping the *first* word's start also moves the line's own `start`
+    /// to match (checked against the same neighbor-overlap rule
+    /// [`lyrics::check_start_change`] applies to a direct line-start
+    /// edit) - keeping the line bubble and its first word bubble always in
+    /// sync, instead of letting them drift apart and need a second manual
+    /// fix. See the matching sync in the timeline drag handler and in
+    /// `poll_align_job` for auto-align's own results.
     fn tap_word_start(&mut self, line_idx: usize, word_idx: usize) {
         let Some(audio) = &self.audio else { return };
         if !audio.is_playing() {
@@ -2179,9 +2224,18 @@ impl KaraokeApp {
             return;
         }
         let pos = audio.position();
+        if word_idx == 0 {
+            if let Err(e) = lyrics::check_start_change(&self.lines, line_idx, pos) {
+                self.status = e;
+                return;
+            }
+        }
         if let Some(line) = self.lines.get_mut(line_idx) {
             if let Some(slot) = line.word_overrides.get_mut(word_idx) {
                 *slot = Some(pos);
+            }
+            if word_idx == 0 {
+                line.start = Some(pos);
             }
         }
     }
@@ -2190,6 +2244,10 @@ impl KaraokeApp {
     /// lets a word's color-wipe finish (and freeze) *before* the next
     /// word's start, instead of always stretching to fill that whole gap.
     /// See [`lyrics::LyricLine::word_end_overrides`].
+    ///
+    /// Tapping the *last* word's end also moves the line's own
+    /// `sing_end_override` to match, the same sync [`Self::tap_word_start`]
+    /// does for the first word's start.
     fn tap_word_end(&mut self, line_idx: usize, word_idx: usize) {
         let Some(audio) = &self.audio else { return };
         if !audio.is_playing() {
@@ -2197,9 +2255,22 @@ impl KaraokeApp {
             return;
         }
         let pos = audio.position();
+        let is_last_word = self
+            .lines
+            .get(line_idx)
+            .is_some_and(|l| word_idx + 1 == l.words().len());
+        if is_last_word {
+            if let Err(e) = lyrics::check_end_change(&self.lines, line_idx, pos) {
+                self.status = e;
+                return;
+            }
+        }
         if let Some(line) = self.lines.get_mut(line_idx) {
             if let Some(slot) = line.word_end_overrides.get_mut(word_idx) {
                 *slot = Some(pos);
+            }
+            if is_last_word {
+                line.sing_end_override = Some(pos);
             }
         }
     }
@@ -3522,10 +3593,20 @@ impl KaraokeApp {
                                     if let Some(slot) = l.word_overrides.get_mut(w) {
                                         *slot = Some(s);
                                     }
-                                    // The first word pushing earlier than
-                                    // the line's own start pulls the
-                                    // line's start along with it.
-                                    if w == 0 && s < l.start.unwrap_or(s) {
+                                    // The first word's start always tracks
+                                    // the line's own start, in both
+                                    // directions - not just when pushed
+                                    // earlier - so shrinking it back in
+                                    // pulls the line bubble back with it
+                                    // too, instead of leaving the line
+                                    // stuck wherever it was last pushed
+                                    // out to. Already safe unconditionally:
+                                    // `bounds.min_start` above caps this
+                                    // drag at the previous line's own
+                                    // sing_end, the same neighbor limit
+                                    // `check_start_change` enforces
+                                    // elsewhere.
+                                    if w == 0 {
                                         l.start = Some(s);
                                     }
                                 }
@@ -3533,10 +3614,12 @@ impl KaraokeApp {
                                     if let Some(slot) = l.word_end_overrides.get_mut(w) {
                                         *slot = Some(e);
                                     }
-                                    // Symmetrically, the last word
-                                    // pushing later than the line's own
-                                    // sing_end extends the line to match.
-                                    if w == last_word_idx && e > line.sing_end {
+                                    // Symmetrically, the last word's end
+                                    // always tracks the line's own
+                                    // sing_end - see the matching comment
+                                    // above (bounds.max_sing_end caps this
+                                    // at the next line's start).
+                                    if w == last_word_idx {
                                         l.sing_end_override = Some(e);
                                     }
                                 }
@@ -4040,7 +4123,10 @@ impl eframe::App for KaraokeApp {
                      you hear back and tap timestamps against is unaffected either way. Nothing \
                      to install separately - the selected language's model downloads \
                      automatically the first time you use it (a one-time, roughly 1.2GB \
-                     download, then cached). Undo (Ctrl+Z) if a result doesn't look right.",
+                     download, then cached). Best-effort, not perfect: it's a speech model, \
+                     not one trained for singing, so always play the result back and fine-tune \
+                     anything that's off before exporting - treat it as a fast first pass, not \
+                     a substitute for a final review. Undo (Ctrl+Z) if a result doesn't help.",
                 )
                 .small()
                 .weak(),

@@ -28,9 +28,10 @@ an old Rust toolchain, not a bug in this project.
   no need to go fix unrelated ones as part of your change).
 - If you touched `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`, `formats.rs`,
   `video.rs`, `timeline.rs`, `project.rs`, `recent.rs`, `waveform.rs`, or
-  `stft.rs`/`mdx.rs`/`ctc.rs`/`align.rs`/`ffmpeg_path.rs`, add or update a unit test
-  alongside the change - these modules are pure logic with no GUI dependency, so
-  there's no excuse not to. `main.rs` (GUI wiring, including the timeline widget's
+  `stft.rs`/`mdx.rs`/`ctc.rs`/`align.rs`/`vocals.rs`/`model_assets.rs`/`onnxrt.rs`/
+  `ffmpeg_path.rs`, add or update a unit test alongside the change - these modules
+  are pure logic with no GUI dependency, so there's no excuse not to. `main.rs` (GUI
+  wiring, including the timeline widget's
   painting/interaction code and the undo/redo frame-diffing) has no automated tests;
   changes there are verified by running the app. `ffmpeg`'s subprocess invocation, and
   `mdx.rs`'s/`align.rs`'s actual ONNX inference against the real (not committed) model

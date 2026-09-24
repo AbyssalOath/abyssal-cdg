@@ -153,4 +153,21 @@ Zlib (2): foldhash, slotmap
 
 The DejaVu Sans / DejaVu Sans Bold fonts bundled for video export are
 under the permissive Bitstream Vera license - see
-`assets/DEJAVU-LICENSE.txt`.
+`assets/fonts/dejavu/DEJAVU-LICENSE.txt`.
+
+Two more fonts are bundled as selectable lyric-text fonts (see `fonts.rs`'s
+`BUNDLED_FONTS`) - both under the permissive SIL Open Font License 1.1,
+which allows commercial use, redistribution, and embedding freely (the
+same license class as DejaVu's own Bitstream Vera above):
+- **Creepster** - Copyright 2011 Font Diner, Inc. - see
+  `assets/fonts/creepster/OFL.txt`.
+- **Nosifer** - Copyright 2011 Typomondo - see
+  `assets/fonts/nosifer/OFL.txt`. Used as the "Abyssal" color preset's own
+  default font.
+
+An earlier "Bloodlust" font (Iconian Fonts) was considered for this exact
+spot and dropped before ever being released - its own license is
+non-commercial-use-only, which doesn't fit this project's bundled-font bar
+(everything baked into the compiled binary needs a license that's fine
+with commercial use/redistribution, since this app itself is - see
+`CONTRIBUTING.md`'s "only bundles permissively-licensed dependencies").

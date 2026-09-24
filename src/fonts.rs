@@ -17,16 +17,41 @@ use font_kit::handle::Handle;
 use font_kit::properties::{Style, Weight};
 use font_kit::source::SystemSource;
 
-/// Every distinct font family name installed on this machine, sorted and
-/// deduplicated (font-kit's own listing can repeat a family name once per
-/// style/weight file on some platforms/backends). Can take a noticeable
-/// moment on a machine with a lot of fonts - callers should run this on a
-/// background thread rather than blocking a frame on it.
+/// Fonts this app ships itself, baked into the binary at compile time -
+/// unlike every other selectable font, which is loaded from whatever's
+/// actually installed on the running machine (see [`load_family_bytes`]).
+/// Both under the SIL Open Font License 1.1 (see their own `OFL.txt`
+/// under `assets/fonts/`) - genuinely permissive (commercial use,
+/// redistribution, embedding all fine, same class of license as DejaVu's
+/// own Bitstream Vera), unlike an earlier "Bloodlust" font considered for
+/// this exact spot and dropped for being non-commercial-use-only. Merged
+/// into [`list_family_names`]'s result so they show up in the manual font
+/// picker like any other choice, not just reachable via a color preset -
+/// "Nosifer" is also the "Abyssal" color preset's own default font (see
+/// `main.rs`'s `apply_color_preset`).
+const BUNDLED_FONTS: &[(&str, &[u8])] = &[
+    (
+        "Creepster",
+        include_bytes!("../assets/fonts/creepster/Creepster-Regular.ttf"),
+    ),
+    (
+        "Nosifer",
+        include_bytes!("../assets/fonts/nosifer/Nosifer-Regular.ttf"),
+    ),
+];
+
+/// Every distinct font family name installed on this machine, plus this
+/// app's own bundled fonts (see [`BUNDLED_FONTS`]), sorted and deduplicated
+/// (font-kit's own listing can repeat a family name once per style/weight
+/// file on some platforms/backends). Can take a noticeable moment on a
+/// machine with a lot of fonts - callers should run this on a background
+/// thread rather than blocking a frame on it.
 pub fn list_family_names() -> Result<Vec<String>> {
     let source = SystemSource::new();
-    let names = source
+    let mut names = source
         .all_families()
         .context("failed to enumerate system fonts")?;
+    names.extend(BUNDLED_FONTS.iter().map(|(name, _)| name.to_string()));
     Ok(dedup_sorted(names))
 }
 
@@ -45,6 +70,9 @@ fn dedup_sorted(mut names: Vec<String>) -> Vec<String> {
 /// raw TrueType/OpenType bytes - font-kit's own `Font` wrapper isn't needed
 /// past this point.
 pub fn load_family_bytes(family_name: &str) -> Result<Vec<u8>> {
+    if let Some((_, bytes)) = BUNDLED_FONTS.iter().find(|(name, _)| *name == family_name) {
+        return Ok(bytes.to_vec());
+    }
     let source = SystemSource::new();
     let family = source
         .select_family_by_name(family_name)
