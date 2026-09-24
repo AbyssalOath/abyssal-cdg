@@ -1,8 +1,10 @@
 # Abyssal CDG Creator
 
-A desktop app (Rust + egui) that turns an audio file and a block of pasted
-lyrics into a real karaoke `.cdg` file - the standard CD+Graphics format
-used by karaoke machines and "MP3+G" karaoke software.
+A desktop application written in Rust and egui for creating real CD+G karaoke files from audio and lyrics.
+
+Abyssal CDG Creator is designed for people who want to make karaoke tracks without fighting complex or outdated software. Import audio, paste lyrics, automatically align timing, customize colors and layout, and export authentic `.cdg` files compatible with karaoke players and MP3+G software.
+
+Creating karaoke tracks still takes effort, but Abyssal CDG Creator aims to make the process faster, simpler, and more approachable.
 
 [![CI](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml/badge.svg)](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/AbyssalOath/abyssal-cdg)](https://github.com/AbyssalOath/abyssal-cdg/releases/latest)
