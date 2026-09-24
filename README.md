@@ -16,6 +16,8 @@ Creating karaoke tracks still takes effort, but Abyssal CDG Creator aims to make
 
 ![Export Screenshot](assets/screenshots/export.png)
 
+![MP4 Screenshot](assets/screenshots/abyssal-cdg-example-3.png)
+
 ## What it does
 
 Paste (or import) lyrics, load an audio file, and tap **Space** along with
