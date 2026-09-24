@@ -30,8 +30,8 @@ use audio::AudioPlayer;
 use eframe::egui;
 use export::Palette;
 use lyrics::{
-    blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines, resolve_timing,
-    singer_legend, BackingVocal, LyricLine, Singer, TimedLine,
+    blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines, singer_legend,
+    BackingVocal, LyricLine, Singer, TimedLine,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -238,6 +238,14 @@ struct KaraokeApp {
     /// ends, the same instant those words need a click - so it can be
     /// turned off to fine-tune a line at your own pace instead.
     auto_follow_words: bool,
+    /// Whether the timing table's Lyric column truncates long lines (with a
+    /// hover tooltip for the full text) instead of growing to fit - off by
+    /// default (nothing is hidden until you ask for it), a session-only
+    /// view preference like `auto_follow_words`, not saved with the
+    /// project. Narrows the table considerably on a long lyric line, so
+    /// there's less to horizontally scroll through to reach the Singer/
+    /// Countdown/action columns.
+    compact_timing_table: bool,
     /// Line index + in-progress text while a start-time field in the
     /// timing table is focused - `None` the rest of the time, so the
     /// displayed text otherwise always mirrors the line's live value.
@@ -326,6 +334,12 @@ struct KaraokeApp {
         egui::Color32,
         Option<egui::TextureHandle>,
     )>,
+    /// User-configurable overrides for the word-pace/countdown-sensitivity
+    /// heuristics in `lyrics.rs` - see [`lyrics::TimingSettings`]. Defaults
+    /// to this app's own long-standing constants, so a project that never
+    /// opens the "Timing" panel behaves exactly as before this setting
+    /// existed.
+    timing_settings: lyrics::TimingSettings,
     /// The system font family chosen for lyric text, if any - `None` means
     /// the bundled default (DejaVu Sans, the same font the video export
     /// always used before this existed). Applies to the video export and
@@ -405,6 +419,12 @@ struct KaraokeApp {
     /// Language model used for auto-align (see `align.rs`) - defaults to
     /// English since the app has no other language-awareness.
     align_language: align::AlignLanguage,
+    /// Which vocal-isolation model auto-align uses to isolate vocals
+    /// before running forced alignment against them (see
+    /// `start_word_alignment`) - defaults to [`mdx::MdxModel::InstHq3`],
+    /// same as everywhere else in the app. Session-only, like
+    /// `align_language` itself - not saved with the project.
+    align_vocal_model: mdx::MdxModel,
     /// Set while a background "Auto-align words" run is in progress.
     align_job: Option<AlignJob>,
 
@@ -646,6 +666,7 @@ impl KaraokeApp {
             backing_vocal_edit: None,
             word_tap_mode: WordTapMode::default(),
             auto_follow_words: true,
+            compact_timing_table: false,
             start_edit: None,
             end_edit: None,
             selected_lines: std::collections::BTreeSet::new(),
@@ -675,6 +696,7 @@ impl KaraokeApp {
             background_fit: video::BackgroundFit::default(),
             background_dim: 0.4,
             background_preview: None,
+            timing_settings: lyrics::TimingSettings::default(),
             selected_font_family: None,
             font_list: None,
             font_list_job: None,
@@ -701,6 +723,7 @@ impl KaraokeApp {
             waveform: None,
             waveform_job: None,
             align_language: align::AlignLanguage::Eng,
+            align_vocal_model: mdx::MdxModel::InstHq3,
             align_job: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -795,7 +818,8 @@ impl KaraokeApp {
     /// pair. Used by both export and the live preview so they always agree.
     fn resolved(&self) -> (Vec<TimedLine>, f64) {
         let duration_hint = self.audio.as_ref().and_then(|a| a.duration());
-        let timed = resolve_timing(&self.lines, duration_hint);
+        let timed =
+            lyrics::resolve_timing_with_settings(&self.lines, duration_hint, &self.timing_settings);
         let total = duration_hint
             .unwrap_or(0.0)
             .max(timed.last().map(|t| t.end).unwrap_or(0.0));
@@ -837,6 +861,7 @@ impl KaraokeApp {
             background_fit: self.background_fit,
             background_dim: self.background_dim,
             lyric_font_family: self.selected_font_family.clone(),
+            timing_settings: self.timing_settings,
         }
     }
 
@@ -972,6 +997,7 @@ impl KaraokeApp {
         self.selected_font_family = project.lyric_font_family;
         self.font_bytes = None;
         self.font_load_error = None;
+        self.timing_settings = project.timing_settings;
 
         let c = project.colors;
         self.color_bg = color32_from_rgb_color(c.background);
@@ -1592,6 +1618,7 @@ impl KaraokeApp {
         }
 
         let language = self.align_language;
+        let vocal_model = self.align_vocal_model;
         let total = requests.len();
 
         let progress = Arc::new(AtomicU32::new(0));
@@ -1624,7 +1651,7 @@ impl KaraokeApp {
             let mut vocals_tmp: Option<PathBuf> = None;
             let align_source: PathBuf = {
                 let progress_for_separation = progress_clone.clone();
-                match vocals::separate_vocals_to_temp_wav(&audio_path, move |p| {
+                match vocals::separate_vocals_to_temp_wav(&audio_path, vocal_model, move |p| {
                     progress_for_separation.store((p * 500.0) as u32, Ordering::Relaxed);
                 }) {
                     Ok(path) => {
@@ -2097,7 +2124,12 @@ impl KaraokeApp {
                 }
             };
             let line = &self.lines[orig_idx];
-            timed.push(TimedLine::from_line(line, start, end));
+            timed.push(TimedLine::from_line_with_settings(
+                line,
+                start,
+                end,
+                &self.timing_settings,
+            ));
             indices.push(orig_idx);
         }
         (timed, indices)
@@ -2570,6 +2602,7 @@ impl KaraokeApp {
         }
 
         let (timed, total_duration) = self.resolved();
+        let timing_settings = self.timing_settings;
         let cdg_palette = self.palette();
         let video_palette = self.video_palette();
         let title = (!self.title.trim().is_empty()).then(|| self.title.trim().to_string());
@@ -2629,12 +2662,13 @@ impl KaraokeApp {
             let mut paired_audio_sibling: Option<PathBuf> = None;
 
             if do_cdg {
-                let bytes = export::render_cdg(
+                let bytes = export::render_cdg_with_settings(
                     &timed,
                     total_duration,
                     &cdg_palette,
                     title.as_deref(),
                     artist.as_deref(),
+                    &timing_settings,
                 );
                 let r = std::fs::write(&cdg_path, &bytes)
                     .map(|()| cdg_path.clone())
@@ -2811,6 +2845,7 @@ impl KaraokeApp {
                         background_dim,
                         custom_font_bytes,
                         &video_path,
+                        &timing_settings,
                         |p| set_progress(video_phase, p),
                     );
 
@@ -2970,9 +3005,12 @@ impl KaraokeApp {
                 // sitting on the generic "nothing timed yet" note icon.
                 if let Some(first) = timed.first() {
                     if t < first.start {
-                        if let Some((cd_start, cd_end)) =
-                            lyrics::countdown_window_between(card_end, first.start)
-                        {
+                        if let Some((cd_start, cd_end)) = lyrics::countdown_window_between(
+                            card_end,
+                            first.start,
+                            first.countdown_mode,
+                            &self.timing_settings,
+                        ) {
                             if t >= cd_start {
                                 let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
                                     .clamp(0.0, 1.0);
@@ -3027,8 +3065,22 @@ impl KaraokeApp {
                         // should read as "done, waiting" (then the countdown, then the
                         // next line), not show lyrics that are still a break away.
                         let current_line = &timed[current_idx];
-                        let hide_upcoming = hide_upcoming_lines(current_line, t);
-                        let blank_sung = blank_sung_lines(current_line, t);
+                        let next_countdown_mode = timed
+                            .get(current_idx + 1)
+                            .map(|n| n.countdown_mode)
+                            .unwrap_or_default();
+                        let hide_upcoming = hide_upcoming_lines(
+                            current_line,
+                            t,
+                            next_countdown_mode,
+                            &self.timing_settings,
+                        );
+                        let blank_sung = blank_sung_lines(
+                            current_line,
+                            t,
+                            next_countdown_mode,
+                            &self.timing_settings,
+                        );
                         let lyric_family = self.lyric_font_family();
 
                         for (slot, &idx) in block.iter().enumerate() {
@@ -3123,7 +3175,11 @@ impl KaraokeApp {
                         // line to count into - see the matching comment in
                         // video.rs's render_frame.
                         let has_next_line = current_idx + 1 < timed.len();
-                        if let Some((cd_start, cd_end)) = countdown_window(current_line) {
+                        if let Some((cd_start, cd_end)) = countdown_window(
+                            current_line,
+                            next_countdown_mode,
+                            &self.timing_settings,
+                        ) {
                             if has_next_line && t >= cd_start {
                                 let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
                                     .clamp(0.0, 1.0);
@@ -4109,6 +4165,22 @@ impl eframe::App for KaraokeApp {
                                 );
                             }
                         });
+                    ui.label("Vocal model:").on_hover_text(
+                        "Which model isolates vocals before alignment - doesn't affect \
+                         \"Instrumental audio\"/\"Vocals audio\" export or video's \"Remove \
+                         vocals\", which always use Inst HQ 3.",
+                    );
+                    egui::ComboBox::from_id_source("align_vocal_model")
+                        .selected_text(self.align_vocal_model.label())
+                        .show_ui(ui, |ui| {
+                            for model in mdx::MdxModel::ALL {
+                                ui.selectable_value(
+                                    &mut self.align_vocal_model,
+                                    model,
+                                    model.label(),
+                                );
+                            }
+                        });
                 });
                 if busy {
                     ui.spinner();
@@ -4546,6 +4618,88 @@ impl eframe::App for KaraokeApp {
                                     }
                                 }
                             });
+                        egui::CollapsingHeader::new("Timing")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Tunes the word-timing estimate and the \"get ready\" \
+                                         countdown's sensitivity - used only where you haven't \
+                                         fine-tuned something yourself (a manually tapped word, \
+                                         or an auto-aligned line). Saved with the project.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(4.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Seconds per word:");
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.timing_settings.seconds_per_word,
+                                            0.1..=1.5,
+                                        )
+                                        .custom_formatter(|v, _| format!("{v:.2}s")),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "How long each word is assumed to take to sing, for the \
+                                         word-by-word color wipe - only matters for words you \
+                                         haven't fine-tuned by hand.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(6.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Minimum line duration:");
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.timing_settings.min_sing_duration,
+                                            0.3..=5.0,
+                                        )
+                                        .custom_formatter(|v, _| format!("{v:.2}s")),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "A floor under the estimate above, so even a single \
+                                         short word still gets a readable amount of time on \
+                                         screen.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(6.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Countdown gap threshold:");
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.timing_settings.countdown_gap_threshold,
+                                            1.0..=15.0,
+                                        )
+                                        .custom_formatter(|v, _| format!("{v:.1}s")),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "How long a gap before a line starts (or before the \
+                                         first line, after the title card) needs to be before \
+                                         the \"get ready\" countdown dots appear.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(6.0);
+
+                                if ui.button("Reset to defaults").clicked() {
+                                    self.timing_settings = lyrics::TimingSettings::default();
+                                }
+                            });
                     });
             });
 
@@ -4798,16 +4952,23 @@ impl eframe::App for KaraokeApp {
                     }
                 });
             });
-            ui.label(
-                egui::RichText::new(
-                    "Click a row's checkbox to select it - Shift-click for a range, \
-                     Ctrl/Cmd-click to add/remove one at a time.",
-                )
-                .small()
-                .weak(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Click a row's checkbox to select it - Shift-click for a range, \
+                         Ctrl/Cmd-click to add/remove one at a time.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.checkbox(&mut self.compact_timing_table, "Compact table")
+                    .on_hover_text(
+                        "Truncate long lyric lines in the table below (hover a truncated \
+                         one to see the full text) instead of letting them widen the table.",
+                    );
+            });
 
-            egui::ScrollArea::both()
+            egui::ScrollArea::vertical()
                 .id_source("timing_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -4818,55 +4979,111 @@ impl eframe::App for KaraokeApp {
                     // had already been set).
                     let (timed_for_grid, indices_for_grid) = self.resolved_with_indices();
                     let mut estimated_end = vec![None; self.lines.len()];
+                    // The actual gap before each line starts (previous
+                    // timed line's sing_end -> this line's start), used
+                    // only to warn when "Force" won't have much room to
+                    // work with - `None` for the very first timed line
+                    // (nothing sung before it to measure from; the
+                    // title-card-to-first-line gap is a separate
+                    // computation this table doesn't have handy, so it's
+                    // simplest to just not warn there).
+                    let mut gap_before_line = vec![None; self.lines.len()];
+                    let mut prev_sing_end: Option<f64> = None;
                     for (t, &orig_idx) in timed_for_grid.iter().zip(indices_for_grid.iter()) {
                         estimated_end[orig_idx] = Some(t.sing_end);
+                        if let Some(prev) = prev_sing_end {
+                            gap_before_line[orig_idx] = Some(t.start - prev);
+                        }
+                        prev_sing_end = Some(t.sing_end);
                     }
 
-                    egui::Grid::new("lines_grid")
-                        .num_columns(9)
-                        .striped(true)
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            let mut retap_idx: Option<usize> = None;
-                            let mut words_idx: Option<usize> = None;
-                            let mut backing_idx: Option<usize> = None;
-                            let mut nudge: Option<(usize, f64)> = None;
-                            let mut clear_idx: Option<usize> = None;
-                            let mut commit_start: Option<(usize, String)> = None;
-                            let mut commit_end: Option<(usize, String)> = None;
-                            let mut selection_click: Option<(usize, bool, bool)> = None;
+                    let mut retap_idx: Option<usize> = None;
+                    let mut words_idx: Option<usize> = None;
+                    let mut backing_idx: Option<usize> = None;
+                    let mut nudge: Option<(usize, f64)> = None;
+                    let mut clear_idx: Option<usize> = None;
+                    let mut commit_start: Option<(usize, String)> = None;
+                    let mut commit_end: Option<(usize, String)> = None;
+                    let mut selection_click: Option<(usize, bool, bool)> = None;
 
-                            ui.label("");
-                            ui.label(egui::RichText::new("Start").small().weak());
-                            ui.label(egui::RichText::new("Lyric").small().weak());
-                            ui.label(egui::RichText::new("End").small().weak());
-                            ui.label(egui::RichText::new("Singer").small().weak());
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.end_row();
+                    // Both grids below use this same minimum row height,
+                    // so the sticky checkbox column's rows can't drift out
+                    // of alignment with the scrollable "rest" grid's rows -
+                    // every widget in both (checkbox, text edit, combo
+                    // box, button) already naturally sizes to this same
+                    // theme constant, so this is just an explicit
+                    // guarantee, not a guess.
+                    let row_height = ui.spacing().interact_size.y;
 
-                            // Not a `.zip()`/`.enumerate()` candidate: each
-                            // iteration needs the plain index `i` itself (to
-                            // defer mutation - see the `retap_idx`/etc.
-                            // handling below, which avoids double-borrowing
-                            // `self` while its own fields are being edited
-                            // inline above), not just a borrowed element.
-                            #[allow(clippy::needless_range_loop)]
-                            for i in 0..self.lines.len() {
-                                let is_next = i == self.next_untimed;
+                    ui.horizontal_top(|ui| {
+                        // Sticky first column: just the row-selection
+                        // checkboxes, in their own fixed-width Grid outside
+                        // the horizontally-scrolling one below - so you can
+                        // always tell which rows are selected (and click to
+                        // change that) no matter how far right you've
+                        // scrolled to reach the Singer/Countdown/action
+                        // columns. Both this and the "rest" grid below sit
+                        // inside one shared *vertical*-only ScrollArea, so
+                        // their rows always scroll in lockstep - the only
+                        // independent scrolling is the "rest" grid's own
+                        // horizontal one.
+                        egui::Grid::new("lines_grid_sticky")
+                            .num_columns(1)
+                            .striped(true)
+                            .spacing([8.0, 4.0])
+                            .min_row_height(row_height)
+                            .show(ui, |ui| {
+                                ui.label("");
+                                ui.end_row();
 
-                                // Selection checkbox - see
-                                // `apply_row_selection_click` for the
-                                // shift/ctrl-click semantics.
-                                let mut checked = self.selected_lines.contains(&i);
-                                let checkbox_resp = ui.checkbox(&mut checked, "");
-                                if checkbox_resp.clicked() {
-                                    let shift = ui.input(|inp| inp.modifiers.shift);
-                                    let cmd = ui.input(|inp| inp.modifiers.command);
-                                    selection_click = Some((i, shift, cmd));
+                                #[allow(clippy::needless_range_loop)]
+                                for i in 0..self.lines.len() {
+                                    // See `apply_row_selection_click` for
+                                    // the shift/ctrl-click semantics.
+                                    let mut checked = self.selected_lines.contains(&i);
+                                    let checkbox_resp = ui.checkbox(&mut checked, "");
+                                    if checkbox_resp.clicked() {
+                                        let shift = ui.input(|inp| inp.modifiers.shift);
+                                        let cmd = ui.input(|inp| inp.modifiers.command);
+                                        selection_click = Some((i, shift, cmd));
+                                    }
+                                    ui.end_row();
                                 }
+                            });
+
+                        egui::ScrollArea::horizontal()
+                            .id_source("timing_scroll_h")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                egui::Grid::new("lines_grid_rest")
+                                    .num_columns(9)
+                                    .striped(true)
+                                    .spacing([8.0, 4.0])
+                                    .min_row_height(row_height)
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Start").small().weak());
+                                        ui.label(egui::RichText::new("Lyric").small().weak());
+                                        ui.label(egui::RichText::new("End").small().weak());
+                                        ui.label(egui::RichText::new("Singer").small().weak());
+                                        ui.label(egui::RichText::new("Countdown").small().weak());
+                                        ui.label("");
+                                        ui.label("");
+                                        ui.label("");
+                                        ui.label("");
+                                        ui.end_row();
+
+                                        // Not a `.zip()`/`.enumerate()`
+                                        // candidate: each iteration needs
+                                        // the plain index `i` itself (to
+                                        // defer mutation - see the
+                                        // `retap_idx`/etc. handling below,
+                                        // which avoids double-borrowing
+                                        // `self` while its own fields are
+                                        // being edited inline above), not
+                                        // just a borrowed element.
+                                        #[allow(clippy::needless_range_loop)]
+                                        for i in 0..self.lines.len() {
+                                let is_next = i == self.next_untimed;
 
                                 // Start field.
                                 let editing_start =
@@ -4892,11 +5109,32 @@ impl eframe::App for KaraokeApp {
                                 }
 
                                 ui.scope(|ui| {
-                                    ui.set_max_width(220.0);
-                                    let text_label = if is_next {
-                                        egui::RichText::new(&self.lines[i].text).strong()
+                                    // Compact mode: truncate (character
+                                    // count, not pixel width - simpler and
+                                    // good enough for a hover-to-see-more
+                                    // affordance) instead of letting a long
+                                    // line widen the whole table - see the
+                                    // "Compact table" checkbox above.
+                                    const COMPACT_LYRIC_MAX_CHARS: usize = 18;
+                                    let full_text = self.lines[i].text.as_str();
+                                    let truncated = self.compact_timing_table
+                                        && full_text.chars().count() > COMPACT_LYRIC_MAX_CHARS;
+                                    let shown_text: std::borrow::Cow<str> = if truncated {
+                                        let head: String =
+                                            full_text.chars().take(COMPACT_LYRIC_MAX_CHARS).collect();
+                                        std::borrow::Cow::Owned(format!("{head}…"))
                                     } else {
-                                        egui::RichText::new(&self.lines[i].text)
+                                        std::borrow::Cow::Borrowed(full_text)
+                                    };
+                                    ui.set_max_width(if self.compact_timing_table {
+                                        90.0
+                                    } else {
+                                        220.0
+                                    });
+                                    let text_label = if is_next {
+                                        egui::RichText::new(shown_text.as_ref()).strong()
+                                    } else {
+                                        egui::RichText::new(shown_text.as_ref())
                                     };
                                     // Clicking the lyric text itself opens/switches the
                                     // "Fine-tune words" panel to this line - the same as
@@ -4904,11 +5142,18 @@ impl eframe::App for KaraokeApp {
                                     // target, and one that also shows which line is
                                     // currently selected (highlighted) at a glance.
                                     let selected = self.word_tap_line == Some(i);
+                                    let hover_text = if truncated {
+                                        format!(
+                                            "{full_text}\n\nClick to select this line for \
+                                             fine-tuning words."
+                                        )
+                                    } else {
+                                        "Click to select this line for fine-tuning words."
+                                            .to_string()
+                                    };
                                     if ui
                                         .selectable_label(selected, text_label)
-                                        .on_hover_text(
-                                            "Click to select this line for fine-tuning words.",
-                                        )
+                                        .on_hover_text(hover_text)
                                         .clicked()
                                     {
                                         words_idx = Some(i);
@@ -4977,6 +5222,44 @@ impl eframe::App for KaraokeApp {
                                         );
                                     });
 
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_source(("countdown_mode", i))
+                                        .width(78.0)
+                                        .selected_text(self.lines[i].countdown_mode.label())
+                                        .show_ui(ui, |ui| {
+                                            for mode in lyrics::CountdownMode::ALL {
+                                                ui.selectable_value(
+                                                    &mut self.lines[i].countdown_mode,
+                                                    mode,
+                                                    mode.label(),
+                                                );
+                                            }
+                                        });
+                                    // A short/nonexistent gap before this
+                                    // line means a forced countdown has to
+                                    // compress to fit (or, for a zero/
+                                    // negative gap, won't show at all - see
+                                    // lyrics.rs's countdown_window_between)
+                                    // - flagged here rather than silently
+                                    // letting the user wonder why "Force"
+                                    // didn't visibly change anything.
+                                    let short_gap = self.lines[i].countdown_mode
+                                        == lyrics::CountdownMode::Force
+                                        && gap_before_line[i]
+                                            .is_some_and(|g| g < lyrics::COUNTDOWN_LEAD_SECS);
+                                    if short_gap {
+                                        ui.label(
+                                            egui::RichText::new("⚠")
+                                                .color(egui::Color32::from_rgb(230, 140, 40)),
+                                        )
+                                        .on_hover_text(
+                                            "This line's gap is too short for the full \
+                                             countdown - it'll compress to fit (or not show \
+                                             at all, if there's no gap left).",
+                                        );
+                                    }
+                                });
+
                                 if ui.small_button("Tap").clicked() {
                                     retap_idx = Some(i);
                                 }
@@ -5011,9 +5294,12 @@ impl eframe::App for KaraokeApp {
                                     }
                                 });
                                 ui.end_row();
-                            }
+                                        }
+                                    });
+                            });
+                    });
 
-                            if let Some((i, shift, cmd)) = selection_click {
+                    if let Some((i, shift, cmd)) = selection_click {
                                 apply_row_selection_click(
                                     &mut self.selected_lines,
                                     &mut self.selection_anchor,
@@ -5088,7 +5374,6 @@ impl eframe::App for KaraokeApp {
                                     }
                                 }
                             }
-                        });
                 });
         });
 

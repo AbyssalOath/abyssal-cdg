@@ -60,6 +60,38 @@ impl Singer {
     ];
 }
 
+/// Per-line override for whether the "get ready" countdown indicator shows
+/// up before this line starts - see [`countdown_window`]/[`LyricLine::countdown_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum CountdownMode {
+    /// Show the countdown only if the automatic gap threshold
+    /// ([`TimingSettings::countdown_gap_threshold`]) says to - the normal,
+    /// original behavior.
+    #[default]
+    Auto,
+    /// Always show the countdown before this line, even if the gap is
+    /// shorter than the automatic threshold - clamped the same way a short
+    /// `Auto` gap already is (the dots compress to fit whatever room is
+    /// actually there; a gap of zero or less shows nothing, since there's
+    /// no room for anything).
+    Force,
+    /// Never show the countdown before this line, even if the gap is long
+    /// enough that `Auto` would otherwise trigger it.
+    Suppress,
+}
+
+impl CountdownMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Force => "Force",
+            Self::Suppress => "Suppress",
+        }
+    }
+
+    pub const ALL: [CountdownMode; 3] = [Self::Auto, Self::Force, Self::Suppress];
+}
+
 /// The distinct voices actually used across `lines`, in a fixed
 /// Default/Male/Female/Duet/Screaming order regardless of which order they
 /// first appear in the song. Used to build a color-legend on the intro
@@ -94,6 +126,33 @@ pub const MIN_SING_DURATION: f64 = 1.2;
 /// before we bother showing a countdown indicator (short natural pauses
 /// between lines shouldn't trigger it).
 pub const COUNTDOWN_GAP_THRESHOLD: f64 = 5.0;
+
+/// User-configurable overrides for [`SECONDS_PER_WORD`], [`MIN_SING_DURATION`],
+/// and [`COUNTDOWN_GAP_THRESHOLD`] - exposed in the app's "Timing" settings
+/// panel and persisted per-project (see `project::ProjectFile::timing_settings`),
+/// so a song that needs a different word-per-second pace or countdown
+/// sensitivity doesn't need a source edit. `Default` is exactly this app's
+/// own long-standing constants above, so a project that never touches this
+/// panel gets byte-identical output to before this setting existed.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TimingSettings {
+    /// See [`SECONDS_PER_WORD`].
+    pub seconds_per_word: f64,
+    /// See [`MIN_SING_DURATION`].
+    pub min_sing_duration: f64,
+    /// See [`COUNTDOWN_GAP_THRESHOLD`].
+    pub countdown_gap_threshold: f64,
+}
+
+impl Default for TimingSettings {
+    fn default() -> Self {
+        Self {
+            seconds_per_word: SECONDS_PER_WORD,
+            min_sing_duration: MIN_SING_DURATION,
+            countdown_gap_threshold: COUNTDOWN_GAP_THRESHOLD,
+        }
+    }
+}
 /// The countdown indicator occupies this many seconds immediately before
 /// the next line begins.
 pub const COUNTDOWN_LEAD_SECS: f64 = 4.0;
@@ -105,9 +164,9 @@ pub const COUNTDOWN_LEAD_SECS: f64 = 4.0;
 /// instead of leaving finished lyrics sitting there for the whole break.
 pub const SUNG_LINGER_SECS: f64 = 5.0;
 
-fn estimate_sing_duration(text: &str, window: f64) -> f64 {
+fn estimate_sing_duration(text: &str, window: f64, settings: &TimingSettings) -> f64 {
     let word_count = text.split_whitespace().count().max(1);
-    let est = (word_count as f64 * SECONDS_PER_WORD).max(MIN_SING_DURATION);
+    let est = (word_count as f64 * settings.seconds_per_word).max(settings.min_sing_duration);
     est.min(window.max(0.0))
 }
 
@@ -163,6 +222,12 @@ pub struct LyricLine {
     /// independent line in its own right.
     #[serde(default)]
     pub backing_vocal: Option<BackingVocal>,
+    /// Manual override for whether the "get ready" countdown shows up
+    /// before *this* line - see [`CountdownMode`]. `Auto` (the default,
+    /// via `#[serde(default)]`) for every line/project saved before this
+    /// existed, matching the automatic-only behavior they already had.
+    #[serde(default)]
+    pub countdown_mode: CountdownMode,
 }
 
 impl LyricLine {
@@ -178,6 +243,7 @@ impl LyricLine {
             sing_end_override: None,
             starts_new_block: true,
             backing_vocal: None,
+            countdown_mode: CountdownMode::default(),
         }
     }
 
@@ -700,6 +766,8 @@ pub struct TimedLine {
     /// its `start` hasn't been tapped yet (nothing to time it by, so it
     /// doesn't render - see [`BackingVocal::start`]).
     pub backing_vocal: Option<TimedBackingVocal>,
+    /// See [`LyricLine::countdown_mode`].
+    pub countdown_mode: CountdownMode,
 }
 
 impl TimedLine {
@@ -710,15 +778,30 @@ impl TimedLine {
         Self::from_line(&line, start, end)
     }
 
-    /// Build a resolved [start, end) window for `line`, carrying over its
-    /// word/end/singer overrides. Used by [`resolve_timing`] and by the live
-    /// preview (which needs the same resolution but also wants to know
-    /// which original `LyricLine` each result came from).
+    /// Same as [`Self::from_line_with_settings`], using [`TimingSettings::default`] -
+    /// kept as its own entry point so the many existing callers/tests that
+    /// don't care about custom timing settings don't all need updating just
+    /// because this setting now exists.
     pub fn from_line(line: &LyricLine, start: f64, end: f64) -> Self {
+        Self::from_line_with_settings(line, start, end, &TimingSettings::default())
+    }
+
+    /// Build a resolved [start, end) window for `line`, carrying over its
+    /// word/end/singer overrides. Used by [`resolve_timing_with_settings`]
+    /// and by the live preview (which needs the same resolution but also
+    /// wants to know which original `LyricLine` each result came from).
+    pub fn from_line_with_settings(
+        line: &LyricLine,
+        start: f64,
+        end: f64,
+        settings: &TimingSettings,
+    ) -> Self {
         let window = (end - start).max(0.0);
         let sing_end = match line.sing_end_override {
             Some(manual) => manual.clamp(start, end),
-            None => (start + estimate_sing_duration(&line.text, window)).clamp(start, end),
+            None => {
+                (start + estimate_sing_duration(&line.text, window, settings)).clamp(start, end)
+            }
         };
         let backing_vocal = line.backing_vocal.as_ref().and_then(|bv| {
             let bv_start = bv.start?.clamp(start, end);
@@ -749,6 +832,7 @@ impl TimedLine {
             word_end_overrides: line.word_end_overrides.clone(),
             starts_new_block: line.starts_new_block,
             backing_vocal,
+            countdown_mode: line.countdown_mode,
         }
     }
 }
@@ -765,11 +849,27 @@ pub struct TimedBackingVocal {
     pub word_end_overrides: Vec<Option<f64>>,
 }
 
+/// Same as [`resolve_timing_with_settings`], using [`TimingSettings::default`] -
+/// kept as its own entry point so the many existing callers/tests that
+/// don't care about custom timing settings don't all need updating just
+/// because this setting now exists. Real production code calls
+/// `resolve_timing_with_settings` directly (see `main.rs`), so this is only
+/// reached by tests in a normal (non-test) build - same reasoning as
+/// `TimedLine::new`'s own `#[allow(dead_code)]` just above.
+#[allow(dead_code)]
+pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<TimedLine> {
+    resolve_timing_with_settings(lines, total_duration, &TimingSettings::default())
+}
+
 /// Resolve start/end windows for every line. Requires every line to already
 /// have a `start` set (caller should validate this first). Lines are sorted
 /// by start time. The final line's end is `total_duration` (or `start + 4.0`
 /// if `total_duration` is unknown / shorter than that).
-pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<TimedLine> {
+pub fn resolve_timing_with_settings(
+    lines: &[LyricLine],
+    total_duration: Option<f64>,
+    settings: &TimingSettings,
+) -> Vec<TimedLine> {
     let mut sorted: Vec<(f64, &LyricLine)> = lines
         .iter()
         .filter_map(|l| l.start.map(|s| (s, l)))
@@ -787,7 +887,9 @@ pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<T
                 _ => start + 4.0,
             }
         };
-        out.push(TimedLine::from_line(line, start, end));
+        out.push(TimedLine::from_line_with_settings(
+            line, start, end, settings,
+        ));
     }
     out
 }
@@ -1015,9 +1117,25 @@ pub fn group_into_blocks(timed_lines: &[TimedLine]) -> Vec<Vec<usize>> {
 /// title card) and the first lyric line's start - used by the CDG exporter,
 /// the video exporter, and the live preview, so all three agree on when the
 /// intro countdown appears.
-pub fn countdown_window_between(after: f64, next_start: f64) -> Option<(f64, f64)> {
+///
+/// `mode` is the [`CountdownMode`] of whichever line begins at `next_start`
+/// (the one the countdown announces) - `Suppress` always returns `None`
+/// regardless of gap size, `Force` always returns a window as long as
+/// there's *any* positive gap to work with (clamped exactly like a short
+/// `Auto` gap already is - the dots compress to fit whatever room is
+/// actually there), and `Auto` keeps the original threshold-based behavior.
+pub fn countdown_window_between(
+    after: f64,
+    next_start: f64,
+    mode: CountdownMode,
+    settings: &TimingSettings,
+) -> Option<(f64, f64)> {
+    if mode == CountdownMode::Suppress {
+        return None;
+    }
     let leftover = next_start - after;
-    if leftover >= COUNTDOWN_GAP_THRESHOLD {
+    let auto_triggers = leftover >= settings.countdown_gap_threshold;
+    if leftover > 0.0 && (mode == CountdownMode::Force || auto_triggers) {
         let cd_start = (next_start - COUNTDOWN_LEAD_SECS).max(after);
         Some((cd_start, next_start))
     } else {
@@ -1028,9 +1146,15 @@ pub fn countdown_window_between(after: f64, next_start: f64) -> Option<(f64, f64
 /// If a line has a long enough musical break before the *next* line starts,
 /// returns the `(countdown_start, countdown_end)` window (in seconds) during
 /// which a "get ready" countdown indicator should be shown. `countdown_end`
-/// is always equal to `line.end` (i.e. the next line's start).
-pub fn countdown_window(line: &TimedLine) -> Option<(f64, f64)> {
-    countdown_window_between(line.sing_end, line.end)
+/// is always equal to `line.end` (i.e. the next line's start). `next_mode`
+/// is the upcoming line's own [`CountdownMode`] - see
+/// [`countdown_window_between`].
+pub fn countdown_window(
+    line: &TimedLine,
+    next_mode: CountdownMode,
+    settings: &TimingSettings,
+) -> Option<(f64, f64)> {
+    countdown_window_between(line.sing_end, line.end, next_mode, settings)
 }
 
 /// True once `line` is done being sung (`t >= line.sing_end`) and there's a
@@ -1041,8 +1165,13 @@ pub fn countdown_window(line: &TimedLine) -> Option<(f64, f64)> {
 /// the countdown indicator, then the next line), not show lyrics that are
 /// still a break away. Shared by the video exporter, the CDG exporter, and
 /// the live preview so all three agree on when to hide ahead-of-time lines.
-pub fn hide_upcoming_lines(line: &TimedLine, t: f64) -> bool {
-    t >= line.sing_end && countdown_window(line).is_some()
+pub fn hide_upcoming_lines(
+    line: &TimedLine,
+    t: f64,
+    next_mode: CountdownMode,
+    settings: &TimingSettings,
+) -> bool {
+    t >= line.sing_end && countdown_window(line, next_mode, settings).is_some()
 }
 
 /// True once the already-sung display for `line` (this line, plus any
@@ -1054,8 +1183,13 @@ pub fn hide_upcoming_lines(line: &TimedLine, t: f64) -> bool {
 /// break doesn't wait out the full linger before the dots appear). Implies
 /// [`hide_upcoming_lines`] is also true. Shared by the video exporter, the
 /// CDG exporter, and the live preview.
-pub fn blank_sung_lines(line: &TimedLine, t: f64) -> bool {
-    match countdown_window(line) {
+pub fn blank_sung_lines(
+    line: &TimedLine,
+    t: f64,
+    next_mode: CountdownMode,
+    settings: &TimingSettings,
+) -> bool {
+    match countdown_window(line, next_mode, settings) {
         Some((cd_start, _)) => t >= (line.sing_end + SUNG_LINGER_SECS).min(cd_start),
         None => false,
     }
@@ -1245,7 +1379,7 @@ mod tests {
     fn countdown_triggers_on_long_gap_only() {
         // Short line, huge window -> big gap -> countdown should trigger.
         let long_gap = TimedLine::new("hi".into(), 0.0, 20.0, Singer::Male);
-        let cd = countdown_window(&long_gap);
+        let cd = countdown_window(&long_gap, CountdownMode::Auto, &TimingSettings::default());
         assert!(cd.is_some());
         let (start, end) = cd.unwrap();
         assert_eq!(end, 20.0);
@@ -1254,7 +1388,106 @@ mod tests {
 
         // Tight line, no meaningful gap -> no countdown.
         let tight = TimedLine::new("hi there".into(), 0.0, 2.0, Singer::Male);
-        assert!(countdown_window(&tight).is_none());
+        assert!(
+            countdown_window(&tight, CountdownMode::Auto, &TimingSettings::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn timing_settings_default_matches_the_bare_constants() {
+        // Phase 1's own acceptance criterion: a project that never touches
+        // the settings panel must behave exactly as before this setting
+        // existed.
+        let settings = TimingSettings::default();
+        assert_eq!(settings.seconds_per_word, SECONDS_PER_WORD);
+        assert_eq!(settings.min_sing_duration, MIN_SING_DURATION);
+        assert_eq!(settings.countdown_gap_threshold, COUNTDOWN_GAP_THRESHOLD);
+    }
+
+    #[test]
+    fn custom_seconds_per_word_changes_the_sing_end_estimate() {
+        let mut lines = vec![LyricLine::new("one two three four")];
+        lines[0].start = Some(0.0);
+
+        let default_timed =
+            resolve_timing_with_settings(&lines, Some(20.0), &TimingSettings::default());
+        let slower = TimingSettings {
+            seconds_per_word: 2.0,
+            ..TimingSettings::default()
+        };
+        let slower_timed = resolve_timing_with_settings(&lines, Some(20.0), &slower);
+
+        // 4 words at 2.0s/word = 8.0s, well past the default 0.45s/word
+        // estimate - and still clamped to the window like the default is.
+        assert_eq!(slower_timed[0].sing_end, 8.0);
+        assert!(slower_timed[0].sing_end > default_timed[0].sing_end);
+    }
+
+    #[test]
+    fn custom_min_sing_duration_raises_the_floor_for_short_lines() {
+        let mut lines = vec![LyricLine::new("hi")];
+        lines[0].start = Some(0.0);
+
+        let raised = TimingSettings {
+            min_sing_duration: 5.0,
+            ..TimingSettings::default()
+        };
+        let timed = resolve_timing_with_settings(&lines, Some(20.0), &raised);
+        // 1 word at the default 0.45s/word pace would normally floor out at
+        // the *default* MIN_SING_DURATION (1.2s) - the custom, higher floor
+        // should win instead.
+        assert_eq!(timed[0].sing_end, 5.0);
+    }
+
+    #[test]
+    fn custom_countdown_gap_threshold_changes_whether_a_countdown_fires() {
+        // A 4s gap: no countdown under the default 5s threshold, but should
+        // trigger once the threshold is lowered below the gap's own size.
+        let line = TimedLine::new("hi".into(), 0.0, 4.0 + MIN_SING_DURATION, Singer::Male);
+        assert!(countdown_window(&line, CountdownMode::Auto, &TimingSettings::default()).is_none());
+
+        let sensitive = TimingSettings {
+            countdown_gap_threshold: 3.0,
+            ..TimingSettings::default()
+        };
+        assert!(countdown_window(&line, CountdownMode::Auto, &sensitive).is_some());
+    }
+
+    #[test]
+    fn countdown_mode_force_bypasses_the_gap_threshold() {
+        // Same short gap as the "no countdown" case above, but Force should
+        // show one anyway, clamped to whatever room is actually there.
+        let line = TimedLine::new("hi".into(), 0.0, 4.0 + MIN_SING_DURATION, Singer::Male);
+        let cd = countdown_window(&line, CountdownMode::Force, &TimingSettings::default());
+        assert!(cd.is_some());
+        let (start, end) = cd.unwrap();
+        assert_eq!(end, line.end);
+        assert!(start >= line.sing_end);
+    }
+
+    #[test]
+    fn countdown_mode_force_shows_nothing_for_a_zero_or_negative_gap() {
+        // No room at all before the next line starts - Force can't invent
+        // one, so it should still show nothing rather than a degenerate
+        // (zero- or negative-width) window.
+        let line = TimedLine::new("hi there".into(), 0.0, 0.01, Singer::Male);
+        assert!(line.sing_end >= line.end); // no leftover gap in this window
+        assert!(
+            countdown_window(&line, CountdownMode::Force, &TimingSettings::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn countdown_mode_suppress_overrides_a_long_automatic_gap() {
+        // Same long gap that already triggers Auto above - Suppress should
+        // override it back off.
+        let long_gap = TimedLine::new("hi".into(), 0.0, 20.0, Singer::Male);
+        assert!(countdown_window(
+            &long_gap,
+            CountdownMode::Suppress,
+            &TimingSettings::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1308,15 +1541,32 @@ mod tests {
     fn hide_upcoming_lines_only_during_a_real_break() {
         // Short line, huge window -> long break -> hide once singing's done.
         let long_gap = TimedLine::new("hi".into(), 0.0, 20.0, Singer::Male);
-        assert!(!hide_upcoming_lines(&long_gap, 0.0)); // still singing
-        assert!(!hide_upcoming_lines(&long_gap, long_gap.sing_end - 0.01)); // just before done
-        assert!(hide_upcoming_lines(&long_gap, long_gap.sing_end)); // done, break starts
-        assert!(hide_upcoming_lines(&long_gap, 19.9)); // still in the break
+        let settings = TimingSettings::default();
+        let auto = CountdownMode::Auto;
+        assert!(!hide_upcoming_lines(&long_gap, 0.0, auto, &settings)); // still singing
+        assert!(!hide_upcoming_lines(
+            &long_gap,
+            long_gap.sing_end - 0.01,
+            auto,
+            &settings
+        )); // just before done
+        assert!(hide_upcoming_lines(
+            &long_gap,
+            long_gap.sing_end,
+            auto,
+            &settings
+        )); // done, break starts
+        assert!(hide_upcoming_lines(&long_gap, 19.9, auto, &settings)); // still in the break
 
         // Tight line, no meaningful gap -> never hide, even once "sung".
         let tight = TimedLine::new("hi there".into(), 0.0, 2.0, Singer::Male);
-        assert!(!hide_upcoming_lines(&tight, tight.sing_end));
-        assert!(!hide_upcoming_lines(&tight, 2.0));
+        assert!(!hide_upcoming_lines(
+            &tight,
+            tight.sing_end,
+            auto,
+            &settings
+        ));
+        assert!(!hide_upcoming_lines(&tight, 2.0, auto, &settings));
     }
 
     #[test]
@@ -1325,20 +1575,29 @@ mod tests {
         // end-4.0. Linger keeps the sung line up for SUNG_LINGER_SECS past
         // sing_end, then it should blank until the countdown begins.
         let line = TimedLine::new("hi there".into(), 0.0, 30.0, Singer::Male);
-        let cd_start = countdown_window(&line).unwrap().0;
-        assert!(!blank_sung_lines(&line, line.sing_end)); // just finished, still lingering
+        let settings = TimingSettings::default();
+        let auto = CountdownMode::Auto;
+        let cd_start = countdown_window(&line, auto, &settings).unwrap().0;
+        assert!(!blank_sung_lines(&line, line.sing_end, auto, &settings)); // just finished, still lingering
         assert!(!blank_sung_lines(
             &line,
-            line.sing_end + SUNG_LINGER_SECS - 0.01
+            line.sing_end + SUNG_LINGER_SECS - 0.01,
+            auto,
+            &settings
         ));
-        assert!(blank_sung_lines(&line, line.sing_end + SUNG_LINGER_SECS)); // linger's up
-        assert!(blank_sung_lines(&line, cd_start - 0.01)); // still blank right up to the dots
-        assert!(blank_sung_lines(&line, cd_start)); // dots are on; sung line stays cleared
+        assert!(blank_sung_lines(
+            &line,
+            line.sing_end + SUNG_LINGER_SECS,
+            auto,
+            &settings
+        )); // linger's up
+        assert!(blank_sung_lines(&line, cd_start - 0.01, auto, &settings)); // still blank right up to the dots
+        assert!(blank_sung_lines(&line, cd_start, auto, &settings)); // dots are on; sung line stays cleared
 
         // Short/no gap -> never blank.
         let tight = TimedLine::new("hi there".into(), 0.0, 2.0, Singer::Male);
-        assert!(!blank_sung_lines(&tight, tight.sing_end));
-        assert!(!blank_sung_lines(&tight, 2.0));
+        assert!(!blank_sung_lines(&tight, tight.sing_end, auto, &settings));
+        assert!(!blank_sung_lines(&tight, 2.0, auto, &settings));
     }
 
     #[test]

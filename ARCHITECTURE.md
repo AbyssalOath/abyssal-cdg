@@ -68,16 +68,30 @@ timeline.rs  Pure time<->pixel mapping, zoom/drag bounds, and drag-mode
              classification for the fine-tuning timeline - no egui dependency, so
              it's unit-tested directly; main.rs owns the actual widget/painting/
              interaction glue built on top of it.
-vocals.rs    Runs the UVR-MDX-NET-Inst_HQ_3 separation model natively (via `ort`/
-             ONNX Runtime - see mdx.rs/stft.rs) to produce instrumental and vocals
-             stems from the loaded audio, for the "Instrumental audio"/"Vocals
-             audio" export checkboxes and the video export's "Remove vocals"
-             checkbox. Nothing to install separately - the model ships bundled
-             with the app (see model_assets.rs).
+vocals.rs    Runs an MDX-Net separation model natively (via `ort`/ONNX Runtime -
+             see mdx.rs/stft.rs) to produce instrumental and vocals stems from
+             the loaded audio. `load_separator` (the "Instrumental audio"/
+             "Vocals audio" export checkboxes and the video export's "Remove
+             vocals" checkbox) always uses `MdxModel::InstHq3`; auto-align's own
+             internal vocal isolation (`separate_vocals_to_temp_wav`, called
+             from main.rs's `start_word_alignment`) takes an explicit
+             `MdxModel` instead, selectable via its own "Vocal model" dropdown
+             - see mdx.rs's `MdxModel` docs for why this is a real trade-off,
+             not a strict upgrade, and why it's scoped to auto-align only.
+             Nothing to install separately - `MdxModel::InstHq3`'s model ships
+             bundled with the app; other models download on first use (see
+             model_assets.rs).
 mdx.rs       The MDX-Net separation algorithm itself: chunked overlap-add,
-             STFT->model->ISTFT per chunk, the vocals-by-subtraction formula - a
-             bit-faithful port of `audio-separator`'s reference implementation,
-             not a from-scratch reimplementation of "an" MDX-Net.
+             STFT->model->ISTFT per chunk, the derived-stem-by-subtraction
+             formula - a bit-faithful port of `audio-separator`'s reference
+             implementation, not a from-scratch reimplementation of "an"
+             MDX-Net. `MdxModel` holds each selectable model's own verified
+             parameters (dim_f/n_fft/segment_size/compensate, sourced the same
+             way as the rest - see this file's own module docs) and which stem
+             it outputs directly vs. derives by subtraction - `InstHq3`
+             outputs Instrumental directly; `KimVocal2` outputs Vocals
+             directly instead, flipping which array `separate()` assigns
+             which way.
 stft.rs      Short-time Fourier transform matching PyTorch's `torch.stft`/
              `torch.istft` conventions exactly (reflect-padding, windowed
              overlap-add with NOLA normalization) - mdx.rs's building block.
@@ -304,10 +318,14 @@ against something this project builds or fetches itself:
   and `aeneas` (which itself needed eSpeak/eSpeak-NG and `ffmpeg`)
   respectively. Both now run their model natively via `ort` (ONNX Runtime
   bindings) - no subprocess, no separate install. The difference between
-  them is bundling: vocal removal's ~65MB model ships inside every
-  installer (see `model_assets.rs`); auto-align's models are ~1.2GB *each*,
-  one per language, so only the language actually selected downloads, on
-  first use, into a local cache.
+  them is bundling: `MdxModel::InstHq3` (the only model `vocals.rs`'s
+  `load_separator` ever uses, for the export checkboxes/video's "Remove
+  vocals") ships bundled, ~65MB, inside every installer (see
+  `model_assets.rs`); `MdxModel::KimVocal2` (selectable only for
+  auto-align's own internal vocal isolation, ~65MB too) and auto-align's
+  own language models (~1.2GB *each*, one per language) both instead
+  download on first use into a local cache, the same shape - so only what
+  a given run actually needs ever leaves the installer's fixed size.
 - **The ONNX Runtime shared library itself** (`onnxrt.rs`) - a separate
   concern from either ML model file, needed by both of the features above.
   Loaded via `ort`'s `load-dynamic` feature rather than linked in at build
@@ -341,9 +359,10 @@ tested the same way, decoupled from the real `rodio`/`symphonia` calls it wraps.
 (`ISTFT(STFT(x)) ≈ x`, within floating-point tolerance) against both a sine wave and
 pseudo-random noise, at MDX-Net's actual `n_fft`/`hop_length` - this is what gives
 confidence the reflect-padding/windowing/NOLA-normalization convention actually matches
-PyTorch's, not just that it compiles. `mdx.rs`'s chunk/pad/trim size constants are
-checked directly against the values verified against the model's own data (see
-`vocals.rs`'s module docs for how). `ctc.rs`'s forced-alignment trellis/backtrack is
+PyTorch's, not just that it compiles. `mdx.rs`'s per-model parameters (each
+selectable `MdxModel`'s own `n_fft`/`dim_f`/`segment_size`/`compensate`) are checked
+directly against the values verified against each model's own data (see `mdx.rs`'s
+own module docs for how). `ctc.rs`'s forced-alignment trellis/backtrack is
 verified against hand-computable synthetic emission matrices with an unambiguous correct
 answer (not just "it runs") - this is what caught a real tie-breaking bug during
 development (the backtrack initially preferred the wrong side of a near-tie, silently

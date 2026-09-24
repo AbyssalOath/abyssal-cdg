@@ -16,9 +16,12 @@ not code copied into this project's own source).
 ## Bundled binaries and models
 
 These are fetched or built by the release workflow
-(`.github/workflows/release.yml`) and bundled into every installer - see
-`ARCHITECTURE.md`'s "Bundled binaries and models" section for how each is
-located at runtime.
+(`.github/workflows/release.yml`) - most are bundled into every installer,
+but a few (each noted explicitly below: the forced-alignment language
+models, and the optional Kim Vocal 2 vocal-isolation model) are too large
+to bundle and instead download on first use into a per-user cache
+directory - see `ARCHITECTURE.md`'s "Bundled binaries and models" section
+for exactly which is which and how each is located at runtime.
 
 ### ffmpeg
 
@@ -84,6 +87,18 @@ located at runtime.
   architecture, verified bit-faithful against `audio-separator`'s
   (MIT-licensed) reference implementation by reading its source directly -
   see `mdx.rs`'s module docs.
+
+### Kim Vocal 2 (optional alternative vocal-isolation model for auto-align)
+
+- **License/source:** same as UVR-MDX-NET-Inst_HQ_3 above (MIT, same
+  Ultimate Vocal Remover project, same `TRvlvr/model_repo` source) - this
+  is just a second selectable model from the same project, not a
+  different one needing its own separate credit.
+- Downloaded/cached on first use only if selected via auto-align's own
+  "Vocal model" dropdown (see `mdx.rs`'s `MdxModel::KimVocal2`) - not
+  bundled in the installer, and not used by the "Instrumental audio"/
+  "Vocals audio" export checkboxes or video export's "Remove vocals",
+  which always use Inst HQ 3.
 
 ### Forced-alignment models (auto-align, 9 languages)
 

@@ -6,6 +6,8 @@ Abyssal CDG Creator is designed for people who want to make karaoke tracks witho
 
 Creating karaoke tracks still takes effort, but Abyssal CDG Creator aims to make the process faster, simpler, and more approachable.
 
+**You're responsible for the audio/lyrics you use with this tool** - see [DISCLAIMER.md](DISCLAIMER.md).
+
 [![CI](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml/badge.svg)](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/AbyssalOath/abyssal-cdg)](https://github.com/AbyssalOath/abyssal-cdg/releases/latest)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
@@ -166,6 +168,9 @@ cargo test
 
 ## More documentation
 
+- [DISCLAIMER.md](DISCLAIMER.md) - your responsibility for the audio/
+  lyrics you use with this tool, separate from the software's own
+  license.
 - [FEATURES.md](FEATURES.md) - the full feature walkthrough, and known
   limitations/ideas for extending it.
 - [ARCHITECTURE.md](ARCHITECTURE.md) - module layout, data flow, and the

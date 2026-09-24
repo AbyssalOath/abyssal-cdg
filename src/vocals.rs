@@ -1,17 +1,18 @@
 //! Removes vocals from the loaded audio via real ML source separation -
-//! native Rust, running the actual UVR-MDX-NET-Inst_HQ_3 ONNX weights
-//! through `ort` (ONNX Runtime) directly (see `mdx.rs` for the separation
-//! algorithm and `stft.rs` for its STFT/ISTFT). This used to shell out to
-//! the `audio-separator` Python CLI; now nothing needs to be installed
-//! separately - the model ships with the app (see `model_assets.rs`) and
-//! inference runs in-process.
+//! native Rust, running real UVR-MDX-NET ONNX weights through `ort` (ONNX
+//! Runtime) directly (see `mdx.rs` for the separation algorithm, its
+//! selectable [`crate::mdx::MdxModel`]s, and `stft.rs` for the STFT/
+//! ISTFT). This used to shell out to the `audio-separator` Python CLI;
+//! now nothing needs to be installed separately - the model ships with
+//! the app (see `model_assets.rs`) and inference runs in-process.
 //!
-//! Produces *both* stems from a single separation pass - the vocals stem
-//! is derived from the instrumental one by subtraction (see `mdx.rs`), not
-//! a second, independently expensive model run, so exposing both here
-//! costs nothing extra over the old instrumental-only feature.
+//! Produces *both* stems from a single separation pass - whichever one
+//! the loaded model doesn't output directly is derived from the other by
+//! subtraction (see `mdx.rs`), not a second, independently expensive
+//! model run, so exposing both here costs nothing extra over the old
+//! instrumental-only feature.
 
-use crate::mdx::MdxSeparator;
+use crate::mdx::{MdxModel, MdxSeparator};
 use crate::model_assets;
 use anyhow::{Context, Result};
 use rodio::{Decoder, Source};
@@ -23,8 +24,6 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-const MODEL_FILENAME: &str = "UVR-MDX-NET-Inst_HQ_3.onnx";
-const MODEL_DOWNLOAD_URL: &str = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx";
 /// UVR-MDX-NET-Inst_HQ_3 (like every MDX-Net model) is trained on fixed
 /// 44.1kHz audio - input at any other rate is resampled to this before
 /// separation (see `resample_to`).
@@ -40,16 +39,27 @@ pub struct Separation {
     pub vocals: [Vec<f32>; 2],
 }
 
-/// Locates (bundled, cached, or freshly downloaded - see `model_assets.rs`)
-/// the separation model and loads it. Callers that only need one
-/// separation can skip this and just call [`separate`]; this exists so a
-/// caller doing several in a row (e.g. instrumental export *and* video
-/// vocal removal in the same export run) can load the ~65MB model once
-/// and reuse it, instead of paying that cost twice.
+/// Same as [`load_separator_with_model`], using [`MdxModel::InstHq3`] -
+/// the "Instrumental audio"/"Vocals audio" export checkboxes and video
+/// export's "Remove vocals" all go through this one, unconditionally, not
+/// the model picker next to auto-align's own "isolate vocals" step (see
+/// `main.rs`'s `start_word_alignment`) - kept deliberately separate so
+/// experimenting with a different model there can never change what an
+/// export actually produces.
 pub fn load_separator() -> Result<MdxSeparator> {
-    let model_path = model_assets::resolve_model(MODEL_FILENAME, MODEL_DOWNLOAD_URL)
+    load_separator_with_model(MdxModel::InstHq3)
+}
+
+/// Locates (bundled, cached, or freshly downloaded - see `model_assets.rs`)
+/// `model` and loads it. Callers that only need one separation can skip
+/// this and just call [`separate`]; this exists so a caller doing several
+/// in a row (e.g. instrumental export *and* video vocal removal in the
+/// same export run) can load the ~65MB model once and reuse it, instead
+/// of paying that cost twice.
+pub fn load_separator_with_model(model: MdxModel) -> Result<MdxSeparator> {
+    let model_path = model_assets::resolve_model(model.filename(), model.download_url())
         .context("couldn't locate or download the vocal separation model")?;
-    MdxSeparator::load(&model_path)
+    MdxSeparator::load(&model_path, model)
 }
 
 /// Separates `input_path` into instrumental and vocals, calling
@@ -75,15 +85,20 @@ pub fn separate(
 /// (via `main.rs`'s `start_word_alignment`) to run forced alignment
 /// against isolated vocals instead of the full mix, since the CTC speech
 /// model aligns more reliably without instrumentation underneath the
-/// singing. The caller owns the returned path and is responsible for
-/// deleting it once alignment is done with it (this doesn't clean up
-/// after itself, the same way `write_stem_to_file`'s own intermediate
-/// `.wav.tmp` only cleans up the one it makes internally, not this one).
+/// singing. `model` is auto-align's own selectable "vocal isolation
+/// model" (defaults to [`MdxModel::InstHq3`], same as everything else -
+/// see that enum's docs), independent of [`load_separator`]'s own fixed
+/// choice for the general export checkboxes. The caller owns the
+/// returned path and is responsible for deleting it once alignment is
+/// done with it (this doesn't clean up after itself, the same way
+/// `write_stem_to_file`'s own intermediate `.wav.tmp` only cleans up the
+/// one it makes internally, not this one).
 pub fn separate_vocals_to_temp_wav(
     input_path: &Path,
+    model: MdxModel,
     on_progress: impl FnMut(f32),
 ) -> Result<PathBuf> {
-    let mut separator = load_separator()?;
+    let mut separator = load_separator_with_model(model)?;
     let separation = separate(&mut separator, input_path, on_progress)?;
     let tmp_path = std::env::temp_dir().join(format!(
         "abyssal-cdg-align-vocals-{}.wav",

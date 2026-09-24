@@ -34,9 +34,11 @@
 
 use crate::cdg::{CdgColor, CdgWriter, BLANK_TILE, SAFE_COLS};
 use crate::font;
+#[cfg(test)]
+use crate::lyrics::CountdownMode;
 use crate::lyrics::{
     backing_vocal_word_timings, countdown_window, countdown_window_between, singer_legend,
-    word_timings, Singer, TimedLine, SUNG_LINGER_SECS,
+    word_timings, Singer, TimedLine, TimingSettings, SUNG_LINGER_SECS,
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -513,13 +515,39 @@ fn schedule_countdown_dots(w: &mut CdgWriter, cd_start: f64, cd_end: f64, lit_co
     }
 }
 
-/// Render a complete karaoke CDG stream, padded to `total_duration` seconds.
+/// Same as [`render_cdg_with_settings`], using [`TimingSettings::default`] -
+/// kept as its own entry point so the many existing callers/tests that
+/// don't care about custom timing settings don't all need updating just
+/// because this setting now exists. Real production code calls
+/// `render_cdg_with_settings` directly (see `main.rs`), so this is only
+/// reached by tests in a normal (non-test) build - same reasoning as
+/// `TimedLine::new`'s own `#[allow(dead_code)]` in `lyrics.rs`.
+#[allow(dead_code)]
 pub fn render_cdg(
     timed_lines: &[TimedLine],
     total_duration: f64,
     palette: &Palette,
     title: Option<&str>,
     artist: Option<&str>,
+) -> Vec<u8> {
+    render_cdg_with_settings(
+        timed_lines,
+        total_duration,
+        palette,
+        title,
+        artist,
+        &TimingSettings::default(),
+    )
+}
+
+/// Render a complete karaoke CDG stream, padded to `total_duration` seconds.
+pub fn render_cdg_with_settings(
+    timed_lines: &[TimedLine],
+    total_duration: f64,
+    palette: &Palette,
+    title: Option<&str>,
+    artist: Option<&str>,
+    timing_settings: &TimingSettings,
 ) -> Vec<u8> {
     let mut w = CdgWriter::new();
 
@@ -572,7 +600,9 @@ pub fn render_cdg(
     // intro deserves the countdown either way (matches `video.rs`, which
     // never gated this on the title card).
     if let Some(first) = timed_lines.first() {
-        if let Some((cd_start, cd_end)) = countdown_window_between(card_end, first.start) {
+        if let Some((cd_start, cd_end)) =
+            countdown_window_between(card_end, first.start, first.countdown_mode, timing_settings)
+        {
             let (_, highlight_idx) = palette.singer_colors(first.singer);
             schedule_countdown_dots(&mut w, cd_start, cd_end, highlight_idx);
             w.advance_to(cd_end);
@@ -668,7 +698,13 @@ pub fn render_cdg(
             );
         }
 
-        if let Some((cd_start, cd_end)) = countdown_window(line) {
+        let next_countdown_mode = timed_lines
+            .get(i + 1)
+            .map(|n| n.countdown_mode)
+            .unwrap_or_default();
+        if let Some((cd_start, cd_end)) =
+            countdown_window(line, next_countdown_mode, timing_settings)
+        {
             // There's a real musical break before the next line - don't
             // leave its dim preview sitting on screen for the whole break;
             // clear it as soon as this line is done being sung, so the
@@ -1019,8 +1055,10 @@ mod tests {
 
     #[test]
     fn intro_countdown_triggers_only_on_long_gap() {
-        assert!(countdown_window_between(5.0, 25.0).is_some()); // 20s gap
-        assert!(countdown_window_between(5.0, 7.0).is_none()); // 2s gap, too short
+        let settings = TimingSettings::default();
+        let auto = CountdownMode::Auto;
+        assert!(countdown_window_between(5.0, 25.0, auto, &settings).is_some()); // 20s gap
+        assert!(countdown_window_between(5.0, 7.0, auto, &settings).is_none()); // 2s gap, too short
     }
 
     #[test]

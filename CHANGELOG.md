@@ -9,6 +9,47 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Added
 
+- **Configurable timing settings**: a "Timing" panel (right sidebar) lets you tune the
+  word-pace estimate (seconds per word, and a minimum floor for very short lines) and
+  the "get ready" countdown's gap threshold, instead of the fixed values every line
+  used before. Defaults are exactly those old values, so a project that never opens
+  the panel behaves identically to before this existed; saved per-project.
+- **Per-line countdown override**: a "Countdown" column in the timing table lets each
+  line force the "get ready" indicator on (even for a short gap, clamped to whatever
+  room is actually there), suppress it (even for a long gap), or leave it on the
+  automatic threshold above - a ⚠ warns when "Force" won't have much room to work
+  with. Respected identically by the `.cdg` export, the video export, and the live
+  preview.
+- **Selectable vocal-isolation model for auto-align**: a "Vocal model" dropdown next
+  to auto-align's Language picker lets you try Kim Vocal 2 (outputs vocals directly,
+  rather than deriving them by subtraction like the default Inst HQ 3 does) if a
+  particular song's alignment results seem off - a real trade-off (cleaner vocals,
+  less clean instrumental if it were used for that), not a strict upgrade, which is
+  why Inst HQ 3 stays the default. Scoped to auto-align's own internal vocal
+  isolation only - the "Instrumental audio"/"Vocals audio" export checkboxes and
+  video export's "Remove vocals" always use Inst HQ 3 regardless of this setting.
+- **Compact timing table + sticky selection column**: a "Compact table" checkbox
+  truncates long lyric lines in the table (hover a truncated one for the full text)
+  instead of letting them widen the whole table, and the row-selection checkboxes
+  now stay visible in their own fixed column while the rest of the table scrolls
+  horizontally, so you can always tell which rows are selected no matter how far
+  right you've scrolled.
+- **Two more bundled lyric-text fonts**: Creepster and Nosifer (both SIL Open Font
+  License 1.1) join the existing system-font picker as selectable options baked
+  into the binary - Nosifer is also the "Abyssal" color preset's own default font
+  now, applied once alongside its colors the same way the preset's colors are.
+- **DISCLAIMER.md**: user responsibility for the audio/lyrics used with this tool,
+  kept explicitly separate from the software's own AGPLv3 license (which governs the
+  code, not the copyright status of content you process with it).
+- **macOS ad-hoc code signing** for release builds (`signing-identity = "-"`) - fixes
+  the arm64 build failing to launch at all ("...is damaged and can't be opened").
+  Apple Silicon's kernel-level code-signing enforcement (AMFI) requires at least an
+  ad-hoc signature just to load an executable, a stricter check than Gatekeeper's own
+  "unidentified developer" warning (which the unsigned x86_64 build only ever hit,
+  since it happened to run via Rosetta 2 translation, sidestepping the native-arm64
+  requirement entirely) - see README's "Installing a prebuilt release" for the
+  (unrelated, still-needed) Gatekeeper workaround this doesn't replace.
+
 - **THIRD_PARTY_LICENSES.md**: full attribution and license details for every bundled
   binary/model (ffmpeg, openh264, LAME, ONNX Runtime, the vocal-separation and
   auto-align models) plus a generated license report for the entire Rust dependency
@@ -147,6 +188,34 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Changed
 
+- **Auto-align now isolates vocals first**: before running the speech-recognition
+  model, auto-align separates vocals from the loaded audio (the same native
+  separation "Removing vocals" already uses) and aligns against that isolated stem
+  instead of the full mix - the CTC model tracks singing far more reliably without
+  instrumentation underneath it. Falls back to the original mixed audio if
+  separation itself fails, rather than failing the whole run over what's an
+  accuracy improvement, not a hard requirement. Previously this required manually
+  exporting a vocals-only file and temporarily loading it in place of the song;
+  that workaround is gone.
+- **The timing table's own start/end always tracks its outer word timing now**:
+  auto-align results, dragging a word bubble on the timeline, and tapping a word's
+  time in the "Words" panel all keep a line's own start (first word) and end (last
+  word) in sync with whichever word bubble actually moved - previously this only
+  worked one direction (pushing a word *out* past the line's boundary stretched the
+  line to match, but pulling it back *in* left the line stuck at its old, wider
+  bound), which meant fixing the last word after an auto-align run often needed a
+  second manual adjustment to the line itself.
+- **README split into a quick overview + FEATURES.md**: the full feature walkthrough
+  (previously the bulk of a ~700-line README) moved to a new FEATURES.md; the README
+  itself is now a ~180-line quick overview plus install/build instructions, pointing
+  to FEATURES.md/ARCHITECTURE.md for the rest instead of duplicating it.
+- The bundled DejaVu Sans/DejaVu Sans Bold fonts moved to `assets/fonts/dejavu/`
+  (alongside the new Creepster/Nosifer fonts, each in their own `assets/fonts/`
+  subdirectory) - was directly under `assets/`.
+- Corrected the documented minimum Rust version to 1.88 (the real floor, from
+  `image`/`libloading`'s own declared MSRV in the locked dependency graph) -
+  previously documented incorrectly as 1.75, then 1.85, neither of which was ever
+  actually checked against the real resolved dependency versions.
 - **`ffmpeg` is now bundled, not a system install**: video export and MP3 stem output
   (vocal removal) both used to require `ffmpeg` installed separately on `PATH`; a
   packaged release now bundles a custom-built `ffmpeg` instead (nothing to install for
@@ -193,6 +262,46 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Fixed
 
+- **Packaged Linux releases (`.deb`/AppImage) couldn't find any bundled resource at
+  all** (ONNX Runtime, the ML models, ffmpeg) - vocal removal and auto-align failed
+  outright with a message telling the user to manually download things a real
+  packaged release should never need. Root cause: `cargo-packager`'s actual Linux
+  layout installs the binary at `usr/bin/<pkg>` and resources at
+  `usr/lib/<pkg>/<relative>` (confirmed directly against a real CI packaging log,
+  including that the AppImage build reuses the `.deb` build's own `usr/` tree
+  wholesale) - the resource-lookup code never checked that exact path, only ones
+  missing the `<pkg>` directory segment.
+- **AppImage packaging itself failed** ("Could not find dependency: libopenh264.so")
+  - `linuxdeploy`'s own dependency-discovery pass resolves a binary's `NEEDED`
+    entries via `LD_LIBRARY_PATH`/system paths, not the `$ORIGIN` rpath already baked
+    into the built `ffmpeg` (which only matters once the AppImage actually runs) -
+    fixed by exporting `LD_LIBRARY_PATH` to include the bundled ffmpeg directory
+    before invoking the packager.
+- **openh264 (the build-time-only copy `ffmpeg` links against - see `ffmpeg_path.rs`
+  for why the real runtime library is separate) failed to build on macOS arm64**
+  (NEON assembly toolchain issue) - fixed by disabling its assembly for just that
+  one OS/arch combination (it's never shipped or executed, only linked for
+  headers/ABI, so this costs nothing). An earlier, broader attempt at the same fix
+  disabled assembly for every platform and broke the macOS x86_64 cross-compile
+  build instead, due to an asymmetry in openh264's own `Makefile` (only arm64 gets
+  its `-arch` flag unconditionally; x86_64's is nested inside the assembly-enabled
+  branch) - narrowed to just darwin/arm64 once that was found.
+- `scripts/build-ffmpeg.sh`'s `OPENH264_OS` is now auto-detected using openh264's
+  own Makefile formula instead of a per-platform guess (which got Windows/MSYS2
+  wrong - its `uname` doesn't actually report "msys"), and both LAME's and
+  ffmpeg's own `./configure` invocations now `eval` their extra-flags argument so a
+  quoted, space-containing value (e.g. `--cc="clang -arch x86_64"` for macOS
+  cross-compiling) survives intact instead of being word-split apart.
+- **The background image/video preview could fail outright ("Output file is empty,
+  nothing was encoded")** for some real-world video files - particularly ones
+  downloaded/remuxed via a tool like `yt-dlp`, which can have a leading stretch
+  (e.g. a title card or fade-in spliced in without a full re-encode) that fails to
+  decode at all under `ffmpeg`'s default "grab frame 0" behavior, even though the
+  rest of the file decodes fine. Now tries a cascade of seek points (0.5s, 3s, 8s,
+  15s, then literal frame 0) before giving up, and the resulting error (if every
+  attempt still fails) includes each attempt's own diagnostic output instead of
+  just the last few lines of the final one, which previously cut off the actual
+  cause.
 - **Dragging a timeline bubble's edge could grab the whole bubble instead,
   if the very first movement was toward the bubble's interior** (e.g.
   dragging left to shrink from the right edge) - the documented-by-users

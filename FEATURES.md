@@ -148,18 +148,32 @@ song, it'll come out consistently in both formats.
 ## The "get ready" countdown
 
 If there's a long instrumental break before a line starts (more than ~5
-seconds after the previous line finishes being sung), four dot markers
-appear and light up one at a time during the final 4 seconds before the
-next line begins - a heads-up so the singer knows to get ready. Each dot
-lights up at the start of its own quarter of that window and then stays
-lit, so by the time the next line actually starts all 4 have been visibly
-lit for a moment rather than the last one flashing on for a single instant
-right as the line changes. The same indicator also appears if there's a
-long instrumental intro before the very first line (after the title card
-fades), so a long intro doesn't just sit on a blank screen with no clue
-when the singing starts. This is based on an estimate of how long each
-line takes to sing (word count x a rough seconds-per-word figure), unless
-you've tapped/set that line's end explicitly (see below).
+seconds after the previous line finishes being sung by default - adjustable
+in the **Timing** settings panel, see below) four dot markers appear and
+light up one at a time during the final 4 seconds before the next line
+begins - a heads-up so the singer knows to get ready. Each dot lights up at
+the start of its own quarter of that window and then stays lit, so by the
+time the next line actually starts all 4 have been visibly lit for a moment
+rather than the last one flashing on for a single instant right as the line
+changes. The same indicator also appears if there's a long instrumental
+intro before the very first line (after the title card fades), so a long
+intro doesn't just sit on a blank screen with no clue when the singing
+starts. This is based on an estimate of how long each line takes to sing
+(word count x a rough seconds-per-word figure), unless you've tapped/set
+that line's end explicitly (see below).
+
+Each line also has its own **Countdown** override in the timing table -
+**Auto** (the default, following the gap threshold above), **Force**
+(always show the countdown before this line, even on a short gap - it
+compresses to fit whatever room is actually there, or shows nothing at all
+if there's no room left), or **Suppress** (never show it before this line,
+even on a long gap). A ⚠ next to a line set to **Force** means its gap is
+short enough that the countdown will be compressed.
+
+The **Timing** settings panel (right sidebar) also lets you adjust the
+word-pace estimate itself (seconds per word, and a minimum floor for very
+short lines) - these only affect words/lines you haven't fine-tuned by
+hand, and are saved with the project.
 
 During a break long enough to trigger the countdown, the already-sung
 line(s) also clear off screen partway through instead of sitting there for
@@ -237,16 +251,26 @@ re-adjustment needed just because the real audio-derived timing came in a
 little earlier/later than your original tapped line boundary.
 
 It works by first isolating vocals (the same native separation used by
-"Removing vocals" above), then running a real speech-recognition model
-(wav2vec2-CTC, via [ONNX Runtime](https://onnxruntime.ai/) - see
-ARCHITECTURE.md) natively against just the isolated singing, once per
-already-timed line - each call is restricted to that line's own tapped
-`[start, end)` window (with a little padding), so it only has to figure
-out *where within a few seconds of audio* each of that line's own words
-falls, rather than aligning an entire song at once. This means
-**auto-align builds directly on line-level tapping** - a line with no
-timing, or badly mistimed timing, has no window to search and won't get
-useful word-level results, so tap along first. If vocal separation itself
+"Removing vocals" above - **Vocal model** dropdown, next to the button,
+lets you pick which one; Inst HQ 3 is the default and generally the best
+all-around choice, but Kim Vocal 2 outputs vocals directly instead of
+deriving them by subtraction, which *can* align more accurately on a
+song where Inst HQ 3's isolated vocal stem isn't clean enough - worth
+trying if a particular song's results seem off, at some cost to how
+clean the *instrumental* stem would be, which is why it's not the
+default. This choice only affects auto-align's own internal vocal
+isolation - it has no effect on the "Instrumental audio"/"Vocals audio"
+export checkboxes or video export's "Remove vocals", which always use
+Inst HQ 3), then running a real speech-recognition model (wav2vec2-CTC,
+via [ONNX Runtime](https://onnxruntime.ai/) - see ARCHITECTURE.md)
+natively against just the isolated singing, once per already-timed line
+- each call is restricted to that line's own tapped `[start, end)`
+window (with a little padding), so it only has to figure out *where
+within a few seconds of audio* each of that line's own words falls,
+rather than aligning an entire song at once. This means **auto-align
+builds directly on line-level tapping** - a line with no timing, or
+badly mistimed timing, has no window to search and won't get useful
+word-level results, so tap along first. If vocal separation itself
 fails for any reason, auto-align falls back to aligning against the
 original mixed audio rather than failing the whole run - isolating vocals
 first is an accuracy improvement, not a hard requirement.
@@ -407,10 +431,15 @@ folder-based player/game library.
   far more reliable across formats (some MP3 encodings in particular have
   unreliable seek tables). Decoding runs many times faster than real time,
   so a seek anywhere in a typical song is still effectively instant.
-- The timing table can be wider than the window at small sizes (long
-  lyric lines, plus the singer dropdown and buttons); it scrolls both
-  ways rather than overlapping the side panels. Drag the divider between
-  the side panels and the middle to resize if you want more room.
+- The timing table can still be wider than the window at small sizes
+  (long lyric lines, plus the singer/countdown dropdowns and buttons);
+  it scrolls both ways rather than overlapping the side panels, its
+  row-selection checkboxes stay visible on the left no matter how far
+  right you've scrolled, and the **Compact table** checkbox truncates
+  long lyric lines (hover a truncated one for the full text) if you want
+  less to scroll through. Drag the divider between the side panels and
+  the middle to resize if you want more room - it's remembered across
+  restarts.
 - The live preview is a second renderer reading the same timing data, not
   a decoder of the actual `.cdg` bytes - see "Live preview vs. the exported
   file" above.

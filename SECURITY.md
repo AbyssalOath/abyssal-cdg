@@ -96,16 +96,22 @@ security issue):**
   includes an HTTP client (`ureq`), used from two places in the app's own code -
   `model_assets.rs`'s `download_to_file` (the shared downloader, also used by
   `ffmpeg_path.rs` for openh264 - see below) - always to a fixed, hardcoded URL, never
-  a user-supplied one. For vocal removal's model and openh264, this only runs as a
-  dev-build fallback - a packaged release bundles both (fetched/built by CI before
-  packaging - see `.github/workflows/release.yml`), so a normal install never triggers
-  a download for either. Auto-align's 9 language models are too large to bundle the
-  same way (~1.2GB each vs. vocal removal's ~65MB), so for it, downloading on first use
-  *is* the normal packaged-release behavior, not just a dev fallback - the first time a
-  given language is used, expect a real, visible network request. Either way,
-  downloads land in a per-user cache directory and are reused after that. If a future
-  change adds network access anywhere else (e.g. an update checker), it should be
-  called out explicitly in the changelog and this file updated accordingly.
+  a user-supplied one. For `MdxModel::InstHq3` (the model `vocals.rs`'s
+  `load_separator` always uses for the export checkboxes/video's "Remove vocals") and
+  openh264, this only runs as a dev-build fallback - a packaged release bundles both
+  (fetched/built by CI before packaging - see `.github/workflows/release.yml`), so a
+  normal install never triggers a download for either. Auto-align's 9 language models
+  are too large to bundle the same way (~1.2GB each vs. InstHq3's ~65MB), so for
+  those, downloading on first use *is* the normal packaged-release behavior, not just
+  a dev fallback - the first time a given language is used, expect a real, visible
+  network request. `MdxModel::KimVocal2` (auto-align's own selectable alternative
+  vocal-isolation model, ~65MB - see mdx.rs's `MdxModel` docs) behaves the same way as
+  the language models, not InstHq3: it downloads on first use in every build,
+  packaged or not, only if a user actually picks it from auto-align's "Vocal model"
+  dropdown. Either way, downloads land in a per-user cache directory and are reused
+  after that. If a future change adds network access anywhere else (e.g. an update
+  checker), it should be called out explicitly in the changelog and this file updated
+  accordingly.
 - The ONNX Runtime shared library itself (distinct from either ML model file) is
   loaded via `ort`'s `load-dynamic` feature (`onnxrt.rs`), not linked in at build
   time - deliberately, since ONNX Runtime publishes no prebuilt binary at all for one
@@ -138,7 +144,8 @@ security issue):**
   `eframe::storage_dir` - the same mechanism `eframe` already uses for
   window-position persistence) and the model/binary cache directories
   `model_assets.rs`/`ffmpeg_path.rs` download into (always for auto-align's language
-  models; a dev-build-only fallback for vocal removal's model, ffmpeg, and openh264) -
-  never a location the user didn't implicitly consent to just by running the app. This
+  models and `MdxModel::KimVocal2`; a dev-build-only fallback for `MdxModel::InstHq3`,
+  ffmpeg, and openh264) - never a location the user didn't implicitly consent to just
+  by running the app. This
   is in addition to the throwaway temp files/directories `video.rs`/`vocals.rs` create
   for an in-progress operation and delete afterward.

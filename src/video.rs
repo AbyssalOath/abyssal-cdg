@@ -25,7 +25,7 @@ use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
     backing_vocal_wipe_fraction, blank_sung_lines, countdown_window, countdown_window_between,
     current_line_wipe_fraction, group_into_blocks, hide_upcoming_lines, normalize_text,
-    singer_legend, Singer, TimedLine,
+    singer_legend, Singer, TimedLine, TimingSettings,
 };
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
@@ -466,6 +466,7 @@ fn render_frame(
     artist: Option<&str>,
     card_end: f64,
     t: f64,
+    timing_settings: &TimingSettings,
 ) {
     let w = canvas.w as f32;
     let h = canvas.h as f32;
@@ -520,7 +521,12 @@ fn render_frame(
     // mid-song breaks, instead of just sitting on a blank screen.
     if let Some(first) = timed_lines.first() {
         if t < first.start {
-            if let Some((cd_start, cd_end)) = countdown_window_between(card_end, first.start) {
+            if let Some((cd_start, cd_end)) = countdown_window_between(
+                card_end,
+                first.start,
+                first.countdown_mode,
+                timing_settings,
+            ) {
                 if t >= cd_start {
                     let (_, highlight) = palette.singer_colors(first.singer);
                     let lit = countdown_lit_count(cd_start, cd_end, t);
@@ -549,8 +555,22 @@ fn render_frame(
     // next line), not show lyrics that are still a break away. During a
     // long enough break, the already-sung lines get cleared too (after
     // lingering for a bit) instead of sitting there for the whole break.
-    let hide_upcoming = hide_upcoming_lines(&timed_lines[current_idx], t);
-    let blank_sung = blank_sung_lines(&timed_lines[current_idx], t);
+    let next_countdown_mode = timed_lines
+        .get(current_idx + 1)
+        .map(|n| n.countdown_mode)
+        .unwrap_or_default();
+    let hide_upcoming = hide_upcoming_lines(
+        &timed_lines[current_idx],
+        t,
+        next_countdown_mode,
+        timing_settings,
+    );
+    let blank_sung = blank_sung_lines(
+        &timed_lines[current_idx],
+        t,
+        next_countdown_mode,
+        timing_settings,
+    );
 
     let line_height = h * 0.11;
     let font_size = h * 0.055;
@@ -642,7 +662,11 @@ fn render_frame(
     // for the last line of the song, a long gap here is just trailing
     // silence after the song ends, not a break before another line.
     let has_next_line = current_idx + 1 < timed_lines.len();
-    if let Some((cd_start, cd_end)) = countdown_window(&timed_lines[current_idx]) {
+    if let Some((cd_start, cd_end)) = countdown_window(
+        &timed_lines[current_idx],
+        next_countdown_mode,
+        timing_settings,
+    ) {
         if has_next_line && t >= cd_start {
             let next_singer = timed_lines
                 .get(current_idx + 1)
@@ -889,6 +913,7 @@ pub fn render_video(
     background_dim: f32,
     custom_font_bytes: Option<Vec<u8>>,
     output_path: &Path,
+    timing_settings: &TimingSettings,
     mut on_progress: impl FnMut(f32),
 ) -> Result<()> {
     check_ffmpeg_available()?;
@@ -1082,6 +1107,7 @@ pub fn render_video(
             artist,
             card_end,
             t,
+            timing_settings,
         );
         if stdin.write_all(&canvas.buf).is_err() {
             break;
@@ -1418,6 +1444,7 @@ mod tests {
                 Some("A"),
                 card_end,
                 t,
+                &TimingSettings::default(),
             );
             t += 0.37;
         }
@@ -1505,6 +1532,7 @@ mod tests {
                 None,
                 card_end,
                 t,
+                &TimingSettings::default(),
             );
             canvas
         };
@@ -1554,6 +1582,7 @@ mod tests {
             None,
             card_end,
             28.0,
+            &TimingSettings::default(),
         );
 
         assert!(
@@ -1589,6 +1618,7 @@ mod tests {
             None,
             card_end,
             18.0,
+            &TimingSettings::default(),
         );
 
         assert!(

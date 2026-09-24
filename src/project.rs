@@ -12,7 +12,7 @@
 //! if something ever goes wrong with one, which matters more than a few
 //! saved bytes for a "your work" file.
 
-use crate::lyrics::LyricLine;
+use crate::lyrics::{LyricLine, TimingSettings};
 use crate::video::{Background, BackgroundFit, Resolution};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,12 @@ pub struct ProjectFile {
     /// default and shows a notice rather than failing to load.
     #[serde(default)]
     pub lyric_font_family: Option<String>,
+    /// Word-pace/countdown-sensitivity overrides (see [`TimingSettings`]) -
+    /// defaults to this app's own long-standing constants (via
+    /// `#[serde(default)]`) for every project saved before this existed, so
+    /// they behave exactly as before.
+    #[serde(default)]
+    pub timing_settings: TimingSettings,
 }
 
 impl ProjectFile {
@@ -239,6 +245,7 @@ mod tests {
         lines[0].sing_end_override = Some(3.25);
         lines[0].word_overrides[0] = Some(1.6);
         lines[0].word_end_overrides[1] = Some(3.0);
+        lines[0].countdown_mode = crate::lyrics::CountdownMode::Force;
         let mut bv = crate::lyrics::BackingVocal::new("echo");
         bv.start = Some(2.0);
         bv.end = Some(2.8);
@@ -259,6 +266,11 @@ mod tests {
             background_fit: BackgroundFit::Contain,
             background_dim: 0.4,
             lyric_font_family: Some("Comic Sans MS".to_string()),
+            timing_settings: TimingSettings {
+                seconds_per_word: 0.6,
+                min_sing_duration: 1.5,
+                countdown_gap_threshold: 4.0,
+            },
         };
 
         let dir = std::env::temp_dir().join(format!(
@@ -302,6 +314,7 @@ mod tests {
         assert_eq!(loaded.background, None);
         assert_eq!(loaded.background_fit, BackgroundFit::Cover);
         assert_eq!(loaded.background_dim, 0.0);
+        assert_eq!(loaded.timing_settings, TimingSettings::default());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -399,6 +412,7 @@ mod tests {
             background_fit: BackgroundFit::default(),
             background_dim: 0.0,
             lyric_font_family: None,
+            timing_settings: TimingSettings::default(),
         };
 
         write_autosave(&app_id, &project).unwrap();
