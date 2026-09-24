@@ -766,6 +766,23 @@ fn spawn_background_video_decoder(
 /// small preview isn't worth the extra decoder/timing machinery it'd take,
 /// when the actual export already plays the real video back in sync with
 /// the song.
+///
+/// Tries a fraction of a second into the file first, not literal frame 0,
+/// escalating through a few later points before finally trying frame 0
+/// itself: some real-world files (confirmed directly - a video downloaded/
+/// remuxed via a tool like `yt-dlp`, its container metadata naming Google
+/// as the producer) have a leading stretch that fails to decode at all -
+/// e.g. a title card or fade-in spliced in without a full re-encode,
+/// leaving that whole stretch with different/incompatible stream
+/// parameters from the rest of the file - which makes `-frames:v 1` with
+/// no (or too small a) seek silently produce zero output frames, even
+/// though the rest of the file decodes completely normally. A single fixed
+/// seek offset isn't enough if that bad stretch runs longer than it - so
+/// this escalates through a few points rather than trying just one, and
+/// only genuinely fails once every one of them comes up empty.
+const THUMBNAIL_SEEK_CASCADE: [Option<&str>; 5] =
+    [Some("0.5"), Some("3"), Some("8"), Some("15"), None];
+
 pub fn extract_video_background_thumbnail(
     path: &Path,
     w: u32,
@@ -774,35 +791,74 @@ pub fn extract_video_background_thumbnail(
     pad_color: Rgb8,
 ) -> Result<Vec<u8>> {
     check_ffmpeg_available()?;
-    let output = crate::ffmpeg_path::command()?
-        .args(["-y", "-i"])
-        .arg(path)
-        .args([
+    let expected_len = w as usize * h as usize * 3;
+    let vf = fit_filter(fit, w, h, pad_color);
+
+    let grab = |seek: Option<&str>| -> Result<std::process::Output> {
+        let mut cmd = crate::ffmpeg_path::command()?;
+        cmd.arg("-y");
+        if let Some(seek) = seek {
+            // Placed before `-i` for fast, keyframe-based input seeking -
+            // this is a best-effort preview thumbnail, not a frame-exact
+            // export, so an approximate seek is the right trade-off.
+            cmd.args(["-ss", seek]);
+        }
+        cmd.arg("-i").arg(path).args([
             "-frames:v",
             "1",
             "-vf",
-            &fit_filter(fit, w, h, pad_color),
+            &vf,
             "-pix_fmt",
             "rgb24",
             "-f",
             "rawvideo",
             "-",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to run ffmpeg on {}", path.display()))?;
-    let expected_len = w as usize * h as usize * 3;
-    if !output.status.success() || output.stdout.len() < expected_len {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n");
-        bail!(
-            "couldn't read a preview frame from {}:\n{tail}",
-            path.display()
-        );
+        ]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("failed to run ffmpeg on {}", path.display()))
+    };
+
+    let mut attempts = Vec::with_capacity(THUMBNAIL_SEEK_CASCADE.len());
+    for seek in THUMBNAIL_SEEK_CASCADE {
+        let output = grab(seek)?;
+        if output.status.success() && output.stdout.len() >= expected_len {
+            return Ok(output.stdout);
+        }
+        attempts.push((seek, output));
     }
-    Ok(output.stdout)
+
+    // Every attempt came up empty - report each one's stderr tail (not
+    // just the very last line or two: the actual diagnostic - a decoder
+    // error, "moov atom not found", etc. - almost always appears well
+    // before ffmpeg's final "Conversion failed!" summary, so too short a
+    // tail can cut off the one line that actually explains what went
+    // wrong), labeled by which seek point it was.
+    let sections: Vec<String> = attempts
+        .iter()
+        .map(|(seek, output)| {
+            let label = seek.map_or("from the start (frame 0)".to_string(), |s| {
+                format!("seeked to {s}s")
+            });
+            let tail: String = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .take(15)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("--- {label} ---\n{tail}")
+        })
+        .collect();
+    bail!(
+        "couldn't read a preview frame from {}:\n{}",
+        path.display(),
+        sections.join("\n")
+    );
 }
 
 /// Renders the full karaoke video to `output_path`, muxed with the audio
