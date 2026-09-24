@@ -854,28 +854,30 @@ pub fn extract_video_background_thumbnail(
         attempts.push((seek, output));
     }
 
-    // Every attempt came up empty - report each one's stderr tail (not
-    // just the very last line or two: the actual diagnostic - a decoder
-    // error, "moov atom not found", etc. - almost always appears well
-    // before ffmpeg's final "Conversion failed!" summary, so too short a
-    // tail can cut off the one line that actually explains what went
-    // wrong), labeled by which seek point it was.
+    // Every attempt came up empty - report each one's stderr starting from
+    // its "Input #0" line (where ffmpeg reports the actual detected codec/
+    // duration/stream info for the source file), not just a fixed-size
+    // tail: a real decoder error/warning appears *between* that line and
+    // the final "Conversion failed!" summary, and a tail sized to safely
+    // include it kept turning out too short across two rounds of this bug
+    // already - ffmpeg's own version/build-config banner alone (which
+    // always comes first, and has only grown release to release) can
+    // already run 15-20 lines before "Input #0" even starts. Anchoring on
+    // that literal marker instead of a line count can't be out-grown the
+    // same way. Falls back to the whole thing if the marker's ever
+    // missing (e.g. a truly malformed invocation that fails before even
+    // opening the input), rather than showing nothing.
     let sections: Vec<String> = attempts
         .iter()
         .map(|(seek, output)| {
             let label = seek.map_or("from the start (frame 0)".to_string(), |s| {
                 format!("seeked to {s}s")
             });
-            let tail: String = String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .rev()
-                .take(15)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("--- {label} ---\n{tail}")
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let relevant = stderr
+                .find("Input #0")
+                .map_or(stderr.as_ref(), |i| &stderr[i..]);
+            format!("--- {label} ---\n{}", relevant.trim_end())
         })
         .collect();
     bail!(
