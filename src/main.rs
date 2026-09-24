@@ -8,6 +8,7 @@
 mod align;
 mod audio;
 mod cdg;
+mod codex;
 mod ctc;
 mod export;
 mod ffmpeg_path;
@@ -378,6 +379,15 @@ struct KaraokeApp {
     remove_vocals_for_video: bool,
     /// Whether the "Export…" options window is open.
     show_export_dialog: bool,
+    /// Whether the in-app documentation ("Codex") window is open - see
+    /// `codex.rs`/`draw_codex`.
+    codex_open: bool,
+    /// Index into [`codex::ARTICLES`] of the currently-shown article.
+    codex_selected: usize,
+    /// `egui_commonmark`'s own per-viewer cache (parsed markdown, loaded
+    /// images) - kept across frames so re-rendering the same article every
+    /// frame doesn't re-parse it from scratch each time.
+    codex_cache: egui_commonmark::CommonMarkCache,
     export_cdg: bool,
     export_lrc: bool,
     export_ultrastar: bool,
@@ -707,6 +717,9 @@ impl KaraokeApp {
             font_search: String::new(),
             remove_vocals_for_video: false,
             show_export_dialog: false,
+            codex_open: false,
+            codex_selected: 0,
+            codex_cache: egui_commonmark::CommonMarkCache::default(),
             export_cdg: true,
             export_lrc: false,
             export_ultrastar: false,
@@ -2395,6 +2408,70 @@ impl KaraokeApp {
         }
     }
 
+    /// Draws the in-app documentation ("Codex") window, if open - a
+    /// category/article sidebar plus a `CommonMarkViewer`-rendered main
+    /// area. See `codex.rs`'s own module docs for what's in
+    /// [`codex::ARTICLES`] and why.
+    fn draw_codex(&mut self, ctx: &egui::Context) {
+        if !self.codex_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("📖 Codex")
+            .open(&mut open)
+            .default_size([760.0, 560.0])
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(180.0);
+                        egui::ScrollArea::vertical()
+                            .id_source("codex_nav_scroll")
+                            .show(ui, |ui| {
+                                // Grouped by category, in the fixed order
+                                // each category's first article appears in
+                                // `codex::ARTICLES` - a real category
+                                // picker (independent of article order)
+                                // isn't worth it yet for five single-
+                                // article categories; revisit once
+                                // "Internals" splits one category across
+                                // several articles.
+                                let mut last_category = "";
+                                for (i, article) in codex::ARTICLES.iter().enumerate() {
+                                    if article.category != last_category {
+                                        ui.add_space(if last_category.is_empty() {
+                                            0.0
+                                        } else {
+                                            8.0
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(article.category).small().weak(),
+                                        );
+                                        last_category = article.category;
+                                    }
+                                    ui.selectable_value(&mut self.codex_selected, i, article.title);
+                                }
+                            });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_source("codex_article_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if let Some(article) = codex::ARTICLES.get(self.codex_selected) {
+                                egui_commonmark::CommonMarkViewer::new("codex_article").show(
+                                    ui,
+                                    &mut self.codex_cache,
+                                    article.content,
+                                );
+                            }
+                        });
+                });
+            });
+        if !open {
+            self.codex_open = false;
+        }
+    }
+
     fn draw_export_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_export_dialog {
             return;
@@ -3978,6 +4055,10 @@ impl eframe::App for KaraokeApp {
                         self.redo();
                     }
                 });
+                ui.separator();
+                if ui.button("📖 Codex").clicked() {
+                    self.codex_open = true;
+                }
                 match &self.current_project_path {
                     Some(path) => {
                         let name = path
@@ -4131,6 +4212,7 @@ impl eframe::App for KaraokeApp {
         });
 
         self.draw_export_dialog(ctx);
+        self.draw_codex(ctx);
 
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.add_space(4.0);

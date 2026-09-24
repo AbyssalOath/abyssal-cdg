@@ -123,15 +123,16 @@ for exactly which is which and how each is located at runtime.
 ## Rust crate dependencies
 
 Every crate this project depends on (transitively, `--avoid-dev-deps
---avoid-build-deps`) is permissively licensed - MIT, Apache-2.0,
-BSD-2/3-Clause, Zlib, ISC, BSL-1.0, CC0-1.0, Unicode-3.0, or CDLA-Permissive-2.0
-(all compatible with unrestricted redistribution), plus MPL-2.0 for the
-`symphonia` family (weak copyleft at the *file* level - using it as an
-unmodified library dependency, as this project does, doesn't extend any
-obligation to this project's own source). No dependency in the tree is
-GPL/AGPL-only or otherwise restrictively licensed; the one dependency
-offering LGPL as an option (`r-efi`) offers it alongside MIT/Apache-2.0
-alternatives, so no LGPL obligation is actually incurred.
+--avoid-build-deps`) is permissively licensed - MIT, Apache-2.0, 0BSD,
+BSD-2/3-Clause, Zlib, ISC, BSL-1.0, CC0-1.0, NCSA, OFL-1.1, the Ubuntu Font
+License, Unicode-3.0, or CDLA-Permissive-2.0 (all compatible with
+unrestricted redistribution), plus MPL-2.0 for the `symphonia` family
+(weak copyleft at the *file* level - using it as an unmodified library
+dependency, as this project does, doesn't extend any obligation to this
+project's own source). No dependency in the tree is GPL/AGPL-only or
+otherwise restrictively licensed; the one dependency offering LGPL as an
+option (`r-efi`) offers it alongside MIT/Apache-2.0 alternatives, so no
+LGPL obligation is actually incurred.
 
 This list was generated with [`cargo-license`](https://crates.io/crates/cargo-license)
 (`cargo license --avoid-dev-deps --avoid-build-deps`) and reflects
@@ -142,6 +143,14 @@ file to stay current on its own.
 <!-- Regenerate below with: cargo license --avoid-dev-deps --avoid-build-deps -->
 
 ```
+(Apache-2.0 OR MIT) AND BSD-3-Clause (1): encoding_rs
+(Apache-2.0 OR MIT) AND NCSA (1): libfuzzer-sys
+(Apache-2.0 OR MIT) AND OFL-1.1 AND LicenseRef-UFL-1.0 (1): epaint (egui's own painting
+    primitives crate embeds a fallback font under OFL-1.1/the Ubuntu Font License -
+    same permissive font-license family already used for this project's own bundled
+    fonts, see "Bundled binaries and models" above)
+0BSD OR Apache-2.0 (1): audio-codec-algorithms
+0BSD OR Apache-2.0 OR MIT (1): adler2
 Apache-2.0 (15): ab_glyph, ab_glyph_rasterizer, codespan-reporting, cpal, gethostname, glutin, glutin_egl_sys, glutin_glx_sys, glutin_wgl_sys, hound, oboe, oboe-sys, owned_ttf_parser, spirv, winit
 Apache-2.0 AND ISC (1): ring
 Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT (7): linux-raw-sys, linux-raw-sys, rustix, rustix, wasi, wasip2, wit-bindgen
@@ -151,7 +160,7 @@ Apache-2.0 OR BSD-3-Clause OR MIT (2): num_enum, num_enum_derive
 Apache-2.0 OR CC0-1.0 (1): imgref
 Apache-2.0 OR ISC OR MIT (1): rustls
 Apache-2.0 OR LGPL-2.1-or-later OR MIT (2): r-efi, r-efi
-Apache-2.0 OR MIT (305): (see `cargo license` for the full list - too long to usefully inline; includes ort, ndarray, rustfft, realfft, rubato, hound, bzip2-rs, ureq, dirs, unicode-normalization, serde, and most of the rest of this project's direct dependencies)
+Apache-2.0 OR MIT (312): (see `cargo license` for the full list - too long to usefully inline; includes ort, ndarray, rustfft, realfft, rubato, hound, bzip2-rs, ureq, dirs, unicode-normalization, serde, egui_commonmark, egui_extras, and most of the rest of this project's direct dependencies)
 Apache-2.0 OR MIT OR Zlib (18): bytemuck, bytemuck_derive, cursor-icon, dispatch2, glow, miniz_oxide, objc2-app-kit, objc2-core-foundation, objc2-core-graphics, objc2-io-surface, raw-window-handle, raw-window-handle, tinyvec, visibility, xkeysym, zune-core, zune-inflate, zune-jpeg
 BSD-2-Clause (3): av1-grain, rav1e, v_frame
 BSD-3-Clause (5): avif-serialize, exr, lebe, ravif, subtle
@@ -159,7 +168,7 @@ BSL-1.0 (2): clipboard-win, error-code
 CC0-1.0 (1): hexf-parse
 CDLA-Permissive-2.0 (1): webpki-roots
 ISC (5): libloading, libloading, libloading, rustls-webpki, untrusted
-MIT (117): (see `cargo license` for the full list - includes rfd, font8x8, realfft, tracing, and most GUI/windowing-adjacent crates)
+MIT (119): (see `cargo license` for the full list - includes rfd, font8x8, realfft, tracing, pulldown-cmark, mime_guess2, and most GUI/windowing-adjacent crates)
 MIT OR Unlicense (7): byteorder, byteorder-lite, memchr, same-file, termcolor, walkdir, winapi-util
 MPL-2.0 (18): dwrote, option-ext, symphonia, symphonia-bundle-flac, symphonia-bundle-mp3, symphonia-codec-aac, symphonia-codec-adpcm, symphonia-codec-alac, symphonia-codec-pcm, symphonia-codec-vorbis, symphonia-core, symphonia-format-caf, symphonia-format-isomp4, symphonia-format-mkv, symphonia-format-ogg, symphonia-format-riff, symphonia-metadata, symphonia-utils-xiph
 Unicode-3.0 (18): icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data, icu_properties, icu_properties_data, icu_provider, litemap, potential_utf, tinystr, writeable, yoke, yoke-derive, zerofrom, zerofrom-derive, zerotrie, zerovec, zerovec-derive
