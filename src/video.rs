@@ -1022,15 +1022,19 @@ pub fn render_video(
     // builds default to) is a simpler, bitrate-driven encoder without
     // x264's CRF-style "target a perceptual quality" mode, and its
     // rate-distortion optimization is genuinely weaker than x264's at the
-    // same bitrate - so this targets a generously high bitrate to
-    // compensate, rather than trying to replicate a CRF setting that
-    // openh264 has no real equivalent for. Karaoke video content (mostly
-    // static text over a slow-moving or still background) compresses well
-    // in practice, so this is comfortably more headroom than the content
-    // actually needs.
+    // same bitrate - so this targets a bitrate with real headroom above
+    // what the content needs, rather than trying to replicate a CRF
+    // setting that openh264 has no real equivalent for. These numbers were
+    // originally set much higher (32M/10M) before being measured against
+    // actual exports: this app's video is overwhelmingly static/slow-moving
+    // (large lyric text over a still or slow-moving background, not
+    // fast-motion footage), so the old numbers were producing needlessly
+    // huge files (measured: a multi-minute export landing at several
+    // hundred MB) for no visible quality gain - these are still generous
+    // for this specific content, not a tight/risky cut.
     let video_bitrate = match (w, h) {
-        _ if w * h > 1920 * 1080 => "32M", // 4K
-        _ => "10M",                        // 1080p (or anything smaller)
+        _ if w * h > 1920 * 1080 => "14M", // 4K
+        _ => "5M",                         // 1080p (or anything smaller)
     };
     let mut child = crate::ffmpeg_path::command()?
         .args([

@@ -447,3 +447,18 @@ folder-based player/game library.
   (`UVR-MDX-NET-Inst_HQ_3.onnx`) - there's no in-app way to pick a
   different separation model or tune its parameters (segment size,
   overlap, etc.) yet.
+- Exported `.mp4` video is H.264 via the bundled `openh264` encoder (see
+  `ffmpeg_path.rs` for why: LGPL-only, no x264) at a fixed bitrate
+  (`video_bitrate` in `src/video.rs` - currently 5M for 1080p, 14M for 4K,
+  sized for this app's own content: mostly-static lyric text over a still
+  or slow-moving background, not fast-motion footage). openh264 has no
+  real CRF-style "target a quality level, let file size float" mode to
+  replace that fixed number with, so file size can only be tuned by
+  guessing a better constant, not genuinely optimized. Swapping the
+  encoder to AV1 (e.g. via SVT-AV1, BSD-2-Clause-Patent - license-
+  compatible with this project the same way `dav1d` is for AV1 decoding)
+  would give real quality-targeted encoding and meaningfully smaller files
+  at equal quality, at the cost of a comparable-sized new from-source
+  build step across all 4 release platforms, slower encodes, and a small
+  AV1-in-MP4 playback-compatibility gap on older devices/editors - not
+  done yet, just scoped.
