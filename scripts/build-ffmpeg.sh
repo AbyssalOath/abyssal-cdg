@@ -3,8 +3,29 @@
 # with H.264 encoding via openh264 (linked at build time for the headers/
 # ABI only - the actual runtime library is a separately-downloaded copy of
 # Cisco's own official binary, not this build's; see ffmpeg_path.rs for
-# why) and MP3 encoding via LAME (statically linked - LGPL, and MP3's
-# patents expired in 2017, so no equivalent runtime-swap dance is needed).
+# why), MP3 encoding via LAME (statically linked - LGPL, and MP3's patents
+# expired in 2017, so no equivalent runtime-swap dance is needed), and AV1
+# decoding via dav1d (statically linked - BSD-2-Clause, VideoLAN's own
+# software AV1 decoder). dav1d specifically (not just "AV1 support") is
+# load-bearing: ffmpeg's own built-in "av1" decoder has no real software
+# fallback in this ffmpeg version - every pixel format it can produce is
+# gated behind a `#if CONFIG_AV1_*_HWACCEL` (VAAPI/NVDEC/VULKAN/...), and
+# with none of those hwaccels compiled in (this build passes
+# --disable-autodetect below, which disables all of them at configure
+# time - see that flag's own comment), it unconditionally fails every AV1
+# frame with "Your platform doesn't support hardware accelerated AV1
+# decoding" (libavcodec/av1dec.c's own `get_pixel_format`) - regardless of
+# the actual machine's GPU, and regardless of any `-hwaccel` CLI flag,
+# since the problem is a missing decode path, not a hwaccel negotiation
+# preference. dav1d is a completely separate registered decoder
+# ("libdav1d", see libavcodec/libdav1d.c) that doesn't go through that
+# hwaccel-only code at all, and - once --enable-libdav1d is set below -
+# ffmpeg's own decoder lookup already prefers it over the native "av1"
+# decoder automatically for every AV1 stream (`libdav1d_decoder` is
+# registered before `av1_decoder` in libavcodec/allcodecs.c, and decoder
+# lookup returns the first registered match for a given codec ID) - no
+# `-c:v` override needed in src/video.rs, and nothing here needs to touch
+# how non-AV1 inputs (the common case) get decoded.
 #
 # Used identically across all 4 release targets (see
 # .github/workflows/release.yml) - platform differences are handled by the
@@ -63,6 +84,7 @@ echo "Detected OPENH264_OS=$OPENH264_OS (uname: $(uname))"
 : "${OPENH264_VERSION:=2.6.0}"
 : "${FFMPEG_VERSION:=n7.1}"
 : "${LAME_VERSION:=3.100}"
+: "${DAV1D_VERSION:=1.4.3}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -145,11 +167,46 @@ tar xzf "$work/lame.tar.gz" -C "$work"
 	make install
 )
 
-echo "== Building ffmpeg ${FFMPEG_VERSION} (LGPL only, libopenh264 + libmp3lame) =="
+echo "== Building dav1d v${DAV1D_VERSION} (statically linked - BSD-2-Clause software AV1 decoder) =="
+git clone --depth 1 --branch "$DAV1D_VERSION" https://code.videolan.org/videolan/dav1d.git "$work/dav1d-src"
+(
+	cd "$work/dav1d-src"
+	dav1d_meson_args=(build --prefix="$work/dav1d-install" --libdir=lib --default-library=static --buildtype=release -Denable_tools=false -Denable_tests=false)
+	# Cross-compiling (currently only the macOS x86_64-on-arm64 target,
+	# which is the one entry that sets CC - see LAME's own build above,
+	# which piggybacks on this exact same env var for the exact same
+	# reason): unlike autotools, meson can't just take an overridden CC -
+	# it needs an explicit cross file naming the *target* machine, since
+	# (unlike LAME's build) it tries to run little test binaries as part
+	# of its own compiler/feature checks, which would silently be built
+	# for the wrong arch and fail to execute without one telling it not
+	# to even try.
+	if [ -n "${CC:-}" ]; then
+		read -r -a cc_words <<<"$CC"
+		cc_toml="$(printf "'%s', " "${cc_words[@]}")"
+		cross_file="$work/dav1d-cross.ini"
+		cat >"$cross_file" <<EOF
+[binaries]
+c = [${cc_toml%, }]
+
+[host_machine]
+system = 'darwin'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+EOF
+		dav1d_meson_args+=(--cross-file="$cross_file")
+	fi
+	meson setup "${dav1d_meson_args[@]}"
+	ninja -C build
+	ninja -C build install
+)
+
+echo "== Building ffmpeg ${FFMPEG_VERSION} (LGPL only, libopenh264 + libmp3lame + libdav1d) =="
 git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.git "$work/ffmpeg-src"
 (
 	cd "$work/ffmpeg-src"
-	export PKG_CONFIG_PATH="$work/openh264-install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+	export PKG_CONFIG_PATH="$work/openh264-install/lib/pkgconfig:$work/dav1d-install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 	# --disable-autodetect is load-bearing, not just tidiness: without it,
 	# `configure` silently links against whatever matching-named codec
 	# libraries happen to already be installed on the build machine
@@ -168,15 +225,27 @@ git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.
 	# regardless of quoting, which broke the first real CI run of this
 	# exact case ("Unknown option \"x86_64\"." - the value's own quotes
 	# were being word-split away instead of respected).
+	# --pkg-config-flags=--static: this ffmpeg build is fully static
+	# (--enable-static --disable-shared below) - without this,
+	# `configure`'s own pkg-config probing for libdav1d only picks up its
+	# *dynamic*-link flags (plain `pkg-config --libs dav1d`), dropping the
+	# transitive/private link deps a static consumer needs (dav1d's .pc
+	# file's own `Libs.private`, e.g. libm/libpthread on Unix) - the same
+	# class of "works dynamically linked, silently missing symbols/flags
+	# statically linked" gap this project's openh264/LAME linking already
+	# had to work around, just via pkg-config's own static-query mode this
+	# time instead of an install-name/soname fix.
 	eval ./configure \
 		--disable-autodetect \
 		--disable-gpl \
 		--disable-nonfree \
 		--enable-static \
 		--disable-shared \
+		--pkg-config-flags=--static \
 		--enable-libopenh264 \
 		--enable-encoder=libopenh264 \
 		--enable-libmp3lame \
+		--enable-libdav1d \
 		--extra-cflags="-I$work/lame-install/include" \
 		--extra-ldflags="-L$work/lame-install/lib" \
 		--disable-doc \

@@ -765,16 +765,20 @@ fn spawn_background_video_decoder(
     pad_color: Rgb8,
 ) -> Result<std::process::Child> {
     crate::ffmpeg_path::command()?
-        // `-hwaccel none`: forces plain software decoding - confirmed
-        // directly (a real AV1 background video's decode otherwise fails
-        // with "Your platform doesn't support hardware accelerated AV1
-        // decoding" / "Failed to get pixel format", then retries that same
-        // failing hwaccel query in a tight loop hundreds of times instead
-        // of falling back to software, hanging the whole export). A
-        // one-shot background-video decode piped into another process
-        // never benefits from hardware acceleration in the first place,
-        // so there's no real trade-off in disabling it outright rather
-        // than only for the specific codecs/machines that hit this.
+        // `-hwaccel none`: a one-shot background-video decode piped into
+        // another process never benefits from hardware acceleration in the
+        // first place, so this is disabled outright rather than only for
+        // specific codecs/machines. Belt-and-suspenders, not the fix for
+        // AV1 specifically: a real AV1 background video used to hang here
+        // ("Your platform doesn't support hardware accelerated AV1
+        // decoding", retried hundreds of times) regardless of this flag -
+        // this custom ffmpeg build's native "av1" decoder has no software
+        // fallback of its own at all in this ffmpeg version (every pixel
+        // format it can produce is gated behind a hwaccel it was never
+        // compiled with, see scripts/build-ffmpeg.sh's own comments on
+        // --enable-libdav1d), so no `-hwaccel` CLI flag could ever have
+        // fixed it - the real fix was giving ffmpeg an actual software AV1
+        // decoder (dav1d) to fall back to.
         .args(["-hwaccel", "none", "-stream_loop", "-1", "-i"])
         .arg(path)
         .args([
@@ -830,13 +834,12 @@ pub fn extract_video_background_thumbnail(
 
     let grab = |seek: Option<&str>| -> Result<std::process::Output> {
         let mut cmd = crate::ffmpeg_path::command()?;
-        // `-hwaccel none`: forces plain software decoding - see the
-        // matching comment on `spawn_background_video_decoder`'s own
-        // identical flag. Confirmed directly: a real AV1 background video
-        // without this hung trying (and re-trying, hundreds of times) a
-        // hardware decode path the machine it was tested on didn't
-        // support, instead of ever falling back to software - which a
-        // one-shot single-frame grab has no reason to want anyway.
+        // `-hwaccel none`: see the matching comment on
+        // `spawn_background_video_decoder`'s own identical flag - a
+        // one-shot single-frame grab has no reason to want hardware
+        // acceleration anyway, but this alone never fixed the real AV1
+        // hang (see that comment for why: this build's ffmpeg had no
+        // software AV1 decoder at all before --enable-libdav1d).
         cmd.args(["-hwaccel", "none", "-y"]);
         if let Some(seek) = seek {
             // Placed before `-i` for fast, keyframe-based input seeking -
