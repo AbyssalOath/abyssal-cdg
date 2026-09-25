@@ -765,7 +765,17 @@ fn spawn_background_video_decoder(
     pad_color: Rgb8,
 ) -> Result<std::process::Child> {
     crate::ffmpeg_path::command()?
-        .args(["-stream_loop", "-1", "-i"])
+        // `-hwaccel none`: forces plain software decoding - confirmed
+        // directly (a real AV1 background video's decode otherwise fails
+        // with "Your platform doesn't support hardware accelerated AV1
+        // decoding" / "Failed to get pixel format", then retries that same
+        // failing hwaccel query in a tight loop hundreds of times instead
+        // of falling back to software, hanging the whole export). A
+        // one-shot background-video decode piped into another process
+        // never benefits from hardware acceleration in the first place,
+        // so there's no real trade-off in disabling it outright rather
+        // than only for the specific codecs/machines that hit this.
+        .args(["-hwaccel", "none", "-stream_loop", "-1", "-i"])
         .arg(path)
         .args([
             "-vf",
@@ -820,7 +830,14 @@ pub fn extract_video_background_thumbnail(
 
     let grab = |seek: Option<&str>| -> Result<std::process::Output> {
         let mut cmd = crate::ffmpeg_path::command()?;
-        cmd.arg("-y");
+        // `-hwaccel none`: forces plain software decoding - see the
+        // matching comment on `spawn_background_video_decoder`'s own
+        // identical flag. Confirmed directly: a real AV1 background video
+        // without this hung trying (and re-trying, hundreds of times) a
+        // hardware decode path the machine it was tested on didn't
+        // support, instead of ever falling back to software - which a
+        // one-shot single-frame grab has no reason to want anyway.
+        cmd.args(["-hwaccel", "none", "-y"]);
         if let Some(seek) = seek {
             // Placed before `-i` for fast, keyframe-based input seeking -
             // this is a best-effort preview thumbnail, not a frame-exact
