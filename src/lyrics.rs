@@ -97,20 +97,43 @@ impl CountdownMode {
 /// first appear in the song. Used to build a color-legend on the intro
 /// screen so singers can see which color means what before the song
 /// starts. Returns an empty list for a song with only one (or zero)
-/// distinct voice, since a legend only earns its place once more than one
-/// color is actually in play - e.g. a duet, or a song with a dedicated
-/// screaming section - which also means an untouched song (every line
-/// still at `Default`) never gets a legend.
-pub fn singer_legend(lines: &[TimedLine]) -> Vec<Singer> {
-    let used: Vec<Singer> = Singer::ALL
-        .into_iter()
-        .filter(|s| lines.iter().any(|l| l.singer == *s))
-        .collect();
+/// distinct *label* in play, since a legend only earns its place once more
+/// than one is actually shown - e.g. a duet, a song with a dedicated
+/// screaming section, or two custom names sharing one base color (see
+/// [`effective_singer_label`]) - which also means an untouched song (every
+/// line still at `Default`, no custom names) never gets a legend. Each
+/// entry pairs a line's `singer` (which color to use) with whatever custom
+/// name (if any) was typed for it - two lines with the same `singer` but
+/// different custom names are two separate entries, not merged into one.
+pub fn singer_legend(lines: &[TimedLine]) -> Vec<(Singer, Option<String>)> {
+    let mut used: Vec<(Singer, Option<String>)> = Vec::new();
+    for base in Singer::ALL {
+        for line in lines {
+            if line.singer != base {
+                continue;
+            }
+            let key = (line.singer, line.custom_singer_name.clone());
+            if !used.contains(&key) {
+                used.push(key);
+            }
+        }
+    }
     if used.len() > 1 {
         used
     } else {
         Vec::new()
     }
+}
+
+/// The text shown for a singer in a legend/dropdown - `custom_name` if
+/// there is one, otherwise `singer`'s own generic label (see
+/// [`Singer::label`]). `custom_name` never changes what color `singer`
+/// renders in - only what's shown as text (see
+/// [`LyricLine::custom_singer_name`]'s own docs for why: this app's `.cdg`
+/// exporter has a hard 16-color palette with no room for arbitrarily many
+/// distinct singer colors).
+pub fn effective_singer_label(singer: Singer, custom_name: &Option<String>) -> &str {
+    custom_name.as_deref().unwrap_or_else(|| singer.label())
 }
 
 /// Rough estimate of how long it takes to sing `text`, used only to decide
@@ -228,6 +251,15 @@ pub struct LyricLine {
     /// existed, matching the automatic-only behavior they already had.
     #[serde(default)]
     pub countdown_mode: CountdownMode,
+    /// A user-typed display name ("Male 1", "Lead Singer", ...) shown in
+    /// the legend/dropdown instead of `singer`'s own generic label -
+    /// `singer` still decides this line's *color* (there's no separate
+    /// color budget for custom names - see [`effective_singer_label`]),
+    /// this only overrides what's shown as text. `None` (the default, via
+    /// `#[serde(default)]`) for every line/project saved before this
+    /// existed, and for any line that hasn't been given a custom name.
+    #[serde(default)]
+    pub custom_singer_name: Option<String>,
 }
 
 impl LyricLine {
@@ -244,6 +276,7 @@ impl LyricLine {
             starts_new_block: true,
             backing_vocal: None,
             countdown_mode: CountdownMode::default(),
+            custom_singer_name: None,
         }
     }
 
@@ -768,6 +801,8 @@ pub struct TimedLine {
     pub backing_vocal: Option<TimedBackingVocal>,
     /// See [`LyricLine::countdown_mode`].
     pub countdown_mode: CountdownMode,
+    /// See [`LyricLine::custom_singer_name`].
+    pub custom_singer_name: Option<String>,
 }
 
 impl TimedLine {
@@ -833,6 +868,7 @@ impl TimedLine {
             starts_new_block: line.starts_new_block,
             backing_vocal,
             countdown_mode: line.countdown_mode,
+            custom_singer_name: line.custom_singer_name.clone(),
         }
     }
 }
@@ -1330,7 +1366,10 @@ mod tests {
             TimedLine::new("his line".into(), 0.0, 1.0, Singer::Default),
             TimedLine::new("her line".into(), 1.0, 2.0, Singer::Female),
         ];
-        assert_eq!(singer_legend(&lines), vec![Singer::Default, Singer::Female]);
+        assert_eq!(
+            singer_legend(&lines),
+            vec![(Singer::Default, None), (Singer::Female, None)]
+        );
     }
 
     #[test]
@@ -1345,8 +1384,41 @@ mod tests {
         ];
         assert_eq!(
             singer_legend(&lines),
-            vec![Singer::Male, Singer::Female, Singer::Screaming]
+            vec![
+                (Singer::Male, None),
+                (Singer::Female, None),
+                (Singer::Screaming, None)
+            ]
         );
+    }
+
+    #[test]
+    fn singer_legend_treats_distinct_custom_names_sharing_one_base_as_separate_entries() {
+        // "Male 1" and "Male 2" both use Singer::Male (see this feature's
+        // own design: custom names share their base's color, no separate
+        // color budget) - the legend should still list them as two
+        // distinct entries, not collapse them into one "Male".
+        let mut a = TimedLine::new("a".into(), 0.0, 1.0, Singer::Male);
+        a.custom_singer_name = Some("Male 1".to_string());
+        let mut b = TimedLine::new("b".into(), 1.0, 2.0, Singer::Male);
+        b.custom_singer_name = Some("Male 2".to_string());
+        let lines = vec![a, b];
+        assert_eq!(
+            singer_legend(&lines),
+            vec![
+                (Singer::Male, Some("Male 1".to_string())),
+                (Singer::Male, Some("Male 2".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_singer_label_prefers_the_custom_name_when_set() {
+        assert_eq!(
+            effective_singer_label(Singer::Male, &Some("Male 1".to_string())),
+            "Male 1"
+        );
+        assert_eq!(effective_singer_label(Singer::Male, &None), "Male");
     }
 
     #[test]

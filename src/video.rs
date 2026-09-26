@@ -24,8 +24,8 @@
 use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
     backing_vocal_wipe_fraction, blank_sung_lines, countdown_window, countdown_window_between,
-    current_line_wipe_fraction, group_into_blocks, hide_upcoming_lines, normalize_text,
-    singer_legend, Singer, TimedLine, TimingSettings,
+    current_line_wipe_fraction, effective_singer_label, group_into_blocks, hide_upcoming_lines,
+    normalize_text, singer_legend, Singer, TimedLine, TimingSettings,
 };
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
@@ -35,6 +35,12 @@ use std::process::Stdio;
 
 static DEJAVU_REGULAR: &[u8] = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
 static DEJAVU_BOLD: &[u8] = include_bytes!("../assets/fonts/dejavu/DejaVuSans-Bold.ttf");
+
+/// Shown under the title card (see `render_frame`) unless the user turns it
+/// off - see [`crate::project::ProjectFile::show_credit`]. Never forced: the
+/// toggle defaults on, but every project can opt out of it entirely.
+pub(crate) const CREDIT_TEXT: &str =
+    "Created with Abyssal CDG Creator - github.com/AbyssalOath/abyssal-cdg";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Resolution {
@@ -415,16 +421,19 @@ fn draw_text_line_wipe(
 /// label is colored with that singer's own highlight color, so the legend
 /// on the intro screen ties the colors used during the song to the voice
 /// they represent.
-fn legend_text_and_colors(palette: &VideoPalette, singers: &[Singer]) -> (String, Vec<Rgb8>) {
+fn legend_text_and_colors(
+    palette: &VideoPalette,
+    singers: &[(Singer, Option<String>)],
+) -> (String, Vec<Rgb8>) {
     let mut text = String::new();
     let mut colors = Vec::new();
-    for (i, singer) in singers.iter().enumerate() {
+    for (i, (singer, custom_name)) in singers.iter().enumerate() {
         if i > 0 {
             text.push_str("   ");
             colors.extend([palette.preview; 3]);
         }
         let (_, highlight) = palette.singer_colors(*singer);
-        let label = singer.label();
+        let label = effective_singer_label(*singer, custom_name);
         text.push_str(label);
         colors.extend(std::iter::repeat_n(highlight, label.chars().count()));
     }
@@ -467,7 +476,12 @@ fn draw_countdown_dots(
     lit_color: Rgb8,
     dim_color: Rgb8,
 ) {
-    let cy = h * 0.85;
+    // Near the top, not the bottom - so it doesn't collide with the
+    // upcoming line(s) now shown (see `render_frame`'s own `hide_upcoming`
+    // logic) starting from the same moment the countdown itself begins,
+    // for the singer to read ahead during the countdown rather than only
+    // right as the words become live.
+    let cy = h * 0.12;
     let radius = h * 0.012;
     let spacing = h * 0.05;
     for i in 0..4 {
@@ -496,6 +510,7 @@ fn render_frame(
     card_end: f64,
     t: f64,
     timing_settings: &TimingSettings,
+    show_credit: bool,
 ) {
     let w = canvas.w as f32;
     let h = canvas.h as f32;
@@ -542,6 +557,18 @@ fn render_frame(
                 max_width,
             );
         }
+        if show_credit {
+            draw_text_line_uniform(
+                canvas,
+                regular,
+                h * 0.028,
+                w / 2.0,
+                h * 0.85,
+                CREDIT_TEXT,
+                palette.preview,
+                max_width,
+            );
+        }
         return;
     }
 
@@ -560,6 +587,38 @@ fn render_frame(
                     let (_, highlight) = palette.singer_colors(first.singer);
                     let lit = countdown_lit_count(cd_start, cd_end, t);
                     draw_countdown_dots(canvas, w, h, lit, highlight, palette.preview);
+
+                    // Reveal the first block's lines too, same idea as the
+                    // mid-song countdown's reveal below (see the main
+                    // `hide_upcoming` logic) - just for the very start of
+                    // the song, which has no "current line" yet to hang a
+                    // block off of. Plain dim/unsung text, no wipe/
+                    // highlight - nothing has started being sung.
+                    let block = blocks
+                        .iter()
+                        .find(|b| b.contains(&0))
+                        .cloned()
+                        .unwrap_or_else(|| vec![0]);
+                    let line_height = h * 0.11;
+                    let font_size = h * 0.055;
+                    let total_height = block.len() as f32 * line_height;
+                    let start_y = h * 0.5 - total_height / 2.0 + line_height * 0.5;
+                    for (slot, &idx) in block.iter().enumerate() {
+                        let line = &timed_lines[idx];
+                        let text = normalize_text(&line.text);
+                        let y = start_y + slot as f32 * line_height;
+                        let (unsung, _) = palette.singer_colors(line.singer);
+                        draw_text_line_uniform(
+                            canvas,
+                            regular,
+                            font_size,
+                            w / 2.0,
+                            y,
+                            &text,
+                            unsung,
+                            max_width,
+                        );
+                    }
                 }
             }
             return;
@@ -580,20 +639,31 @@ fn render_frame(
     // break before the next one (long enough to warrant the countdown
     // indicator below), hide the not-yet-started lines in this block
     // instead of leaving them sitting on screen the whole time - the screen
-    // should read as "done, waiting" (then the countdown dots, then the
-    // next line), not show lyrics that are still a break away. During a
-    // long enough break, the already-sung lines get cleared too (after
-    // lingering for a bit) instead of sitting there for the whole break.
+    // should read as "done, waiting", then, once the countdown itself
+    // starts, both the dots *and* the upcoming line(s) appear together
+    // (`hide_upcoming_lines` alone would keep them hidden for the whole
+    // break, dots included - the `!cd_window.is_some_and(...)` below is
+    // what makes them reappear exactly when the countdown does, not only
+    // once the next line actually starts singing) so the singer can read
+    // ahead during the countdown rather than only right as the words go
+    // live. During a long enough break, the already-sung lines get
+    // cleared too (after lingering for a bit) instead of sitting there
+    // for the whole break.
     let next_countdown_mode = timed_lines
         .get(current_idx + 1)
         .map(|n| n.countdown_mode)
         .unwrap_or_default();
+    let cd_window = countdown_window(
+        &timed_lines[current_idx],
+        next_countdown_mode,
+        timing_settings,
+    );
     let hide_upcoming = hide_upcoming_lines(
         &timed_lines[current_idx],
         t,
         next_countdown_mode,
         timing_settings,
-    );
+    ) && !cd_window.is_some_and(|(cd_start, _)| t >= cd_start);
     let blank_sung = blank_sung_lines(
         &timed_lines[current_idx],
         t,
@@ -691,11 +761,7 @@ fn render_frame(
     // for the last line of the song, a long gap here is just trailing
     // silence after the song ends, not a break before another line.
     let has_next_line = current_idx + 1 < timed_lines.len();
-    if let Some((cd_start, cd_end)) = countdown_window(
-        &timed_lines[current_idx],
-        next_countdown_mode,
-        timing_settings,
-    ) {
+    if let Some((cd_start, cd_end)) = cd_window {
         if has_next_line && t >= cd_start {
             let next_singer = timed_lines
                 .get(current_idx + 1)
@@ -966,6 +1032,7 @@ pub fn render_video(
     custom_font_bytes: Option<Vec<u8>>,
     output_path: &Path,
     timing_settings: &TimingSettings,
+    show_credit: bool,
     mut on_progress: impl FnMut(f32),
 ) -> Result<()> {
     check_ffmpeg_available()?;
@@ -1200,6 +1267,7 @@ pub fn render_video(
             card_end,
             t,
             timing_settings,
+            show_credit,
         );
         if stdin.write_all(&canvas.buf).is_err() {
             break;
@@ -1348,7 +1416,8 @@ mod tests {
             screaming_unsung: Rgb8::new(140, 30, 20),
             screaming_highlight: Rgb8::new(255, 60, 10),
         };
-        let (text, colors) = legend_text_and_colors(&palette, &[Singer::Male, Singer::Female]);
+        let (text, colors) =
+            legend_text_and_colors(&palette, &[(Singer::Male, None), (Singer::Female, None)]);
         assert_eq!(text, "Male   Female");
         assert_eq!(colors.len(), text.chars().count());
         // First char of "Male" should be the male highlight color...
@@ -1358,6 +1427,49 @@ mod tests {
         let female_start = "Male   ".chars().count();
         assert_eq!(colors[female_start].r, palette.female_highlight.r);
         assert_eq!(colors[female_start].g, palette.female_highlight.g);
+    }
+
+    #[test]
+    fn credit_line_only_draws_when_show_credit_is_true() {
+        let mut lines = vec![LyricLine::new("hello")];
+        lines[0].start = Some(20.0);
+        let timed = resolve_timing(&lines, Some(22.0));
+        let blocks = group_into_blocks(&timed);
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed); // 5.0, title present
+        let (w, h) = (320usize, 180usize);
+        let credit_row_y = h as f32 * 0.85;
+
+        let render_at = |show_credit: bool| -> Canvas {
+            let mut canvas = Canvas::new(w, h);
+            canvas.fill(palette.background);
+            render_frame(
+                &mut canvas,
+                &regular,
+                &bold,
+                &timed,
+                &blocks,
+                &palette,
+                Some("Song"),
+                None,
+                card_end,
+                1.0, // within the title card (card_end = 5.0)
+                &TimingSettings::default(),
+                show_credit,
+            );
+            canvas
+        };
+
+        assert!(
+            !row_has_non_background_pixel(&render_at(false), &palette, credit_row_y),
+            "the credit line must not draw when show_credit is false"
+        );
+        assert!(
+            row_has_non_background_pixel(&render_at(true), &palette, credit_row_y),
+            "the credit line should draw under the title card when show_credit is true"
+        );
     }
 
     #[test]
@@ -1537,6 +1649,7 @@ mod tests {
                 card_end,
                 t,
                 &TimingSettings::default(),
+                false,
             );
             t += 0.37;
         }
@@ -1567,7 +1680,7 @@ mod tests {
     fn countdown_dot_area_is_untouched(canvas: &Canvas, palette: &VideoPalette) -> bool {
         let w = canvas.w as f32;
         let h = canvas.h as f32;
-        let cy = (h * 0.85).round() as usize;
+        let cy = (h * 0.12).round() as usize;
         let cx = (w / 2.0 + (0.0 - 1.5) * (h * 0.05)).round() as usize;
         let idx = (cy * canvas.w + cx) * 3;
         canvas.buf[idx] == palette.background.r
@@ -1625,6 +1738,7 @@ mod tests {
                 card_end,
                 t,
                 &TimingSettings::default(),
+                false,
             );
             canvas
         };
@@ -1675,6 +1789,7 @@ mod tests {
             card_end,
             28.0,
             &TimingSettings::default(),
+            false,
         );
 
         assert!(
@@ -1711,11 +1826,140 @@ mod tests {
             card_end,
             18.0,
             &TimingSettings::default(),
+            false,
         );
 
         assert!(
             !countdown_dot_area_is_untouched(&canvas, &palette),
             "expected a countdown dot to be drawn for a real mid-song gap"
+        );
+    }
+
+    #[test]
+    fn upcoming_line_stays_hidden_before_the_countdown_then_appears_once_it_starts() {
+        // Same fixture as the test above (cd_start works out to 20.0 - 4.0 =
+        // 16.0) - "there" (block slot 1, the not-yet-started line) should
+        // still be hidden at t=10.0 (mid-gap, before the countdown itself
+        // starts) but visible at t=18.0 (during the countdown), so the
+        // singer can read it ahead of time rather than only once it starts
+        // being sung. `LyricLine::new` defaults `starts_new_block` to true
+        // (only `parse_pasted_lyrics` groups consecutive lines together),
+        // so it's forced false here - otherwise these two end up in
+        // separate one-line blocks regardless of the gap between them, and
+        // "there" would never be part of the same rendered block as "hi"
+        // for hide_upcoming to have any visible effect on.
+        let mut lines = vec![LyricLine::new("hi"), LyricLine::new("there")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(20.0);
+        lines[1].starts_new_block = false;
+        let timed = resolve_timing(&lines, Some(22.0));
+        let blocks = group_into_blocks(&timed);
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed);
+        let (w, h) = (320usize, 180usize);
+        // Matches render_frame's own block-layout formula for a 2-line
+        // block, slot 1 (the second line's row) - `y` there is a text
+        // *baseline*, not a vertical center, so this samples a row a bit
+        // above it (within the glyph body) rather than right on the
+        // baseline itself, which "there" (no descenders) would put right
+        // at the bottom edge of the ink, if not just past it.
+        let line_height = h as f32 * 0.11;
+        let font_size = h as f32 * 0.055;
+        let start_y = h as f32 * 0.5 - line_height + line_height * 0.5;
+        let upcoming_row_y = start_y + line_height - font_size * 0.4;
+
+        let render_at = |t: f64| -> Canvas {
+            let mut canvas = Canvas::new(w, h);
+            canvas.fill(palette.background);
+            render_frame(
+                &mut canvas,
+                &regular,
+                &bold,
+                &timed,
+                &blocks,
+                &palette,
+                None,
+                None,
+                card_end,
+                t,
+                &TimingSettings::default(),
+                false,
+            );
+            canvas
+        };
+
+        let before_countdown = render_at(10.0);
+        assert!(
+            !row_has_non_background_pixel(&before_countdown, &palette, upcoming_row_y),
+            "the upcoming line should still be hidden before the countdown starts"
+        );
+
+        let during_countdown = render_at(18.0);
+        assert!(
+            row_has_non_background_pixel(&during_countdown, &palette, upcoming_row_y),
+            "the upcoming line should be revealed once the countdown starts"
+        );
+    }
+
+    #[test]
+    fn intro_countdown_also_reveals_the_first_line_once_it_starts() {
+        // No title/artist/second-singer, so the title card never fires
+        // (`has_title_card` is false) and this falls straight through to
+        // the intro-countdown branch - card_end = first.start.min(5.0) = 5.0,
+        // so cd_start works out to the same 20.0 - 4.0 = 16.0 as the
+        // mid-song fixtures above.
+        let mut lines = vec![LyricLine::new("hello")];
+        lines[0].start = Some(20.0);
+        let timed = resolve_timing(&lines, Some(22.0));
+        let blocks = group_into_blocks(&timed);
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed);
+        let (w, h) = (320usize, 180usize);
+        // Single-line block, so render_frame's own start_y formula
+        // collapses to exactly h*0.5 - sampled a bit above that (the
+        // baseline itself) to land within the glyph body, same reasoning
+        // as the mid-song reveal test above.
+        let font_size = h as f32 * 0.055;
+        let first_line_row_y = h as f32 * 0.5 - font_size * 0.4;
+
+        let render_at = |t: f64| -> Canvas {
+            let mut canvas = Canvas::new(w, h);
+            canvas.fill(palette.background);
+            render_frame(
+                &mut canvas,
+                &regular,
+                &bold,
+                &timed,
+                &blocks,
+                &palette,
+                None,
+                None,
+                card_end,
+                t,
+                &TimingSettings::default(),
+                false,
+            );
+            canvas
+        };
+
+        let before_countdown = render_at(10.0);
+        assert!(
+            !row_has_non_background_pixel(&before_countdown, &palette, first_line_row_y),
+            "the first line should still be hidden before the intro countdown starts"
+        );
+
+        let during_countdown = render_at(18.0);
+        assert!(
+            !countdown_dot_area_is_untouched(&during_countdown, &palette),
+            "expected a countdown dot to be drawn during the intro countdown"
+        );
+        assert!(
+            row_has_non_background_pixel(&during_countdown, &palette, first_line_row_y),
+            "the first line should be revealed once the intro countdown starts"
         );
     }
 }

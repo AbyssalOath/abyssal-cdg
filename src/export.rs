@@ -37,8 +37,8 @@ use crate::font;
 #[cfg(test)]
 use crate::lyrics::CountdownMode;
 use crate::lyrics::{
-    backing_vocal_word_timings, countdown_window, countdown_window_between, singer_legend,
-    word_timings, Singer, TimedLine, TimingSettings, SUNG_LINGER_SECS,
+    backing_vocal_word_timings, countdown_window, countdown_window_between, effective_singer_label,
+    singer_legend, word_timings, Singer, TimedLine, TimingSettings, SUNG_LINGER_SECS,
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -395,16 +395,19 @@ fn draw_char_at(
 /// Builds the legend's display text (e.g. "Male  Female") plus a
 /// per-character foreground color index (spaces get a throwaway index,
 /// since [`draw_legend_row`] skips drawing whitespace).
-fn legend_text_and_colors(palette: &Palette, singers: &[Singer]) -> (String, Vec<u8>) {
+fn legend_text_and_colors(
+    palette: &Palette,
+    singers: &[(Singer, Option<String>)],
+) -> (String, Vec<u8>) {
     let mut text = String::new();
     let mut colors = Vec::new();
-    for (i, singer) in singers.iter().enumerate() {
+    for (i, (singer, custom_name)) in singers.iter().enumerate() {
         if i > 0 {
             text.push_str("  ");
             colors.extend([BG, BG]);
         }
         let (_, highlight) = palette.singer_colors(*singer);
-        let label = singer.label();
+        let label = effective_singer_label(*singer, custom_name);
         text.push_str(label);
         colors.extend(std::iter::repeat_n(highlight, label.chars().count()));
     }

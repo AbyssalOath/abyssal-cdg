@@ -308,6 +308,11 @@ struct KaraokeApp {
     /// is the default and H.264 is kept as a selectable, disclosed-as-
     /// larger fallback.
     video_codec: VideoCodec,
+    /// Whether the video export/preview shows a small credit line under
+    /// the title card (see `video.rs`'s `CREDIT_TEXT`) - on by default,
+    /// but never forced: this is the user's own toggle, not a watermark
+    /// they can't remove.
+    show_credit_line: bool,
     /// An image/video shown behind the lyrics in the video export/preview
     /// instead of a flat `color_bg` fill - `None` means the plain
     /// solid-color look, unchanged from before this existed. Never applies
@@ -707,6 +712,7 @@ impl KaraokeApp {
             seek_drag_value: None,
             video_resolution: Resolution::Hd1080,
             video_codec: VideoCodec::default(),
+            show_credit_line: true,
             background: None,
             background_fit: video::BackgroundFit::default(),
             background_dim: 0.4,
@@ -807,6 +813,25 @@ impl KaraokeApp {
         }
     }
 
+    /// Every distinct custom singer name currently typed anywhere in this
+    /// project, paired with the base [`Singer`] category it was first seen
+    /// with - offered as one-click-reusable entries in each line's singer
+    /// dropdown, so typing "Male 1" once on one line makes it selectable
+    /// on every other line without retyping it. Sorted by name for a
+    /// stable, predictable dropdown order.
+    fn known_custom_singers(&self) -> Vec<(String, Singer)> {
+        let mut seen: Vec<(String, Singer)> = Vec::new();
+        for line in &self.lines {
+            if let Some(name) = &line.custom_singer_name {
+                if !seen.iter().any(|(n, _)| n == name) {
+                    seen.push((name.clone(), line.singer));
+                }
+            }
+        }
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        seen
+    }
+
     /// Sets every color at once from a named preset - see [`ColorPreset`].
     fn apply_color_preset(&mut self, preset: ColorPreset) {
         let p = preset.palette();
@@ -876,6 +901,7 @@ impl KaraokeApp {
             },
             video_resolution: self.video_resolution,
             video_codec: self.video_codec,
+            show_credit_line: self.show_credit_line,
             background: self.background.clone(),
             background_fit: self.background_fit,
             background_dim: self.background_dim,
@@ -1006,6 +1032,7 @@ impl KaraokeApp {
         self.artist = project.artist;
         self.video_resolution = project.video_resolution;
         self.video_codec = project.video_codec;
+        self.show_credit_line = project.show_credit_line;
         self.background = project.background;
         self.background_fit = project.background_fit;
         self.background_dim = project.background_dim;
@@ -2555,6 +2582,10 @@ impl KaraokeApp {
                             );
                         }
                         ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals (slow)");
+                        ui.checkbox(
+                            &mut self.show_credit_line,
+                            "Show \"Created with Abyssal CDG Creator\" credit under the title card",
+                        );
                     });
                 });
 
@@ -2721,6 +2752,7 @@ impl KaraokeApp {
         let artist = (!self.artist.trim().is_empty()).then(|| self.artist.trim().to_string());
         let resolution = self.video_resolution;
         let video_codec = self.video_codec;
+        let show_credit_line = self.show_credit_line;
         let background = self.background.clone();
         let background_fit = self.background_fit;
         let background_dim = self.background_dim;
@@ -2960,6 +2992,7 @@ impl KaraokeApp {
                         custom_font_bytes,
                         &video_path,
                         &timing_settings,
+                        show_credit_line,
                         |p| set_progress(video_phase, p),
                     );
 
@@ -3092,13 +3125,13 @@ impl KaraokeApp {
                         // `vertical_centered` centers the whole legend as one
                         // block, the same way it centers the title/artist text.
                         let mut job = egui::text::LayoutJob::default();
-                        for (i, singer) in legend_singers.iter().enumerate() {
+                        for (i, (singer, custom_name)) in legend_singers.iter().enumerate() {
                             if i > 0 {
                                 job.append("   ", 0.0, egui::TextFormat::default());
                             }
                             let (_, highlight) = self.singer_colors(*singer);
                             job.append(
-                                singer.label(),
+                                lyrics::effective_singer_label(*singer, custom_name),
                                 0.0,
                                 egui::TextFormat {
                                     color: highlight,
@@ -3108,6 +3141,13 @@ impl KaraokeApp {
                             );
                         }
                         ui.label(job);
+                    }
+                    if self.show_credit_line {
+                        ui.add_space(10.0);
+                        ui.colored_label(
+                            self.color_preview,
+                            egui::RichText::new(video::CREDIT_TEXT).size(11.0),
+                        );
                     }
                     return;
                 }
@@ -3147,6 +3187,30 @@ impl KaraokeApp {
                                         ui.add_space(8.0);
                                     }
                                 });
+
+                                // Reveal the first block's lines too, same
+                                // idea as the mid-song countdown's reveal -
+                                // see the matching comment in video.rs's
+                                // render_frame.
+                                let blocks = group_into_blocks(&timed);
+                                let block = blocks
+                                    .iter()
+                                    .find(|b| b.contains(&0))
+                                    .cloned()
+                                    .unwrap_or_else(|| vec![0]);
+                                let lyric_family = self.lyric_font_family();
+                                ui.add_space(10.0);
+                                for &idx in &block {
+                                    let line = &timed[idx];
+                                    let (unsung, _) = self.singer_colors(line.singer);
+                                    let normalized = lyrics::normalize_text(&line.text);
+                                    ui.colored_label(
+                                        unsung,
+                                        egui::RichText::new(normalized)
+                                            .size(18.0)
+                                            .family(lyric_family.clone()),
+                                    );
+                                }
                             }
                         }
                         return;
@@ -3176,19 +3240,30 @@ impl KaraokeApp {
                         // musical break before the next one (long enough to warrant the
                         // countdown dots below), hide the not-yet-started lines in this
                         // block instead of leaving them on screen the whole time - it
-                        // should read as "done, waiting" (then the countdown, then the
-                        // next line), not show lyrics that are still a break away.
+                        // should read as "done, waiting", then, once the countdown
+                        // itself starts, both the dots *and* the upcoming line(s)
+                        // appear together (drawn above the block, not below, so the
+                        // dots read as "counting down to the words shown right under
+                        // them") so the singer can read ahead during the countdown
+                        // rather than only right as the words go live - see the
+                        // matching comment in video.rs's render_frame.
                         let current_line = &timed[current_idx];
                         let next_countdown_mode = timed
                             .get(current_idx + 1)
                             .map(|n| n.countdown_mode)
                             .unwrap_or_default();
+                        let cd_window = countdown_window(
+                            current_line,
+                            next_countdown_mode,
+                            &self.timing_settings,
+                        );
                         let hide_upcoming = hide_upcoming_lines(
                             current_line,
                             t,
                             next_countdown_mode,
                             &self.timing_settings,
-                        );
+                        ) && !cd_window
+                            .is_some_and(|(cd_start, _)| t >= cd_start);
                         let blank_sung = blank_sung_lines(
                             current_line,
                             t,
@@ -3196,6 +3271,43 @@ impl KaraokeApp {
                             &self.timing_settings,
                         );
                         let lyric_family = self.lyric_font_family();
+
+                        // Only draw the countdown if there's a real next line to
+                        // count into - see the matching comment in video.rs's
+                        // render_frame. Drawn *before* the block below (not after),
+                        // so it appears above the upcoming line(s) it's counting
+                        // down to, matching the top-anchored layout this looks to
+                        // approximate the placement of.
+                        let has_next_line = current_idx + 1 < timed.len();
+                        if let Some((cd_start, cd_end)) = cd_window {
+                            if has_next_line && t >= cd_start {
+                                let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
+                                    .clamp(0.0, 1.0);
+                                let lit = ((frac * 4.0).floor() as i32 + 1).clamp(0, 4) as usize;
+                                let next_singer = timed
+                                    .get(current_idx + 1)
+                                    .map(|l| l.singer)
+                                    .unwrap_or(current_line.singer);
+                                let (_, next_highlight) = self.singer_colors(next_singer);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(width / 2.0 - 40.0);
+                                    for dot in 0..4 {
+                                        let color = if dot < lit {
+                                            next_highlight
+                                        } else {
+                                            self.color_preview
+                                        };
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(rect.center(), 6.0, color);
+                                        ui.add_space(8.0);
+                                    }
+                                });
+                                ui.add_space(10.0);
+                            }
+                        }
 
                         for (slot, &idx) in block.iter().enumerate() {
                             let line = &timed[idx];
@@ -3284,44 +3396,6 @@ impl KaraokeApp {
                         }
 
                         ui.add_space(8.0);
-
-                        // Only show the countdown if there's a real next
-                        // line to count into - see the matching comment in
-                        // video.rs's render_frame.
-                        let has_next_line = current_idx + 1 < timed.len();
-                        if let Some((cd_start, cd_end)) = countdown_window(
-                            current_line,
-                            next_countdown_mode,
-                            &self.timing_settings,
-                        ) {
-                            if has_next_line && t >= cd_start {
-                                let frac = ((t - cd_start) / (cd_end - cd_start).max(0.001))
-                                    .clamp(0.0, 1.0);
-                                let lit = ((frac * 4.0).floor() as i32 + 1).clamp(0, 4) as usize;
-                                let next_singer = timed
-                                    .get(current_idx + 1)
-                                    .map(|l| l.singer)
-                                    .unwrap_or(current_line.singer);
-                                let (_, next_highlight) = self.singer_colors(next_singer);
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.add_space(width / 2.0 - 40.0);
-                                    for dot in 0..4 {
-                                        let color = if dot < lit {
-                                            next_highlight
-                                        } else {
-                                            self.color_preview
-                                        };
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(14.0, 14.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(rect.center(), 6.0, color);
-                                        ui.add_space(8.0);
-                                    }
-                                });
-                            }
-                        }
                     }
                     None => {
                         ui.label(
@@ -5063,11 +5137,39 @@ impl eframe::App for KaraokeApp {
                             for &i in &self.selected_lines {
                                 if let Some(line) = self.lines.get_mut(i) {
                                     line.singer = singer;
+                                    // Plainly setting a base voice also clears
+                                    // any custom name, same as the per-line
+                                    // dropdown - otherwise the selection would
+                                    // end up showing a stale custom label that
+                                    // no longer matches what was just set.
+                                    line.custom_singer_name = None;
                                 }
                             }
                             self.status =
                                 format!("Set {n} selected line(s) to {}.", singer.label());
                         }
+                    }
+                    let known_custom = self.known_custom_singers();
+                    if !known_custom.is_empty() {
+                        ui.separator();
+                        egui::ComboBox::from_id_source("bulk_custom_singer")
+                            .width(100.0)
+                            .selected_text("Custom…")
+                            .show_ui(ui, |ui| {
+                                for (name, base) in &known_custom {
+                                    if ui.selectable_label(false, name).clicked() {
+                                        let n = self.selected_lines.len();
+                                        for &i in &self.selected_lines {
+                                            if let Some(line) = self.lines.get_mut(i) {
+                                                line.singer = *base;
+                                                line.custom_singer_name = Some(name.clone());
+                                            }
+                                        }
+                                        self.status =
+                                            format!("Set {n} selected line(s) to {name}.");
+                                    }
+                                }
+                            });
                     }
                 });
             });
@@ -5310,36 +5412,71 @@ impl eframe::App for KaraokeApp {
                                     self.end_edit = None;
                                 }
 
+                                let known_custom = self.known_custom_singers();
                                 egui::ComboBox::from_id_source(("singer", i))
                                     .width(82.0)
-                                    .selected_text(self.lines[i].singer.label())
+                                    .selected_text(lyrics::effective_singer_label(
+                                        self.lines[i].singer,
+                                        &self.lines[i].custom_singer_name,
+                                    ))
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.lines[i].singer,
-                                            Singer::Default,
-                                            "Default",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.lines[i].singer,
-                                            Singer::Male,
-                                            "Male",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.lines[i].singer,
-                                            Singer::Female,
-                                            "Female",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.lines[i].singer,
-                                            Singer::Duet,
-                                            "Duet",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.lines[i].singer,
-                                            Singer::Screaming,
-                                            "Screaming",
-                                        );
+                                        // The 5 base categories - picking one of these
+                                        // plainly also clears any custom name, so the
+                                        // dropdown's own selected-text stays consistent
+                                        // with what was actually just picked (a manual
+                                        // click check, not `selectable_value`, since a
+                                        // single click here needs to set *two* fields).
+                                        for (base, label) in [
+                                            (Singer::Default, "Default"),
+                                            (Singer::Male, "Male"),
+                                            (Singer::Female, "Female"),
+                                            (Singer::Duet, "Duet"),
+                                            (Singer::Screaming, "Screaming"),
+                                        ] {
+                                            let selected = self.lines[i].singer == base
+                                                && self.lines[i].custom_singer_name.is_none();
+                                            if ui.selectable_label(selected, label).clicked() {
+                                                self.lines[i].singer = base;
+                                                self.lines[i].custom_singer_name = None;
+                                            }
+                                        }
+                                        if !known_custom.is_empty() {
+                                            ui.separator();
+                                            for (name, base) in &known_custom {
+                                                let selected = self.lines[i].singer == *base
+                                                    && self.lines[i].custom_singer_name.as_ref()
+                                                        == Some(name);
+                                                if ui.selectable_label(selected, name).clicked() {
+                                                    self.lines[i].singer = *base;
+                                                    self.lines[i].custom_singer_name =
+                                                        Some(name.clone());
+                                                }
+                                            }
+                                        }
                                     });
+                                // Always-visible, separate from the dropdown above: types
+                                // a new custom name (or edits this line's existing one)
+                                // without touching which base color it uses - see
+                                // `LyricLine::custom_singer_name`'s own docs. Typing a
+                                // genuinely new name here is what makes it show up as a
+                                // reusable dropdown entry (via `known_custom_singers`) on
+                                // every other line too, not just this one.
+                                let mut custom_buf =
+                                    self.lines[i].custom_singer_name.clone().unwrap_or_default();
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut custom_buf)
+                                            .desired_width(72.0)
+                                            .hint_text("Custom name"),
+                                    )
+                                    .changed()
+                                {
+                                    self.lines[i].custom_singer_name = if custom_buf.trim().is_empty() {
+                                        None
+                                    } else {
+                                        Some(custom_buf)
+                                    };
+                                }
 
                                 ui.horizontal(|ui| {
                                     egui::ComboBox::from_id_source(("countdown_mode", i))

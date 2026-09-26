@@ -9,7 +9,12 @@ and building from source.
 1. **Load an audio file** (mp3, wav, flac, ogg, m4a, aac) - via **"Load
    Audio…"**, or just drag the file onto the window.
 2. **Enter a song title / artist** (optional) - shown as an intro card for
-   the first few seconds, like a real karaoke video.
+   the first few seconds, like a real karaoke video. In the video export
+   and live preview, a small "Created with Abyssal CDG Creator" credit
+   also appears under the title card by default - it's a toggle in the
+   export dialog (**Video (.mp4)** options), on by default but never
+   forced: uncheck it and it's gone from that export entirely, no
+   watermark you can't turn off.
 3. **Paste your lyrics** (one line per line of text) and click "Parse
    lyrics" - or **"Load lyrics file…"** (or drag the file onto the window)
    to import an existing `.lrc` (LRC1/LRC2), UltraStar `.txt`, or KOK file
@@ -46,7 +51,17 @@ and building from source.
    exported file.
 7. **Assign a voice per line** (Male / Female / Duet / Screaming) for duet
    songs or intense sections - each gets its own color pair so singers can
-   tell whose line is whose (or when to belt it) at a glance.
+   tell whose line is whose (or when to belt it) at a glance. For a song
+   with more than one voice in the same category (two different men, three
+   featured singers, ...), type a **custom name** for a line ("Male 1",
+   "Lead Singer", whatever) right next to the voice dropdown - it shows up
+   in the legend/dropdown instead of the generic "Male", and once typed
+   once, becomes a one-click option in every other line's dropdown too, no
+   retyping. A custom name always shares its base category's color (Male 1
+   and Male 2 both render in Male's color) rather than getting its own -
+   there's no separate color budget for arbitrarily many distinct singers,
+   especially in the `.cdg` export's fixed 16-color palette - it's a
+   distinct *label*, not a distinct color.
 8. **Fine-tune individual words** a few ways:
    - Click a lyric line (or the "Words" button next to it) to open a strip
      of clickable word buttons for it, and a Start/End toggle above them.
@@ -178,10 +193,16 @@ hand, and are saved with the project.
 During a break long enough to trigger the countdown, the already-sung
 line(s) also clear off screen partway through instead of sitting there for
 the whole gap: they linger briefly after singing ends, then the screen
-goes blank until the countdown dots appear, then the next line - rather
-than leaving finished lyrics on screen the entire time. Lines still queued
-up further ahead in the same verse block are hidden the moment the current
-line finishes too, for the same reason - they're still a break away.
+goes blank until the countdown dots appear. Lines still queued up further
+ahead in the same verse block are hidden the moment the current line
+finishes too, for the same reason - they're still a break away - but in
+the video export and live preview (not the `.cdg` export, whose 300x216
+display has no spare room for this), those upcoming lines reappear the
+moment the countdown itself starts, dimmed the same way they always are
+before singing reaches them, so there's time to read ahead during the
+countdown rather than only right as the words go live - the dots
+themselves sit near the top of the frame there too, specifically so they
+don't compete for space with the lines they're counting down to.
 
 ## The fine-tuning timeline
 

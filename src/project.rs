@@ -30,6 +30,13 @@ pub const FILE_EXTENSION: &str = "abyzl";
 /// without breaking old files.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// `serde`'s `#[serde(default)]` on a missing field uses `Default::default()`,
+/// which for `bool` is `false` - not what a field that should default *on*
+/// (see `show_credit_line` below) needs, hence this named function instead.
+fn default_true() -> bool {
+    true
+}
+
 /// A plain 8-bit RGB color, independent of `egui::Color32` - this crate
 /// doesn't otherwise depend on `egui`'s `serde` feature, and pulling that in
 /// just for this would be a heavier dependency for one struct's worth of
@@ -88,6 +95,14 @@ pub struct ProjectFile {
     /// this existed, same as a freshly created one.
     #[serde(default)]
     pub video_codec: VideoCodec,
+    /// Whether the video export/preview shows a small credit line under
+    /// the title card - on (via `default_true`, not the usual bare
+    /// `#[serde(default)]`, which for a `bool` would silently mean *off*)
+    /// for every project saved before this existed, matching a freshly
+    /// created one's own default. Never a forced watermark - always the
+    /// user's own choice, on by default.
+    #[serde(default = "default_true")]
+    pub show_credit_line: bool,
     /// An image/video shown behind the lyrics in the video export/preview
     /// instead of a flat color fill - absent (`None`) in every project
     /// saved before this existed, via `#[serde(default)]`.
@@ -268,6 +283,7 @@ mod tests {
             colors: sample_colors(),
             video_resolution: Resolution::Uhd4k,
             video_codec: VideoCodec::H264,
+            show_credit_line: false,
             background: Some(Background::Image(PathBuf::from("/tmp/cover.png"))),
             background_fit: BackgroundFit::Contain,
             background_dim: 0.4,
@@ -322,6 +338,7 @@ mod tests {
         assert_eq!(loaded.background_dim, 0.0);
         assert_eq!(loaded.timing_settings, TimingSettings::default());
         assert_eq!(loaded.video_codec, VideoCodec::default());
+        assert!(loaded.show_credit_line);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -416,6 +433,7 @@ mod tests {
             colors: sample_colors(),
             video_resolution: Resolution::Hd1080,
             video_codec: VideoCodec::default(),
+            show_credit_line: true,
             background: None,
             background_fit: BackgroundFit::default(),
             background_dim: 0.0,
