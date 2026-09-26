@@ -105,7 +105,20 @@ echo "Detected OPENH264_OS=$OPENH264_OS (uname: $(uname))"
 : "${FFMPEG_VERSION:=n7.1}"
 : "${LAME_VERSION:=3.100}"
 : "${DAV1D_VERSION:=1.4.3}"
-: "${SVT_AV1_VERSION:=v4.2.0}"
+# Pinned to the last release *before* SVT-AV1 v3.0.0's breaking API
+# change (confirmed directly against both headers, not guessed): v3.0.0
+# dropped the middle `p_app_data` argument from `svt_av1_enc_init_handle`
+# and removed/renamed `enable_adaptive_quantization` on
+# `EbSvtAv1EncConfiguration`, both of which ffmpeg n7.1's own
+# libavcodec/libsvtav1.c (tagged 2024-09-30, five months before v3.0.0's
+# 2025-02-20 release - it was never written against the new API) still
+# expects. A newer SVT-AV1 tag fails to build against ffmpeg n7.1 with a
+# real compile error ("no member named 'enable_adaptive_quantization'",
+# "too many arguments to function call") - not something FFMPEG_VERSION
+# or FFMPEG_CONFIGURE_EXTRA can work around; the ffmpeg version and the
+# SVT-AV1 version are coupled to each other, not independently upgradable
+# without also patching libsvtav1.c to match.
+: "${SVT_AV1_VERSION:=v2.3.0}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
