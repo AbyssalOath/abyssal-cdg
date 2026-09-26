@@ -3306,6 +3306,40 @@ impl KaraokeApp {
                                     }
                                 });
                                 ui.add_space(10.0);
+
+                                // A real gap almost always falls at a
+                                // verse/chorus boundary, so the line being
+                                // counted into usually starts a *different*
+                                // on-screen block than `current_idx`'s own -
+                                // meaning there's nothing in `block` (below)
+                                // for the per-slot loop to reveal (by now
+                                // `blank_sung` is already guaranteed true
+                                // either way, so that loop would draw
+                                // nothing at all). Preview the *next* block
+                                // directly instead, same idea as the intro
+                                // countdown previewing the very first one -
+                                // see the matching comment in video.rs's
+                                // render_frame.
+                                let next_idx = current_idx + 1;
+                                if !block.contains(&next_idx) {
+                                    let next_block = blocks
+                                        .iter()
+                                        .find(|b| b.contains(&next_idx))
+                                        .cloned()
+                                        .unwrap_or_else(|| vec![next_idx]);
+                                    for &idx in &next_block {
+                                        let line = &timed[idx];
+                                        let (unsung, _) = self.singer_colors(line.singer);
+                                        let normalized = lyrics::normalize_text(&line.text);
+                                        ui.colored_label(
+                                            unsung,
+                                            egui::RichText::new(normalized)
+                                                .size(18.0)
+                                                .family(lyric_family.clone()),
+                                        );
+                                    }
+                                    return;
+                                }
                             }
                         }
 
@@ -3379,6 +3413,76 @@ impl KaraokeApp {
                                         append(&mut job, &format!("{rest}{suffix}"), unsung);
                                     }
                                     ui.label(job);
+
+                                    // A backing/echo vocal (if any) draws directly
+                                    // beneath the current line, smaller, in its own
+                                    // color, with its own independent wipe - only
+                                    // while its own (bounded within the host's)
+                                    // window is actually active. Same idea as the
+                                    // main line's wipe job above, just for the
+                                    // (usually much shorter) echoed text - see the
+                                    // matching block in video.rs's render_frame,
+                                    // which this was missing entirely before, so a
+                                    // fully set-up backing vocal never showed
+                                    // anything here even though the real video
+                                    // export already rendered it correctly.
+                                    if let Some(bv) = &line.backing_vocal {
+                                        if t >= bv.start && t < bv.end {
+                                            let (bv_unsung, bv_highlight) =
+                                                self.singer_colors(bv.singer);
+                                            let bv_normalized = lyrics::normalize_text(&bv.text);
+                                            let bv_chars: Vec<char> =
+                                                bv_normalized.chars().collect();
+                                            let bv_spans = lyrics::word_char_spans(&bv_normalized);
+                                            let bv_boundary =
+                                                lyrics::backing_vocal_wipe_fraction(bv, t)
+                                                    * bv_chars.len().max(1) as f32;
+                                            let bv_font_id =
+                                                egui::FontId::new(14.0, lyric_family.clone());
+                                            let mut bv_job = egui::text::LayoutJob {
+                                                halign: egui::Align::Center,
+                                                ..Default::default()
+                                            };
+                                            for (i, &(offset, len)) in bv_spans.iter().enumerate() {
+                                                let word_text: String =
+                                                    bv_chars[offset..offset + len].iter().collect();
+                                                let split = ((bv_boundary - offset as f32)
+                                                    .round()
+                                                    .clamp(0.0, len as f32))
+                                                    as usize;
+                                                let sung_part: String =
+                                                    word_text.chars().take(split).collect();
+                                                let rest: String =
+                                                    word_text.chars().skip(split).collect();
+                                                let suffix =
+                                                    if i + 1 < bv_spans.len() { " " } else { "" };
+                                                let append_bv =
+                                                    |job: &mut egui::text::LayoutJob,
+                                                     text: &str,
+                                                     color: egui::Color32| {
+                                                        if text.is_empty() {
+                                                            return;
+                                                        }
+                                                        job.append(
+                                                            text,
+                                                            0.0,
+                                                            egui::TextFormat {
+                                                                color,
+                                                                font_id: bv_font_id.clone(),
+                                                                ..Default::default()
+                                                            },
+                                                        );
+                                                    };
+                                                append_bv(&mut bv_job, &sung_part, bv_highlight);
+                                                append_bv(
+                                                    &mut bv_job,
+                                                    &format!("{rest}{suffix}"),
+                                                    bv_unsung,
+                                                );
+                                            }
+                                            ui.label(bv_job);
+                                        }
+                                    }
                                 }
                                 std::cmp::Ordering::Greater => {
                                     if hide_upcoming {
@@ -5412,71 +5516,86 @@ impl eframe::App for KaraokeApp {
                                     self.end_edit = None;
                                 }
 
-                                let known_custom = self.known_custom_singers();
-                                egui::ComboBox::from_id_source(("singer", i))
-                                    .width(82.0)
-                                    .selected_text(lyrics::effective_singer_label(
-                                        self.lines[i].singer,
-                                        &self.lines[i].custom_singer_name,
-                                    ))
-                                    .show_ui(ui, |ui| {
-                                        // The 5 base categories - picking one of these
-                                        // plainly also clears any custom name, so the
-                                        // dropdown's own selected-text stays consistent
-                                        // with what was actually just picked (a manual
-                                        // click check, not `selectable_value`, since a
-                                        // single click here needs to set *two* fields).
-                                        for (base, label) in [
-                                            (Singer::Default, "Default"),
-                                            (Singer::Male, "Male"),
-                                            (Singer::Female, "Female"),
-                                            (Singer::Duet, "Duet"),
-                                            (Singer::Screaming, "Screaming"),
-                                        ] {
-                                            let selected = self.lines[i].singer == base
-                                                && self.lines[i].custom_singer_name.is_none();
-                                            if ui.selectable_label(selected, label).clicked() {
-                                                self.lines[i].singer = base;
-                                                self.lines[i].custom_singer_name = None;
-                                            }
-                                        }
-                                        if !known_custom.is_empty() {
-                                            ui.separator();
-                                            for (name, base) in &known_custom {
-                                                let selected = self.lines[i].singer == *base
-                                                    && self.lines[i].custom_singer_name.as_ref()
-                                                        == Some(name);
-                                                if ui.selectable_label(selected, name).clicked() {
-                                                    self.lines[i].singer = *base;
-                                                    self.lines[i].custom_singer_name =
-                                                        Some(name.clone());
+                                // Both widgets below share this one cell (like every
+                                // other column in this grid, exactly one widget/group
+                                // per cell) - the grid has a fixed `.num_columns(9)`
+                                // matching the header row above, so adding the custom-
+                                // name text field as a *second* top-level widget here
+                                // (instead of nesting it in this same `horizontal`)
+                                // would silently push every later cell one column out
+                                // of alignment with its own header.
+                                ui.horizontal(|ui| {
+                                    let known_custom = self.known_custom_singers();
+                                    egui::ComboBox::from_id_source(("singer", i))
+                                        .width(82.0)
+                                        .selected_text(lyrics::effective_singer_label(
+                                            self.lines[i].singer,
+                                            &self.lines[i].custom_singer_name,
+                                        ))
+                                        .show_ui(ui, |ui| {
+                                            // The 5 base categories - picking one of these
+                                            // plainly also clears any custom name, so the
+                                            // dropdown's own selected-text stays consistent
+                                            // with what was actually just picked (a manual
+                                            // click check, not `selectable_value`, since a
+                                            // single click here needs to set *two* fields).
+                                            for (base, label) in [
+                                                (Singer::Default, "Default"),
+                                                (Singer::Male, "Male"),
+                                                (Singer::Female, "Female"),
+                                                (Singer::Duet, "Duet"),
+                                                (Singer::Screaming, "Screaming"),
+                                            ] {
+                                                let selected = self.lines[i].singer == base
+                                                    && self.lines[i].custom_singer_name.is_none();
+                                                if ui.selectable_label(selected, label).clicked() {
+                                                    self.lines[i].singer = base;
+                                                    self.lines[i].custom_singer_name = None;
                                                 }
                                             }
-                                        }
-                                    });
-                                // Always-visible, separate from the dropdown above: types
-                                // a new custom name (or edits this line's existing one)
-                                // without touching which base color it uses - see
-                                // `LyricLine::custom_singer_name`'s own docs. Typing a
-                                // genuinely new name here is what makes it show up as a
-                                // reusable dropdown entry (via `known_custom_singers`) on
-                                // every other line too, not just this one.
-                                let mut custom_buf =
-                                    self.lines[i].custom_singer_name.clone().unwrap_or_default();
-                                if ui
-                                    .add(
-                                        egui::TextEdit::singleline(&mut custom_buf)
-                                            .desired_width(72.0)
-                                            .hint_text("Custom name"),
-                                    )
-                                    .changed()
-                                {
-                                    self.lines[i].custom_singer_name = if custom_buf.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(custom_buf)
-                                    };
-                                }
+                                            if !known_custom.is_empty() {
+                                                ui.separator();
+                                                for (name, base) in &known_custom {
+                                                    let selected = self.lines[i].singer == *base
+                                                        && self.lines[i].custom_singer_name.as_ref()
+                                                            == Some(name);
+                                                    if ui.selectable_label(selected, name).clicked()
+                                                    {
+                                                        self.lines[i].singer = *base;
+                                                        self.lines[i].custom_singer_name =
+                                                            Some(name.clone());
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    // Always-visible, separate from the dropdown above:
+                                    // types a new custom name (or edits this line's
+                                    // existing one) without touching which base color it
+                                    // uses - see `LyricLine::custom_singer_name`'s own
+                                    // docs. Typing a genuinely new name here is what makes
+                                    // it show up as a reusable dropdown entry (via
+                                    // `known_custom_singers`) on every other line too, not
+                                    // just this one.
+                                    let mut custom_buf = self.lines[i]
+                                        .custom_singer_name
+                                        .clone()
+                                        .unwrap_or_default();
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut custom_buf)
+                                                .desired_width(72.0)
+                                                .hint_text("Custom name"),
+                                        )
+                                        .changed()
+                                    {
+                                        self.lines[i].custom_singer_name =
+                                            if custom_buf.trim().is_empty() {
+                                                None
+                                            } else {
+                                                Some(custom_buf)
+                                            };
+                                    }
+                                });
 
                                 ui.horizontal(|ui| {
                                     egui::ComboBox::from_id_source(("countdown_mode", i))

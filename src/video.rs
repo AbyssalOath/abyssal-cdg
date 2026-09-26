@@ -491,6 +491,49 @@ fn draw_countdown_dots(
     }
 }
 
+/// Draws `block`'s lines all in their own unsung/dim color, no wipe or
+/// highlight - a preview of a block that hasn't started being sung yet.
+/// Used for the very first block (before the intro countdown reaches it)
+/// and, mid-song, for the block a countdown is counting down to when it's
+/// a *different* block than the one that just finished singing - which is
+/// the common case: a real gap almost always falls at a verse/chorus
+/// boundary, so the line being counted into usually isn't part of the same
+/// on-screen block at all (see `render_frame`'s own two call sites - a gap
+/// *within* one block is handled separately, by simply not hiding that
+/// block's own later slots once the countdown starts).
+#[allow(clippy::too_many_arguments)]
+fn draw_upcoming_block_preview(
+    canvas: &mut Canvas,
+    regular: &FontArc,
+    timed_lines: &[TimedLine],
+    block: &[usize],
+    palette: &VideoPalette,
+    w: f32,
+    h: f32,
+    max_width: f32,
+) {
+    let line_height = h * 0.11;
+    let font_size = h * 0.055;
+    let total_height = block.len() as f32 * line_height;
+    let start_y = h * 0.5 - total_height / 2.0 + line_height * 0.5;
+    for (slot, &idx) in block.iter().enumerate() {
+        let line = &timed_lines[idx];
+        let text = normalize_text(&line.text);
+        let y = start_y + slot as f32 * line_height;
+        let (unsung, _) = palette.singer_colors(line.singer);
+        draw_text_line_uniform(
+            canvas,
+            regular,
+            font_size,
+            w / 2.0,
+            y,
+            &text,
+            unsung,
+            max_width,
+        );
+    }
+}
+
 /// Draws one frame's lyrics/title-card/countdown content onto `canvas`.
 /// Does *not* touch the background - the caller fills `canvas` first,
 /// either with `palette.background` (the plain solid-color look) or a
@@ -589,36 +632,24 @@ fn render_frame(
                     draw_countdown_dots(canvas, w, h, lit, highlight, palette.preview);
 
                     // Reveal the first block's lines too, same idea as the
-                    // mid-song countdown's reveal below (see the main
-                    // `hide_upcoming` logic) - just for the very start of
-                    // the song, which has no "current line" yet to hang a
-                    // block off of. Plain dim/unsung text, no wipe/
-                    // highlight - nothing has started being sung.
+                    // mid-song countdown's reveal below - just for the
+                    // very start of the song, which has no "current line"
+                    // yet to hang a block off of.
                     let block = blocks
                         .iter()
                         .find(|b| b.contains(&0))
                         .cloned()
                         .unwrap_or_else(|| vec![0]);
-                    let line_height = h * 0.11;
-                    let font_size = h * 0.055;
-                    let total_height = block.len() as f32 * line_height;
-                    let start_y = h * 0.5 - total_height / 2.0 + line_height * 0.5;
-                    for (slot, &idx) in block.iter().enumerate() {
-                        let line = &timed_lines[idx];
-                        let text = normalize_text(&line.text);
-                        let y = start_y + slot as f32 * line_height;
-                        let (unsung, _) = palette.singer_colors(line.singer);
-                        draw_text_line_uniform(
-                            canvas,
-                            regular,
-                            font_size,
-                            w / 2.0,
-                            y,
-                            &text,
-                            unsung,
-                            max_width,
-                        );
-                    }
+                    draw_upcoming_block_preview(
+                        canvas,
+                        regular,
+                        timed_lines,
+                        &block,
+                        palette,
+                        w,
+                        h,
+                        max_width,
+                    );
                 }
             }
             return;
@@ -658,6 +689,47 @@ fn render_frame(
         next_countdown_mode,
         timing_settings,
     );
+
+    // A real gap almost always falls at a verse/chorus boundary, so the
+    // line the countdown is counting into usually starts a *different*
+    // on-screen block than `current_idx`'s own - meaning there's nothing
+    // in `block` (below) for the ordinary per-slot loop to reveal (by the
+    // time the countdown is actually running, `blank_sung` below is
+    // already guaranteed true, so that loop would draw nothing at all
+    // either way). Preview the *next* block directly in that case, the
+    // same way the intro countdown previews the very first one, instead of
+    // rendering an empty leftover block under a countdown that's counting
+    // into lines the viewer can't see anywhere on screen.
+    let has_next_line = current_idx + 1 < timed_lines.len();
+    if let Some((cd_start, cd_end)) = cd_window {
+        if has_next_line && t >= cd_start {
+            let next_idx = current_idx + 1;
+            if !block.contains(&next_idx) {
+                let next_singer = timed_lines[next_idx].singer;
+                let (_, highlight) = palette.singer_colors(next_singer);
+                let lit = countdown_lit_count(cd_start, cd_end, t);
+                draw_countdown_dots(canvas, w, h, lit, highlight, palette.preview);
+
+                let next_block = blocks
+                    .iter()
+                    .find(|b| b.contains(&next_idx))
+                    .cloned()
+                    .unwrap_or_else(|| vec![next_idx]);
+                draw_upcoming_block_preview(
+                    canvas,
+                    regular,
+                    timed_lines,
+                    &next_block,
+                    palette,
+                    w,
+                    h,
+                    max_width,
+                );
+                return;
+            }
+        }
+    }
+
     let hide_upcoming = hide_upcoming_lines(
         &timed_lines[current_idx],
         t,
@@ -1900,6 +1972,70 @@ mod tests {
         assert!(
             row_has_non_background_pixel(&during_countdown, &palette, upcoming_row_y),
             "the upcoming line should be revealed once the countdown starts"
+        );
+    }
+
+    #[test]
+    fn mid_song_countdown_reveals_the_next_line_even_when_it_starts_a_new_block() {
+        // The realistic case (unlike the fixture above, `starts_new_block`
+        // is left at its default `true` for both lines - see
+        // `countdown_dots_still_show_for_a_real_mid_song_gap`, which uses
+        // this same fixture and already confirms the dots show): a real
+        // gap almost always falls at a section boundary, so "there" is in
+        // a *different* one-line block than "hi" - group_into_blocks
+        // gives [[0], [1]], not [[0, 1]]. The reveal must still work here,
+        // not only when both happen to share one block.
+        let mut lines = vec![LyricLine::new("hi"), LyricLine::new("there")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(20.0);
+        let timed = resolve_timing(&lines, Some(22.0));
+        let blocks = group_into_blocks(&timed);
+        assert_eq!(
+            blocks,
+            vec![vec![0], vec![1]],
+            "sanity check: separate blocks"
+        );
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed);
+        let (w, h) = (320usize, 180usize);
+        // "there" ends up in its own single-line block, so its row is at
+        // exactly h*0.5 (same formula as the intro test's single-line
+        // fixture), not offset by a slot within a shared block.
+        let font_size = h as f32 * 0.055;
+        let next_line_row_y = h as f32 * 0.5 - font_size * 0.4;
+
+        let render_at = |t: f64| -> Canvas {
+            let mut canvas = Canvas::new(w, h);
+            canvas.fill(palette.background);
+            render_frame(
+                &mut canvas,
+                &regular,
+                &bold,
+                &timed,
+                &blocks,
+                &palette,
+                None,
+                None,
+                card_end,
+                t,
+                &TimingSettings::default(),
+                false,
+            );
+            canvas
+        };
+
+        let before_countdown = render_at(10.0);
+        assert!(
+            !row_has_non_background_pixel(&before_countdown, &palette, next_line_row_y),
+            "\"there\" should still be hidden before the countdown starts"
+        );
+
+        let during_countdown = render_at(18.0);
+        assert!(
+            row_has_non_background_pixel(&during_countdown, &palette, next_line_row_y),
+            "\"there\" should be revealed once the countdown starts, even in its own block"
         );
     }
 
