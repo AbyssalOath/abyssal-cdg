@@ -284,6 +284,34 @@ git clone --depth 1 --branch "$SVT_AV1_VERSION" https://gitlab.com/AOMediaCodec/
 		$SVT_AV1_CMAKE_EXTRA
 	cmake --build build --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 	cmake --install build
+	# Works around a real gap in SVT-AV1 v2.3.0's own build, confirmed
+	# directly against its Source/Lib/CMakeLists.txt: on platforms where
+	# it can't do build-time CPUID probing (only the macOS x86_64-on-
+	# arm64 cross target here - a native build probes the host's own
+	# CPU directly instead), it links its vendored third_party/cpuinfo
+	# for runtime CPU-feature detection via a plain CMake
+	# `target_link_libraries(SvtAv1Enc PRIVATE cpuinfo_public)` - which
+	# only threads through CMake's own build graph, not into the
+	# separately-templated SvtAv1Enc.pc a plain pkg-config consumer
+	# (ffmpeg's configure) reads, so that consumer never learns it also
+	# needs -lcpuinfo (confirmed the hard way: a real CI run linked fine
+	# up to "_cpuinfo_isa"/"_cpuinfo_x86_mach_init" undefined symbols).
+	# Patches the installed .pc file directly instead of hardcoding a
+	# guessed library name - self-adapting to whatever this build
+	# actually produced, and a genuine no-op (nothing found, nothing
+	# changed) on every platform that doesn't hit this gap.
+	cpuinfo_lib="$(find build -name 'libcpuinfo*.a' 2>/dev/null | head -n1)"
+	if [ -n "$cpuinfo_lib" ]; then
+		cpuinfo_dir="$(cd "$(dirname "$cpuinfo_lib")" && pwd)"
+		cpuinfo_name="$(basename "$cpuinfo_lib" .a)"
+		cpuinfo_name="${cpuinfo_name#lib}"
+		pc_file="$work/svt-av1-install/lib/pkgconfig/SvtAv1Enc.pc"
+		awk -v extra=" -L$cpuinfo_dir -l$cpuinfo_name" \
+			'/^Libs:/ { print $0 extra; next } { print }' \
+			"$pc_file" >"$pc_file.tmp"
+		mv "$pc_file.tmp" "$pc_file"
+		echo "Patched $pc_file: appended -L$cpuinfo_dir -l$cpuinfo_name"
+	fi
 )
 
 echo "== Building ffmpeg ${FFMPEG_VERSION} (LGPL only, libopenh264 + libmp3lame + libdav1d + libsvtav1) =="
