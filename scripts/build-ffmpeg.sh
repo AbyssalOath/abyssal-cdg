@@ -299,8 +299,15 @@ git clone --depth 1 --branch "$SVT_AV1_VERSION" https://gitlab.com/AOMediaCodec/
 	# Patches the installed .pc file directly instead of hardcoding a
 	# guessed library name - self-adapting to whatever this build
 	# actually produced, and a genuine no-op (nothing found, nothing
-	# changed) on every platform that doesn't hit this gap.
-	cpuinfo_lib="$(find build -name 'libcpuinfo*.a' 2>/dev/null | head -n1)"
+	# changed) on every platform that doesn't hit this gap. Searches the
+	# whole source tree, not just build/: confirmed directly that SVT-AV1's
+	# own CMakeLists.txt redirects real build output to a source-relative
+	# Bin/<config>/ directory instead (libSvtAv1Enc.a itself links to
+	# Bin/Release/libSvtAv1Enc.a, not build/Bin/Release/... or anywhere
+	# under build/ at all) - a first attempt at this fix searched only
+	# build/ and silently found nothing there, a no-op that looked
+	# identical to "there was nothing to patch" from the outside.
+	cpuinfo_lib="$(find . -name 'libcpuinfo*.a' 2>/dev/null | head -n1)"
 	if [ -n "$cpuinfo_lib" ]; then
 		cpuinfo_dir="$(cd "$(dirname "$cpuinfo_lib")" && pwd)"
 		cpuinfo_name="$(basename "$cpuinfo_lib" .a)"
