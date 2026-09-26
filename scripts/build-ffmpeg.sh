@@ -240,6 +240,18 @@ echo "== Building SVT-AV1 ${SVT_AV1_VERSION} (statically linked - BSD-2-Clause-P
 git clone --depth 1 --branch "$SVT_AV1_VERSION" https://gitlab.com/AOMediaCodec/SVT-AV1.git "$work/svt-av1-src"
 (
 	cd "$work/svt-av1-src"
+	# Unset (subshell-scoped only): CC is set globally in this script's
+	# environment for LAME's autotools cross-compile build above
+	# (e.g. "clang -arch x86_64" for the macOS x86_64-on-arm64 target) -
+	# autotools accepts that compound "compiler + flags" form, but CMake's
+	# own compiler detection doesn't reliably, and CMAKE_OSX_ARCHITECTURES
+	# below is already the correct, CMake-native way to cross-arch on
+	# macOS - a redundant/conflicting CC on top of it is a plausible
+	# culprit for the built library ending up the wrong arch without
+	# CMake's own configure step visibly failing (it builds and installs
+	# "successfully" either way, just possibly for the host's arch rather
+	# than the requested target one).
+	unset CC
 	# BUILD_APPS/BUILD_TESTING off: this app only ever links the encoder
 	# library itself (via ffmpeg's libsvtav1 wrapper) - the standalone
 	# SvtAv1EncApp CLI and SVT-AV1's own test suite would just be extra
@@ -307,7 +319,13 @@ git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.
 	# symbols/flags statically linked" gap this project's openh264/LAME
 	# linking already had to work around, just via pkg-config's own
 	# static-query mode this time instead of an install-name/soname fix.
-	eval ./configure \
+	# On failure, dump config.log's own tail before re-raising: configure's
+	# own stdout (what's visible in a plain CI log) never includes the
+	# *actual* pkg-config command/output behind a "not found" error, only
+	# that generic message - config.log is the only place that's recorded,
+	# and without printing it here a failure here is a dead end to
+	# diagnose from the CI log alone.
+	if ! eval ./configure \
 		--disable-autodetect \
 		--disable-gpl \
 		--disable-nonfree \
@@ -326,7 +344,11 @@ git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.
 		--disable-debug \
 		--disable-ffplay \
 		--disable-ffprobe \
-		"$FFMPEG_CONFIGURE_EXTRA"
+		"$FFMPEG_CONFIGURE_EXTRA"; then
+		echo "== ffmpeg configure failed - dumping ffbuild/config.log tail =="
+		tail -n 200 ffbuild/config.log 2>/dev/null || true
+		exit 1
+	fi
 	make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 )
 
