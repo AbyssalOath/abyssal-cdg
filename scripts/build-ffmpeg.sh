@@ -251,10 +251,21 @@ git clone --depth 1 --branch "$SVT_AV1_VERSION" https://gitlab.com/AOMediaCodec/
 	# above pins --libdir=lib - some Linux distros default to lib64
 	# instead, which would silently break the plain "lib/pkgconfig" path
 	# ffmpeg's own PKG_CONFIG_PATH is pointed at below.
+	# -DCMAKE_POLICY_VERSION_MINIMUM=3.5: SVT-AV1 v2.3.0 vendors a
+	# third_party/cpuinfo submodule whose own CMakeLists.txt still
+	# declares `cmake_minimum_required(VERSION <3.5)` - CMake 4.0 (already
+	# what macos-latest/windows-latest's runner images ship, though not
+	# yet ubuntu-22.04's, which is why this only broke 2 of the 4 targets)
+	# removed support for that outright ("Compatibility with CMake < 3.5
+	# has been removed from CMake"). This is CMake's own documented
+	# workaround (quoted verbatim in that exact error message) for a
+	# vendored third-party subproject we don't control the CMakeLists.txt
+	# of - not something fixable by bumping a flag on SVT-AV1's own build.
 	cmake -S . -B build -G "Unix Makefiles" \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_INSTALL_PREFIX="$work/svt-av1-install" \
 		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 		-DBUILD_SHARED_LIBS=OFF \
 		-DBUILD_APPS=OFF \
 		-DBUILD_TESTING=OFF \
