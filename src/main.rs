@@ -38,7 +38,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use video::{Resolution, VideoPalette};
+use video::{Resolution, VideoCodec, VideoPalette};
 
 fn format_time(secs: f64) -> String {
     if !secs.is_finite() || secs < 0.0 {
@@ -304,6 +304,10 @@ struct KaraokeApp {
     seek_drag_value: Option<f64>,
 
     video_resolution: Resolution,
+    /// Which codec the video export uses - see [`VideoCodec`] for why AV1
+    /// is the default and H.264 is kept as a selectable, disclosed-as-
+    /// larger fallback.
+    video_codec: VideoCodec,
     /// An image/video shown behind the lyrics in the video export/preview
     /// instead of a flat `color_bg` fill - `None` means the plain
     /// solid-color look, unchanged from before this existed. Never applies
@@ -702,6 +706,7 @@ impl KaraokeApp {
             status: String::new(),
             seek_drag_value: None,
             video_resolution: Resolution::Hd1080,
+            video_codec: VideoCodec::default(),
             background: None,
             background_fit: video::BackgroundFit::default(),
             background_dim: 0.4,
@@ -870,6 +875,7 @@ impl KaraokeApp {
                 screaming_highlight: rgb_color_from_color32(self.color_screaming_highlight),
             },
             video_resolution: self.video_resolution,
+            video_codec: self.video_codec,
             background: self.background.clone(),
             background_fit: self.background_fit,
             background_dim: self.background_dim,
@@ -999,6 +1005,7 @@ impl KaraokeApp {
         self.title = project.title;
         self.artist = project.artist;
         self.video_resolution = project.video_resolution;
+        self.video_codec = project.video_codec;
         self.background = project.background;
         self.background_fit = project.background_fit;
         self.background_dim = project.background_dim;
@@ -2519,6 +2526,34 @@ impl KaraokeApp {
                                     );
                                 });
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Codec:");
+                            egui::ComboBox::from_id_source("export_video_codec")
+                                .selected_text(self.video_codec.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.video_codec,
+                                        VideoCodec::Av1,
+                                        VideoCodec::Av1.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.video_codec,
+                                        VideoCodec::H264,
+                                        VideoCodec::H264.label(),
+                                    );
+                                });
+                        });
+                        if self.video_codec == VideoCodec::H264 {
+                            ui.label(
+                                egui::RichText::new(
+                                    "H.264 exports are typically several times larger than AV1 \
+                                     at the same quality - pick this only if you specifically \
+                                     need compatibility with something that can't play AV1.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
                         ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals (slow)");
                     });
                 });
@@ -2685,6 +2720,7 @@ impl KaraokeApp {
         let title = (!self.title.trim().is_empty()).then(|| self.title.trim().to_string());
         let artist = (!self.artist.trim().is_empty()).then(|| self.artist.trim().to_string());
         let resolution = self.video_resolution;
+        let video_codec = self.video_codec;
         let background = self.background.clone();
         let background_fit = self.background_fit;
         let background_dim = self.background_dim;
@@ -2915,6 +2951,7 @@ impl KaraokeApp {
                         title.as_deref(),
                         artist.as_deref(),
                         resolution,
+                        video_codec,
                         30,
                         &render_audio_path,
                         background.as_ref(),

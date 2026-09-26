@@ -13,7 +13,7 @@
 //! saved bytes for a "your work" file.
 
 use crate::lyrics::{LyricLine, TimingSettings};
-use crate::video::{Background, BackgroundFit, Resolution};
+use crate::video::{Background, BackgroundFit, Resolution, VideoCodec};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -83,6 +83,11 @@ pub struct ProjectFile {
     pub artist: String,
     pub colors: ProjectColors,
     pub video_resolution: Resolution,
+    /// Which codec the video export uses (see [`VideoCodec`]) - defaults
+    /// to AV1 (via `#[serde(default)]`) for every project saved before
+    /// this existed, same as a freshly created one.
+    #[serde(default)]
+    pub video_codec: VideoCodec,
     /// An image/video shown behind the lyrics in the video export/preview
     /// instead of a flat color fill - absent (`None`) in every project
     /// saved before this existed, via `#[serde(default)]`.
@@ -262,6 +267,7 @@ mod tests {
             artist: "Test Artist".to_string(),
             colors: sample_colors(),
             video_resolution: Resolution::Uhd4k,
+            video_codec: VideoCodec::H264,
             background: Some(Background::Image(PathBuf::from("/tmp/cover.png"))),
             background_fit: BackgroundFit::Contain,
             background_dim: 0.4,
@@ -315,6 +321,7 @@ mod tests {
         assert_eq!(loaded.background_fit, BackgroundFit::Cover);
         assert_eq!(loaded.background_dim, 0.0);
         assert_eq!(loaded.timing_settings, TimingSettings::default());
+        assert_eq!(loaded.video_codec, VideoCodec::default());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -408,6 +415,7 @@ mod tests {
             artist: String::new(),
             colors: sample_colors(),
             video_resolution: Resolution::Hd1080,
+            video_codec: VideoCodec::default(),
             background: None,
             background_fit: BackgroundFit::default(),
             background_dim: 0.0,

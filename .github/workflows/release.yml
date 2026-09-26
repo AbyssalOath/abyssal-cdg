@@ -80,6 +80,10 @@ jobs:
             # target x86_64 too (both consumed by scripts/build-ffmpeg.sh).
             lame_configure_extra: "--host=x86_64-apple-darwin"
             lame_cc: "clang -arch x86_64"
+            # SVT-AV1's CMake build has its own, simpler native way to
+            # target a different arch on macOS than ffmpeg's/LAME's
+            # autotools-style cross flags above - no toolchain file needed.
+            svt_av1_cmake_extra: "-DCMAKE_OSX_ARCHITECTURES=x86_64"
 
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -127,6 +131,9 @@ jobs:
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
+        # cmake (needed for SVT-AV1, AV1 encoding) isn't listed below -
+        # it's already preinstalled on this runner image, same as on the
+        # macOS one (see that step's own comment).
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -144,8 +151,11 @@ jobs:
 
       - name: Install macOS ffmpeg build dependencies
         if: matrix.platform == 'macos-latest'
-        # meson/ninja: build dav1d (see scripts/build-ffmpeg.sh) for real
-        # software AV1 decode.
+        # meson/ninja: build dav1d for real software AV1 decode. cmake is
+        # already preinstalled on this runner image - only SVT-AV1 (AV1
+        # encode) needs it, and it's not worth an explicit brew install
+        # just to pin a version. All three, plus nasm, feed
+        # scripts/build-ffmpeg.sh.
         run: brew install nasm meson ninja
 
       - name: Set up MSYS2 (Windows ffmpeg build)
@@ -162,6 +172,7 @@ jobs:
             git
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-cmake
 
       - name: Build ffmpeg (Linux/macOS)
         if: matrix.platform != 'windows-latest'
@@ -171,6 +182,7 @@ jobs:
           FFMPEG_CONFIGURE_EXTRA: ${{ matrix.ffmpeg_configure_extra }}
           LAME_CONFIGURE_EXTRA: ${{ matrix.lame_configure_extra }}
           CC: ${{ matrix.lame_cc }}
+          SVT_AV1_CMAKE_EXTRA: ${{ matrix.svt_av1_cmake_extra }}
           OUT_DIR: assets/ffmpeg
         run: ./scripts/build-ffmpeg.sh
 

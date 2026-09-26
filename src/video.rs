@@ -58,6 +58,35 @@ impl Resolution {
     }
 }
 
+/// Which video codec `render_video` encodes the exported `.mp4` with.
+/// AV1 (via SVT-AV1 - see `scripts/build-ffmpeg.sh`) is the default: a
+/// real quality-targeted (CRF) encoder, dramatically smaller files than
+/// H.264 at the same visual quality for this app's own content (mostly-
+/// static lyric text over a still/slow-moving background - measured
+/// against real-world karaoke videos other tools produce, H.264 needed
+/// several hundred MB for the same song AV1 covers in a few tens of MB).
+/// H.264 (via openh264 - see `ffmpeg_path.rs`) is kept selectable for
+/// compatibility: older devices/software that can't play AV1 yet, or a
+/// downstream tool (a video editor, an older TV/set-top box) that expects
+/// H.264 - at the cost of a much larger file for the same quality, which
+/// the UI discloses right next to the option (see `main.rs`'s export
+/// dialog), not silently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VideoCodec {
+    #[default]
+    Av1,
+    H264,
+}
+
+impl VideoCodec {
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoCodec::Av1 => "AV1 (smaller files)",
+            VideoCodec::H264 => "H.264 (larger files, most compatible)",
+        }
+    }
+}
+
 /// A user-picked image or video shown behind the lyrics in the video export
 /// (and the live preview) instead of a flat `palette.background` fill -
 /// album art, a music video, etc. Never applies to the legacy `.cdg`
@@ -928,6 +957,7 @@ pub fn render_video(
     title: Option<&str>,
     artist: Option<&str>,
     resolution: Resolution,
+    codec: VideoCodec,
     fps: u32,
     audio_path: &Path,
     background: Option<&Background>,
@@ -1017,24 +1047,68 @@ pub fn render_video(
         }
     };
 
-    // openh264 (this app's bundled H.264 encoder - see ffmpeg_path.rs for
-    // why it's openh264 rather than the GPL-licensed x264 most ffmpeg
-    // builds default to) is a simpler, bitrate-driven encoder without
-    // x264's CRF-style "target a perceptual quality" mode, and its
-    // rate-distortion optimization is genuinely weaker than x264's at the
-    // same bitrate - so this targets a bitrate with real headroom above
-    // what the content needs, rather than trying to replicate a CRF
-    // setting that openh264 has no real equivalent for. These numbers were
-    // originally set much higher (32M/10M) before being measured against
-    // actual exports: this app's video is overwhelmingly static/slow-moving
-    // (large lyric text over a still or slow-moving background, not
-    // fast-motion footage), so the old numbers were producing needlessly
-    // huge files (measured: a multi-minute export landing at several
-    // hundred MB) for no visible quality gain - these are still generous
-    // for this specific content, not a tight/risky cut.
-    let video_bitrate = match (w, h) {
-        _ if w * h > 1920 * 1080 => "14M", // 4K
-        _ => "5M",                         // 1080p (or anything smaller)
+    let codec_args: Vec<String> = match codec {
+        VideoCodec::Av1 => {
+            // SVT-AV1 (see scripts/build-ffmpeg.sh) - a real quality-
+            // targeted (CRF) encoder, unlike openh264 below, so this
+            // doesn't need a per-resolution bitrate guess at all: the same
+            // CRF targets the same perceptual quality regardless of
+            // resolution. crf=32 was picked for this app's own content
+            // (mostly-static lyric text over a still/slow-moving
+            // background - much lower complexity than typical video, so a
+            // higher CRF than a general-purpose "VOD quality" preset like
+            // 23-25 costs nothing visible here) but hasn't been tuned
+            // against a real export yet - see this project's release
+            // workflow for why nothing AV1-encoding-related can be
+            // validated outside real CI. preset=6 is a middle-of-the-road
+            // speed/compression trade-off (SVT-AV1's own range is 0
+            // slowest/best to 13 fastest/worst) - exports aren't
+            // real-time, so there's room to lean slower if 6 turns out
+            // undercompressed, or faster if export time becomes the
+            // bigger complaint.
+            vec![
+                "-c:v".to_string(),
+                "libsvtav1".to_string(),
+                "-preset".to_string(),
+                "6".to_string(),
+                "-crf".to_string(),
+                "32".to_string(),
+            ]
+        }
+        VideoCodec::H264 => {
+            // openh264 (this app's bundled H.264 encoder - see
+            // ffmpeg_path.rs for why it's openh264 rather than the
+            // GPL-licensed x264 most ffmpeg builds default to) is a
+            // simpler, bitrate-driven encoder without x264's (or
+            // SVT-AV1's, above) CRF-style "target a perceptual quality"
+            // mode, and its rate-distortion optimization is genuinely
+            // weaker than x264's at the same bitrate - so this targets a
+            // bitrate with real headroom above what the content needs,
+            // rather than trying to replicate a CRF setting openh264 has
+            // no real equivalent for. These numbers were originally set
+            // much higher (32M/10M) before being measured against actual
+            // exports: this app's video is overwhelmingly static/slow-
+            // moving (large lyric text over a still or slow-moving
+            // background, not fast-motion footage), so the old numbers
+            // were producing needlessly huge files (measured: a
+            // multi-minute export landing at several hundred MB) for no
+            // visible quality gain - these are still generous for this
+            // specific content, not a tight/risky cut. Kept selectable
+            // (not replaced outright) purely for compatibility - see
+            // `VideoCodec`'s own docs.
+            let video_bitrate = match (w, h) {
+                _ if w * h > 1920 * 1080 => "14M", // 4K
+                _ => "5M",                         // 1080p (or anything smaller)
+            };
+            vec![
+                "-c:v".to_string(),
+                "libopenh264".to_string(),
+                "-b:v".to_string(),
+                video_bitrate.to_string(),
+                "-profile:v".to_string(),
+                "high".to_string(),
+            ]
+        }
     };
     let mut child = crate::ffmpeg_path::command()?
         .args([
@@ -1052,17 +1126,9 @@ pub fn render_video(
             "-i",
         ])
         .arg(audio_path)
+        .args(["-map", "0:v", "-map", "1:a"])
+        .args(&codec_args)
         .args([
-            "-map",
-            "0:v",
-            "-map",
-            "1:a",
-            "-c:v",
-            "libopenh264",
-            "-b:v",
-            video_bitrate,
-            "-profile:v",
-            "high",
             "-pix_fmt",
             "yuv420p",
             "-c:a",

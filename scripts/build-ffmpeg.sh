@@ -27,6 +27,19 @@
 # `-c:v` override needed in src/video.rs, and nothing here needs to touch
 # how non-AV1 inputs (the common case) get decoded.
 #
+# AV1 *encoding* (the video export's own output codec - see `VideoCodec`
+# in src/video.rs) is via SVT-AV1 (statically linked - BSD-2-Clause-
+# Patent, Alliance for Open Media/Intel/Netflix's own AV1 encoder,
+# license-compatible with this project the same way dav1d is above).
+# Unlike openh264's H.264, it has a real quality-targeted (CRF) mode, and
+# AV1 itself is meaningfully more efficient than H.264 per bit - this app
+# switched to it as the default export codec after measuring that
+# openh264 alone (even after aggressively tuning its bitrate down) had no
+# path to file sizes competitive with real-world karaoke video, since
+# openh264 has no CRF equivalent at all (see `VideoCodec::H264`'s own
+# docs). H.264 is kept selectable, not removed, purely for playback
+# compatibility with anything that can't decode AV1 yet.
+#
 # Used identically across all 4 release targets (see
 # .github/workflows/release.yml) - platform differences are handled by the
 # environment variables below, not by forking this script. The Linux
@@ -68,11 +81,18 @@
 #                         picked up automatically by LAME's autotools
 #                         `configure`; ffmpeg's own cross-compile flags are
 #                         set independently via FFMPEG_CONFIGURE_EXTRA
+#   SVT_AV1_CMAKE_EXTRA - extra `cmake` configure args for SVT-AV1 (e.g.
+#                          -DCMAKE_OSX_ARCHITECTURES=x86_64 for the macOS
+#                          x86_64-on-arm64 cross case - CMake's own native
+#                          way to target a different arch on macOS, unlike
+#                          dav1d's Meson build above, which needs a whole
+#                          cross file for the same case)
 
 set -euo pipefail
 
 : "${OPENH264_ARCH:?}"
 : "${OUT_DIR:?}"
+SVT_AV1_CMAKE_EXTRA="${SVT_AV1_CMAKE_EXTRA:-}"
 FFMPEG_CONFIGURE_EXTRA="${FFMPEG_CONFIGURE_EXTRA:-}"
 LAME_CONFIGURE_EXTRA="${LAME_CONFIGURE_EXTRA:-}"
 # Exactly openh264's own Makefile's OS-detection formula (see the comment
@@ -85,6 +105,7 @@ echo "Detected OPENH264_OS=$OPENH264_OS (uname: $(uname))"
 : "${FFMPEG_VERSION:=n7.1}"
 : "${LAME_VERSION:=3.100}"
 : "${DAV1D_VERSION:=1.4.3}"
+: "${SVT_AV1_VERSION:=v4.2.0}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -202,11 +223,38 @@ EOF
 	ninja -C build install
 )
 
-echo "== Building ffmpeg ${FFMPEG_VERSION} (LGPL only, libopenh264 + libmp3lame + libdav1d) =="
+echo "== Building SVT-AV1 ${SVT_AV1_VERSION} (statically linked - BSD-2-Clause-Patent AV1 encoder) =="
+git clone --depth 1 --branch "$SVT_AV1_VERSION" https://gitlab.com/AOMediaCodec/SVT-AV1.git "$work/svt-av1-src"
+(
+	cd "$work/svt-av1-src"
+	# BUILD_APPS/BUILD_TESTING off: this app only ever links the encoder
+	# library itself (via ffmpeg's libsvtav1 wrapper) - the standalone
+	# SvtAv1EncApp CLI and SVT-AV1's own test suite would just be extra
+	# build time and dependencies (e.g. the CLI app needs its own CLI-
+	# parsing deps) for output this project never uses.
+	# shellcheck disable=SC2086
+	# -DCMAKE_INSTALL_LIBDIR=lib: pinned explicitly (not left to
+	# GNUInstallDirs' own default) for the same reason dav1d's Meson build
+	# above pins --libdir=lib - some Linux distros default to lib64
+	# instead, which would silently break the plain "lib/pkgconfig" path
+	# ffmpeg's own PKG_CONFIG_PATH is pointed at below.
+	cmake -S . -B build -G "Unix Makefiles" \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX="$work/svt-av1-install" \
+		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DBUILD_APPS=OFF \
+		-DBUILD_TESTING=OFF \
+		$SVT_AV1_CMAKE_EXTRA
+	cmake --build build --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+	cmake --install build
+)
+
+echo "== Building ffmpeg ${FFMPEG_VERSION} (LGPL only, libopenh264 + libmp3lame + libdav1d + libsvtav1) =="
 git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.git "$work/ffmpeg-src"
 (
 	cd "$work/ffmpeg-src"
-	export PKG_CONFIG_PATH="$work/openh264-install/lib/pkgconfig:$work/dav1d-install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+	export PKG_CONFIG_PATH="$work/openh264-install/lib/pkgconfig:$work/dav1d-install/lib/pkgconfig:$work/svt-av1-install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 	# --disable-autodetect is load-bearing, not just tidiness: without it,
 	# `configure` silently links against whatever matching-named codec
 	# libraries happen to already be installed on the build machine
@@ -227,14 +275,14 @@ git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.
 	# were being word-split away instead of respected).
 	# --pkg-config-flags=--static: this ffmpeg build is fully static
 	# (--enable-static --disable-shared below) - without this,
-	# `configure`'s own pkg-config probing for libdav1d only picks up its
-	# *dynamic*-link flags (plain `pkg-config --libs dav1d`), dropping the
-	# transitive/private link deps a static consumer needs (dav1d's .pc
-	# file's own `Libs.private`, e.g. libm/libpthread on Unix) - the same
-	# class of "works dynamically linked, silently missing symbols/flags
-	# statically linked" gap this project's openh264/LAME linking already
-	# had to work around, just via pkg-config's own static-query mode this
-	# time instead of an install-name/soname fix.
+	# `configure`'s own pkg-config probing for libdav1d/libsvtav1 only
+	# picks up their *dynamic*-link flags (plain `pkg-config --libs dav1d`),
+	# dropping the transitive/private link deps a static consumer needs
+	# (their .pc files' own `Libs.private`, e.g. libm/libpthread on Unix) -
+	# the same class of "works dynamically linked, silently missing
+	# symbols/flags statically linked" gap this project's openh264/LAME
+	# linking already had to work around, just via pkg-config's own
+	# static-query mode this time instead of an install-name/soname fix.
 	eval ./configure \
 		--disable-autodetect \
 		--disable-gpl \
@@ -246,6 +294,8 @@ git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.
 		--enable-encoder=libopenh264 \
 		--enable-libmp3lame \
 		--enable-libdav1d \
+		--enable-libsvtav1 \
+		--enable-encoder=libsvtav1 \
 		--extra-cflags="-I$work/lame-install/include" \
 		--extra-ldflags="-L$work/lame-install/lib" \
 		--disable-doc \
