@@ -83,7 +83,29 @@ jobs:
             # SVT-AV1's CMake build has its own, simpler native way to
             # target a different arch on macOS than ffmpeg's/LAME's
             # autotools-style cross flags above - no toolchain file needed.
-            svt_av1_cmake_extra: "-DCMAKE_OSX_ARCHITECTURES=x86_64"
+            # -DCOMPILE_C_ONLY=ON: on this one cross-compiled target, SVT-AV1
+            # v2.3.0's own SIMD-dispatch setup links its vendored
+            # third_party/cpuinfo for runtime CPU-feature detection (needed
+            # since it can't do build-time CPUID probing when the build
+            # host's own arch, arm64, isn't the target one) - confirmed
+            # directly against Source/Lib/CMakeLists.txt that this happens
+            # via a plain `target_link_libraries(SvtAv1Enc PRIVATE
+            # cpuinfo_public)`, which only threads through CMake's own build
+            # graph, never reaching the separately-templated SvtAv1Enc.pc a
+            # plain pkg-config consumer (ffmpeg's configure) reads - so that
+            # consumer never learns it also needs -lcpuinfo, and a real CI
+            # run confirmed this the hard way (link failure: undefined
+            # "_cpuinfo_isa"/"_cpuinfo_x86_mach_init"). COMPILE_C_ONLY skips
+            # every SIMD asm subdirectory *and* the cpuinfo linkage in the
+            # exact same CMakeLists.txt conditionals (also confirmed
+            # directly, not guessed) - removing the need for runtime CPU
+            # detection at its root rather than trying to reassemble
+            # cpuinfo's own build output by hand. Cost: AV1 encoding via
+            # this one target's ffmpeg build runs in portable C only, no
+            # SIMD acceleration - slower exports, only for whoever's running
+            # the Intel-Mac build specifically; every other target (native,
+            # not cross-compiled) keeps full SIMD as normal.
+            svt_av1_cmake_extra: "-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCOMPILE_C_ONLY=ON"
 
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
