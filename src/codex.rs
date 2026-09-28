@@ -26,6 +26,12 @@
 //! for later - see this module's own doc history/PHASES-style planning,
 //! not built speculatively now.
 
+/// `DISCLAIMER.md`'s content, embedded once here and reused both as the
+/// "Legal Disclaimer" Codex article below and as `main.rs`'s first-run
+/// disclaimer modal's content (`draw_disclaimer_modal`) - one `include_str!`
+/// site, not a second copy pointing at the same file.
+pub const DISCLAIMER_TEXT: &str = include_str!("../DISCLAIMER.md");
+
 /// One Codex article - `content` is the *entire* embedded file, rendered
 /// as-is via `egui_commonmark`, not excerpted or reformatted for in-app
 /// display.
@@ -64,7 +70,7 @@ pub const ARTICLES: &[Article] = &[
     Article {
         title: "Legal Disclaimer & User Responsibility",
         category: "Legal & Content Responsibility",
-        content: include_str!("../DISCLAIMER.md"),
+        content: DISCLAIMER_TEXT,
     },
     Article {
         title: "Changelog",

@@ -18,6 +18,7 @@ mod formats;
 mod lyrics;
 mod mdx;
 mod model_assets;
+mod onboarding;
 mod onnxrt;
 mod project;
 mod recent;
@@ -218,6 +219,15 @@ struct KaraokeApp {
     /// saving first) from that confirmation - the next close request is
     /// let through instead of being intercepted again.
     quit_confirmed: bool,
+    /// The project file path a load was requested for, while there are
+    /// unsaved changes to the currently open project - set instead of
+    /// loading immediately, so `draw_load_confirm_prompt` can offer to
+    /// save first (same "don't silently discard work" protection window
+    /// close already has via `show_quit_confirm`, applied to the three
+    /// ways a project load can be triggered: the file picker, the Recent
+    /// menu, and dragging a `.abyzl` file onto the window). `None` means
+    /// no load confirmation is currently pending.
+    pending_project_load: Option<PathBuf>,
     /// Index of the next line "Tap next line"/Space will assign a
     /// timestamp to.
     next_untimed: usize,
@@ -395,8 +405,15 @@ struct KaraokeApp {
     codex_selected: usize,
     /// `egui_commonmark`'s own per-viewer cache (parsed markdown, loaded
     /// images) - kept across frames so re-rendering the same article every
-    /// frame doesn't re-parse it from scratch each time.
+    /// frame doesn't re-parse it from scratch each time. Shared with the
+    /// first-run disclaimer modal below - it's just a rendering cache keyed
+    /// by each `CommonMarkViewer`'s own id, not specific to the Codex.
     codex_cache: egui_commonmark::CommonMarkCache,
+    /// Whether the first-run legal disclaimer modal (see `DISCLAIMER.md`
+    /// and `draw_disclaimer_modal`) is currently showing - `true` only
+    /// until acknowledged for the very first time on this machine (see
+    /// `onboarding.rs`), never again after that, not tied to any project.
+    show_disclaimer_modal: bool,
     export_cdg: bool,
     export_lrc: bool,
     export_ultrastar: bool,
@@ -678,6 +695,7 @@ impl KaraokeApp {
             last_saved_snapshot: None,
             show_quit_confirm: false,
             quit_confirmed: false,
+            pending_project_load: None,
             lines: Vec::new(),
             next_untimed: 0,
             tap_phase: TapPhase::default(),
@@ -731,6 +749,7 @@ impl KaraokeApp {
             codex_open: false,
             codex_selected: 0,
             codex_cache: egui_commonmark::CommonMarkCache::default(),
+            show_disclaimer_modal: !onboarding::disclaimer_acknowledged(APP_ID),
             export_cdg: true,
             export_lrc: false,
             export_ultrastar: false,
@@ -1095,6 +1114,30 @@ impl KaraokeApp {
         self.waveform = None;
         self.waveform_job = None;
 
+        // The "Export…" dialog's own "what to export, and how" choices
+        // aren't part of `project::ProjectFile` at all (they're this
+        // session's export intent, not the song's own data) - reset to
+        // the same fresh defaults `KaraokeApp::new()` starts with rather
+        // than silently carrying over whatever the *previous* project had
+        // selected, which otherwise looks like the newly loaded project's
+        // own settings didn't take effect. `export_folder` is left alone
+        // deliberately - a remembered output location is a genuine
+        // convenience, not something tied to any one project's identity.
+        self.export_cdg = true;
+        self.export_lrc = false;
+        self.export_ultrastar = false;
+        self.export_video = false;
+        self.export_instrumental = false;
+        self.export_vocals = false;
+        self.lrc_enhanced_words = true;
+        self.remove_vocals_for_video = false;
+        self.instrumental_format = InstrumentalFormat::default();
+        // Emptied rather than left as whatever the previous project's name
+        // resolved to - `open_export_dialog` only re-derives this "if it's
+        // still empty", so a non-empty leftover would otherwise silently
+        // keep the old project's filename forever.
+        self.export_base_name.clear();
+
         match project.audio_path {
             Some(path) if path.exists() => {
                 self.load_audio(path);
@@ -1179,6 +1222,19 @@ impl KaraokeApp {
             .add_filter("Abyssal CDG project", &[project::FILE_EXTENSION])
             .pick_file()
         {
+            self.request_project_load(path);
+        }
+    }
+
+    /// Entry point for all three ways a project load can be triggered (the
+    /// file picker above, the Recent menu, dragging a `.abyzl` file onto
+    /// the window) - loads immediately if there's nothing at risk, or asks
+    /// first via `draw_load_confirm_prompt` if there are unsaved changes
+    /// to the currently open project, instead of silently discarding them.
+    fn request_project_load(&mut self, path: PathBuf) {
+        if self.has_unsaved_changes() {
+            self.pending_project_load = Some(path);
+        } else {
             self.load_project_file(path);
         }
     }
@@ -1227,7 +1283,7 @@ impl KaraokeApp {
                             self.status =
                                 "Can't load a project while an export is running.".to_string();
                         } else {
-                            self.load_project_file(path);
+                            self.request_project_load(path);
                         }
                     }
                 }
@@ -1354,6 +1410,51 @@ impl KaraokeApp {
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_quit_confirm = false;
+                    }
+                });
+            });
+        });
+    }
+
+    /// Shown (in place of the rest of the UI, like `draw_quit_confirm_prompt`)
+    /// while `pending_project_load` is `Some` - see `request_project_load`.
+    fn draw_load_confirm_prompt(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("Load without saving?");
+                ui.add_space(8.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(480.0);
+                    ui.label(
+                        "You have changes that haven't been saved to a project file yet. \
+                         Loading a different project will replace them - they're protected by \
+                         autosave and can be recovered next time you open the app, but you can \
+                         also save for real right now.",
+                    );
+                });
+                ui.add_space(16.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.available_width() / 2.0 - 150.0);
+                    if ui.button("Save and Load").clicked() {
+                        self.save_project();
+                        if !self.has_unsaved_changes() {
+                            if let Some(path) = self.pending_project_load.take() {
+                                self.load_project_file(path);
+                            }
+                        }
+                        // Else the save was cancelled (e.g. the "Save
+                        // Project As…" dialog was dismissed) or failed -
+                        // stay on this screen rather than loading anyway.
+                    }
+                    if ui.button("Load Without Saving").clicked() {
+                        if let Some(path) = self.pending_project_load.take() {
+                            self.load_project_file(path);
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_project_load = None;
                     }
                 });
             });
@@ -1960,7 +2061,7 @@ impl KaraokeApp {
                         self.status =
                             "Can't load a project while an export is running.".to_string();
                     } else {
-                        self.load_project_file(path);
+                        self.request_project_load(path);
                     }
                 }
                 _ => {
@@ -2504,6 +2605,42 @@ impl KaraokeApp {
         if !open {
             self.codex_open = false;
         }
+    }
+
+    /// Shows `DISCLAIMER.md` (see `codex.rs`, which also lists it as an
+    /// article - same content, not a second copy) once on first launch,
+    /// with only an acknowledge button and no close/X - the point is that
+    /// it's actually read once, not that it can be dismissed by accident.
+    /// Never shows again after that, on this machine, regardless of which
+    /// project is open or gets loaded later - see `onboarding.rs`.
+    fn draw_disclaimer_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_disclaimer_modal {
+            return;
+        }
+        egui::Window::new("Before you start")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                egui::ScrollArea::vertical()
+                    .id_source("disclaimer_modal_scroll")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        egui_commonmark::CommonMarkViewer::new("disclaimer_modal").show(
+                            ui,
+                            &mut self.codex_cache,
+                            codex::DISCLAIMER_TEXT,
+                        );
+                    });
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    if ui.button("I Understand").clicked() {
+                        onboarding::acknowledge_disclaimer(APP_ID);
+                        self.show_disclaimer_modal = false;
+                    }
+                });
+            });
     }
 
     fn draw_export_dialog(&mut self, ctx: &egui::Context) {
@@ -4111,6 +4248,10 @@ impl eframe::App for KaraokeApp {
             self.draw_quit_confirm_prompt(ctx);
             return;
         }
+        if self.pending_project_load.is_some() {
+            self.draw_load_confirm_prompt(ctx);
+            return;
+        }
 
         self.handle_dropped_files(ctx);
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -4433,6 +4574,7 @@ impl eframe::App for KaraokeApp {
 
         self.draw_export_dialog(ctx);
         self.draw_codex(ctx);
+        self.draw_disclaimer_modal(ctx);
 
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.add_space(4.0);

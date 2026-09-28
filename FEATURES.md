@@ -4,6 +4,14 @@ The full walkthrough of what this app does and how to use it. See
 [README.md](README.md) for a quick overview, installing a prebuilt release,
 and building from source.
 
+The very first time you launch the app on a given machine, a one-time
+disclaimer window (the same content as the Codex's "Legal Disclaimer &
+User Responsibility" article - see [DISCLAIMER.md](DISCLAIMER.md)) shows
+before anything else, with an "I Understand" button to dismiss it. It's a
+per-machine, not per-project, acknowledgment - once dismissed, it never
+shows again on that machine regardless of which project you open or
+create afterward.
+
 ## What it does
 
 1. **Load an audio file** (mp3, wav, flac, ogg, m4a, aac) - via **"Load
@@ -124,9 +132,16 @@ and building from source.
 Along the way: **Ctrl+Z/Ctrl+Shift+Z** undo/redo almost anything (tapping,
 nudging, dragging, auto-align, parsing), so there's no need to be careful
 about experimenting; **Save Project**/**Load Project…** (`.abyzl` files, a
-"Recent" menu for quick reopening) let you pick up exactly where you left
-off, with autosave and a recovery prompt protecting against a crash or an
-accidental close.
+"Recent" menu for quick reopening, drag-and-drop onto the window) let you
+pick up exactly where you left off, with autosave and a recovery prompt
+protecting against a crash or an accidental close. Loading a different
+project while the current one has unsaved changes - via the file picker,
+the Recent menu, or drag-and-drop - prompts first ("Save and Load" / "Load
+Without Saving" / "Cancel"), the same protection an accidental window
+close already has; the export dialog's own "what to export, and how"
+choices (formats, resolution/codec aside - those *are* saved per-project)
+also reset to their defaults on every project load, rather than silently
+carrying over whatever the previous project had selected.
 
 ## Two very different export formats
 
