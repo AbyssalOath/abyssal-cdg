@@ -3129,12 +3129,17 @@ impl KaraokeApp {
                             if i > 0 {
                                 job.append("   ", 0.0, egui::TextFormat::default());
                             }
-                            let (_, highlight) = self.singer_colors(*singer);
+                            // Unsung (upcoming), not highlight - this legend
+                            // appears before anything has been sung, so the
+                            // highlight color (only ever seen once a line is
+                            // already playing) isn't what's actually about to
+                            // be shown.
+                            let (unsung, _) = self.singer_colors(*singer);
                             job.append(
                                 lyrics::effective_singer_label(*singer, custom_name),
                                 0.0,
                                 egui::TextFormat {
-                                    color: highlight,
+                                    color: unsung,
                                     font_id: egui::FontId::proportional(12.0),
                                     ..Default::default()
                                 },

@@ -418,9 +418,12 @@ fn draw_text_line_wipe(
 
 /// Builds the singer-legend's display text (e.g. "Male   Female") plus a
 /// per-character color to pass to [`draw_text_line_chars`] - each singer's
-/// label is colored with that singer's own highlight color, so the legend
-/// on the intro screen ties the colors used during the song to the voice
-/// they represent.
+/// label is colored with that singer's own *unsung* (upcoming) color, not
+/// their highlight color: the legend appears on the intro screen, before
+/// any line has actually been sung, so the highlight color (only ever seen
+/// once a line is already being sung) isn't what the viewer is about to
+/// see - showing it here would defeat the legend's own purpose of "here's
+/// the color to watch for."
 fn legend_text_and_colors(
     palette: &VideoPalette,
     singers: &[(Singer, Option<String>)],
@@ -432,10 +435,10 @@ fn legend_text_and_colors(
             text.push_str("   ");
             colors.extend([palette.preview; 3]);
         }
-        let (_, highlight) = palette.singer_colors(*singer);
+        let (unsung, _) = palette.singer_colors(*singer);
         let label = effective_singer_label(*singer, custom_name);
         text.push_str(label);
-        colors.extend(std::iter::repeat_n(highlight, label.chars().count()));
+        colors.extend(std::iter::repeat_n(unsung, label.chars().count()));
     }
     (text, colors)
 }
@@ -1471,12 +1474,18 @@ mod tests {
     }
 
     #[test]
-    fn legend_text_and_colors_uses_each_singers_highlight_color() {
+    fn legend_text_and_colors_uses_each_singers_unsung_color() {
+        // The legend renders on the intro screen, before anything has been
+        // sung yet - it must use each singer's *unsung* (upcoming) color,
+        // not their highlight color, which the viewer never actually sees
+        // until a line is already playing. Deliberately distinct from
+        // male_unsung here (unlike some other fixtures in this file) so a
+        // regression back to highlight would actually fail this test.
         let palette = VideoPalette {
             background: Rgb8::new(5, 5, 20),
             default_unsung: Rgb8::new(230, 230, 230),
             default_highlight: Rgb8::new(255, 220, 0),
-            male_unsung: Rgb8::new(230, 230, 230),
+            male_unsung: Rgb8::new(200, 200, 200),
             male_highlight: Rgb8::new(255, 220, 0),
             female_unsung: Rgb8::new(210, 210, 255),
             female_highlight: Rgb8::new(255, 90, 220),
@@ -1492,13 +1501,14 @@ mod tests {
             legend_text_and_colors(&palette, &[(Singer::Male, None), (Singer::Female, None)]);
         assert_eq!(text, "Male   Female");
         assert_eq!(colors.len(), text.chars().count());
-        // First char of "Male" should be the male highlight color...
-        assert_eq!(colors[0].r, palette.male_highlight.r);
+        // First char of "Male" should be the male unsung color...
+        assert_eq!(colors[0].r, palette.male_unsung.r);
+        assert_eq!(colors[0].g, palette.male_unsung.g);
         // ...and the first char of "Female" (after "Male" + 3 spaces) the
-        // female highlight color.
+        // female unsung color.
         let female_start = "Male   ".chars().count();
-        assert_eq!(colors[female_start].r, palette.female_highlight.r);
-        assert_eq!(colors[female_start].g, palette.female_highlight.g);
+        assert_eq!(colors[female_start].r, palette.female_unsung.r);
+        assert_eq!(colors[female_start].g, palette.female_unsung.g);
     }
 
     #[test]

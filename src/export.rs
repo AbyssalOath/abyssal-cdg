@@ -394,7 +394,12 @@ fn draw_char_at(
 
 /// Builds the legend's display text (e.g. "Male  Female") plus a
 /// per-character foreground color index (spaces get a throwaway index,
-/// since [`draw_legend_row`] skips drawing whitespace).
+/// since [`draw_legend_row`] skips drawing whitespace). Each singer's label
+/// uses their *unsung* (upcoming) color index, not their highlight one -
+/// same reasoning as `video.rs`'s own `legend_text_and_colors`: the legend
+/// appears before anything has been sung, so the highlight color (only
+/// ever seen once a line is already playing) isn't what the viewer is
+/// actually about to see.
 fn legend_text_and_colors(
     palette: &Palette,
     singers: &[(Singer, Option<String>)],
@@ -406,10 +411,10 @@ fn legend_text_and_colors(
             text.push_str("  ");
             colors.extend([BG, BG]);
         }
-        let (_, highlight) = palette.singer_colors(*singer);
+        let (unsung, _) = palette.singer_colors(*singer);
         let label = effective_singer_label(*singer, custom_name);
         text.push_str(label);
-        colors.extend(std::iter::repeat_n(highlight, label.chars().count()));
+        colors.extend(std::iter::repeat_n(unsung, label.chars().count()));
     }
     (text, colors)
 }
