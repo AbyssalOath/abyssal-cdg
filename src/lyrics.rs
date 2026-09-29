@@ -185,7 +185,56 @@ pub const COUNTDOWN_LEAD_SECS: f64 = 4.0;
 /// during a break long enough to trigger the countdown indicator. Past
 /// this point the display goes blank (until the countdown dots appear)
 /// instead of leaving finished lyrics sitting there for the whole break.
+/// Used directly by the `.cdg` exporter's own packet-scheduling code
+/// (`export.rs`'s `render_cdg`, computing when to emit its clear
+/// instruction) for its hard cutoff - the video export and live preview
+/// use the separate, per-line fade timing below instead (`.cdg`'s fixed
+/// 16-color palette isn't a reasonable place to do a smooth per-line fade
+/// the way full RGB output can).
 pub const SUNG_LINGER_SECS: f64 = 5.0;
+
+/// How long an already-sung line stays fully visible, in the video export
+/// and live preview specifically, before it starts fading out - see
+/// [`sung_line_fade_alpha`]. Deliberately a separate constant from
+/// [`SUNG_LINGER_SECS`] (not a shared one), even though they mean similar
+/// things: the fade itself is what makes a shorter linger read as smooth
+/// rather than abrupt, so the two aren't interchangeable, and `.cdg`'s own
+/// hard-cutoff timing shouldn't change just because the fade-capable
+/// formats' timing does.
+pub const SUNG_FADE_LINGER_SECS: f64 = 2.5;
+/// How long the fade-out itself takes, once it starts.
+pub const SUNG_FADE_DURATION_SECS: f64 = 1.75;
+/// How long a freshly revealed line/block takes to fade *in* - the
+/// countdown's own upcoming-line reveal, and a new block's first
+/// appearance. Shorter than the fade-out so new content doesn't feel slow
+/// to arrive.
+pub const REVEAL_FADE_DURATION_SECS: f64 = 1.0;
+
+/// Opacity (0.0-1.0) for an already-sung line at time `t`, given when it
+/// finished being sung (`sing_end`) - full opacity for
+/// [`SUNG_FADE_LINGER_SECS`], then a linear fade to 0 over
+/// [`SUNG_FADE_DURATION_SECS`], then 0 after that. Video export/live
+/// preview only - see [`SUNG_FADE_LINGER_SECS`]'s own docs for why `.cdg`
+/// doesn't use this.
+pub fn sung_line_fade_alpha(sing_end: f64, t: f64) -> f32 {
+    let since = t - sing_end;
+    if since <= SUNG_FADE_LINGER_SECS {
+        1.0
+    } else {
+        let frac = (since - SUNG_FADE_LINGER_SECS) / SUNG_FADE_DURATION_SECS.max(0.001);
+        (1.0 - frac).clamp(0.0, 1.0) as f32
+    }
+}
+
+/// Opacity (0.0-1.0) for a line/block fading *in* once revealed at
+/// `reveal_at` (e.g. a countdown's own start time, or the moment a fresh
+/// block first becomes current) - 0 right at `reveal_at`, ramping linearly
+/// to full opacity over [`REVEAL_FADE_DURATION_SECS`]. Negative (i.e.
+/// `t < reveal_at`) clamps to 0, same as "not revealed yet".
+pub fn reveal_fade_alpha(reveal_at: f64, t: f64) -> f32 {
+    let since = t - reveal_at;
+    (since / REVEAL_FADE_DURATION_SECS.max(0.001)).clamp(0.0, 1.0) as f32
+}
 
 fn estimate_sing_duration(text: &str, window: f64, settings: &TimingSettings) -> f64 {
     let word_count = text.split_whitespace().count().max(1);
@@ -1210,27 +1259,6 @@ pub fn hide_upcoming_lines(
     t >= line.sing_end && countdown_window(line, next_mode, settings).is_some()
 }
 
-/// True once the already-sung display for `line` (this line, plus any
-/// earlier lines still shown highlighted in the same on-screen block)
-/// should be cleared too, during a break long enough to trigger the
-/// countdown indicator - either because it's lingered on screen for
-/// [`SUNG_LINGER_SECS`] since singing finished, or because the countdown is
-/// about to start (whichever comes first, so a short-but-still-qualifying
-/// break doesn't wait out the full linger before the dots appear). Implies
-/// [`hide_upcoming_lines`] is also true. Shared by the video exporter, the
-/// CDG exporter, and the live preview.
-pub fn blank_sung_lines(
-    line: &TimedLine,
-    t: f64,
-    next_mode: CountdownMode,
-    settings: &TimingSettings,
-) -> bool {
-    match countdown_window(line, next_mode, settings) {
-        Some((cd_start, _)) => t >= (line.sing_end + SUNG_LINGER_SECS).min(cd_start),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1477,6 +1505,45 @@ mod tests {
     }
 
     #[test]
+    fn sung_line_fade_alpha_stays_full_during_the_linger_then_fades_to_zero() {
+        let sing_end = 10.0;
+        assert_eq!(sung_line_fade_alpha(sing_end, sing_end), 1.0);
+        assert_eq!(
+            sung_line_fade_alpha(sing_end, sing_end + SUNG_FADE_LINGER_SECS),
+            1.0
+        );
+        let midway = sing_end + SUNG_FADE_LINGER_SECS + SUNG_FADE_DURATION_SECS / 2.0;
+        let alpha = sung_line_fade_alpha(sing_end, midway);
+        assert!(
+            alpha > 0.0 && alpha < 1.0,
+            "expected a partial fade midway through, got {alpha}"
+        );
+        let after = sing_end + SUNG_FADE_LINGER_SECS + SUNG_FADE_DURATION_SECS + 1.0;
+        assert_eq!(sung_line_fade_alpha(sing_end, after), 0.0);
+    }
+
+    #[test]
+    fn reveal_fade_alpha_ramps_from_zero_to_one() {
+        let reveal_at = 5.0;
+        assert_eq!(reveal_fade_alpha(reveal_at, reveal_at), 0.0);
+        assert_eq!(reveal_fade_alpha(reveal_at, reveal_at - 1.0), 0.0);
+        let midway = reveal_at + REVEAL_FADE_DURATION_SECS / 2.0;
+        let alpha = reveal_fade_alpha(reveal_at, midway);
+        assert!(
+            alpha > 0.0 && alpha < 1.0,
+            "expected a partial reveal midway through, got {alpha}"
+        );
+        assert_eq!(
+            reveal_fade_alpha(reveal_at, reveal_at + REVEAL_FADE_DURATION_SECS),
+            1.0
+        );
+        assert_eq!(
+            reveal_fade_alpha(reveal_at, reveal_at + REVEAL_FADE_DURATION_SECS + 5.0),
+            1.0
+        );
+    }
+
+    #[test]
     fn custom_seconds_per_word_changes_the_sing_end_estimate() {
         let mut lines = vec![LyricLine::new("one two three four")];
         lines[0].start = Some(0.0);
@@ -1639,37 +1706,6 @@ mod tests {
             &settings
         ));
         assert!(!hide_upcoming_lines(&tight, 2.0, auto, &settings));
-    }
-
-    #[test]
-    fn blank_sung_lines_waits_for_linger_then_clears_until_countdown() {
-        // 30s gap: sing_end is at 2.0 (2 short words), so cd_start is at
-        // end-4.0. Linger keeps the sung line up for SUNG_LINGER_SECS past
-        // sing_end, then it should blank until the countdown begins.
-        let line = TimedLine::new("hi there".into(), 0.0, 30.0, Singer::Male);
-        let settings = TimingSettings::default();
-        let auto = CountdownMode::Auto;
-        let cd_start = countdown_window(&line, auto, &settings).unwrap().0;
-        assert!(!blank_sung_lines(&line, line.sing_end, auto, &settings)); // just finished, still lingering
-        assert!(!blank_sung_lines(
-            &line,
-            line.sing_end + SUNG_LINGER_SECS - 0.01,
-            auto,
-            &settings
-        ));
-        assert!(blank_sung_lines(
-            &line,
-            line.sing_end + SUNG_LINGER_SECS,
-            auto,
-            &settings
-        )); // linger's up
-        assert!(blank_sung_lines(&line, cd_start - 0.01, auto, &settings)); // still blank right up to the dots
-        assert!(blank_sung_lines(&line, cd_start, auto, &settings)); // dots are on; sung line stays cleared
-
-        // Short/no gap -> never blank.
-        let tight = TimedLine::new("hi there".into(), 0.0, 2.0, Singer::Male);
-        assert!(!blank_sung_lines(&tight, tight.sing_end, auto, &settings));
-        assert!(!blank_sung_lines(&tight, 2.0, auto, &settings));
     }
 
     #[test]

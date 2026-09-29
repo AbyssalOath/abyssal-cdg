@@ -32,8 +32,8 @@ use audio::AudioPlayer;
 use eframe::egui;
 use export::Palette;
 use lyrics::{
-    blank_sung_lines, countdown_window, group_into_blocks, hide_upcoming_lines, singer_legend,
-    BackingVocal, LyricLine, Singer, TimedLine,
+    countdown_window, group_into_blocks, hide_upcoming_lines, singer_legend, BackingVocal,
+    LyricLine, Singer, TimedLine,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -134,6 +134,21 @@ fn color32_from_rgb_color(c: project::RgbColor) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
+/// Fades `color` toward transparent (letting whatever's drawn underneath -
+/// the live preview's own mock-screen background - show through), rather
+/// than toward black the way `Color32::gamma_multiply` would. Used by
+/// `draw_preview` for the same fade-in/fade-out treatment `render_frame`
+/// (video.rs) applies via `Canvas::blend_pixel`'s own opacity multiplier -
+/// see `lyrics::sung_line_fade_alpha`/`reveal_fade_alpha`.
+fn faded_color(color: egui::Color32, alpha: f32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        (color.a() as f32 * alpha.clamp(0.0, 1.0)).round() as u8,
+    )
+}
+
 /// Which timestamp clicking a word in the fine-tune panel sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum WordTapMode {
@@ -183,6 +198,14 @@ fn timeline_cursor_icon(
     })
 }
 
+/// A "start a new project" or "load this project" request, held while
+/// waiting on the user to resolve unsaved changes first - see
+/// `KaraokeApp::pending_unsaved_action`.
+enum PendingUnsavedAction {
+    NewProject,
+    LoadProject(PathBuf),
+}
+
 struct KaraokeApp {
     audio: Option<AudioPlayer>,
     audio_error: Option<String>,
@@ -219,15 +242,15 @@ struct KaraokeApp {
     /// saving first) from that confirmation - the next close request is
     /// let through instead of being intercepted again.
     quit_confirmed: bool,
-    /// The project file path a load was requested for, while there are
-    /// unsaved changes to the currently open project - set instead of
-    /// loading immediately, so `draw_load_confirm_prompt` can offer to
-    /// save first (same "don't silently discard work" protection window
-    /// close already has via `show_quit_confirm`, applied to the three
-    /// ways a project load can be triggered: the file picker, the Recent
-    /// menu, and dragging a `.abyzl` file onto the window). `None` means
-    /// no load confirmation is currently pending.
-    pending_project_load: Option<PathBuf>,
+    /// A "start a new project" or "load this project" request made while
+    /// there are unsaved changes to the currently open project - set
+    /// instead of acting immediately, so `draw_unsaved_action_confirm_prompt`
+    /// can offer to save first (same "don't silently discard work"
+    /// protection window close already has via `show_quit_confirm`,
+    /// applied to every way a load can be triggered - the file picker, the
+    /// Recent menu, dragging a `.abyzl` file onto the window - and to
+    /// "New Project"). `None` means no confirmation is currently pending.
+    pending_unsaved_action: Option<PendingUnsavedAction>,
     /// Index of the next line "Tap next line"/Space will assign a
     /// timestamp to.
     next_untimed: usize,
@@ -695,7 +718,7 @@ impl KaraokeApp {
             last_saved_snapshot: None,
             show_quit_confirm: false,
             quit_confirmed: false,
-            pending_project_load: None,
+            pending_unsaved_action: None,
             lines: Vec::new(),
             next_untimed: 0,
             tap_phase: TapPhase::default(),
@@ -1229,14 +1252,40 @@ impl KaraokeApp {
     /// Entry point for all three ways a project load can be triggered (the
     /// file picker above, the Recent menu, dragging a `.abyzl` file onto
     /// the window) - loads immediately if there's nothing at risk, or asks
-    /// first via `draw_load_confirm_prompt` if there are unsaved changes
-    /// to the currently open project, instead of silently discarding them.
+    /// first via `draw_unsaved_action_confirm_prompt` if there are unsaved
+    /// changes to the currently open project, instead of silently
+    /// discarding them.
     fn request_project_load(&mut self, path: PathBuf) {
         if self.has_unsaved_changes() {
-            self.pending_project_load = Some(path);
+            self.pending_unsaved_action = Some(PendingUnsavedAction::LoadProject(path));
         } else {
             self.load_project_file(path);
         }
+    }
+
+    /// Entry point for "New Project" - same unsaved-changes protection as
+    /// `request_project_load`, above.
+    fn request_new_project(&mut self) {
+        if self.project_busy() {
+            self.status = "Can't start a new project while an export is running.".to_string();
+            return;
+        }
+        if self.has_unsaved_changes() {
+            self.pending_unsaved_action = Some(PendingUnsavedAction::NewProject);
+        } else {
+            self.start_new_project();
+        }
+    }
+
+    /// Resets every bit of state back to a freshly launched app's own
+    /// defaults - deliberately `*self = KaraokeApp::new()` rather than a
+    /// hand-maintained list of fields to reset: a hand-maintained list is
+    /// exactly the class of bug that made the export dialog's own settings
+    /// silently carry over between projects before `apply_project_file`
+    /// was fixed to reset them - reconstructing the whole struct the same
+    /// way startup does can't have the same kind of gap, by construction.
+    fn start_new_project(&mut self) {
+        *self = KaraokeApp::new();
     }
 
     fn load_project_file(&mut self, path: PathBuf) {
@@ -1417,48 +1466,74 @@ impl KaraokeApp {
     }
 
     /// Shown (in place of the rest of the UI, like `draw_quit_confirm_prompt`)
-    /// while `pending_project_load` is `Some` - see `request_project_load`.
-    fn draw_load_confirm_prompt(&mut self, ctx: &egui::Context) {
+    /// while `pending_unsaved_action` is `Some` - see `request_project_load`/
+    /// `request_new_project`. Same three-button shape either way (save
+    /// first / discard and continue / cancel), just with action-specific
+    /// wording so it's clear what's actually about to happen.
+    fn draw_unsaved_action_confirm_prompt(&mut self, ctx: &egui::Context) {
+        let (heading, body, save_label, discard_label) = match self.pending_unsaved_action {
+            Some(PendingUnsavedAction::NewProject) => (
+                "Start a new project without saving?",
+                "You have changes that haven't been saved to a project file yet. Starting a \
+                 new project will replace them - they're protected by autosave and can be \
+                 recovered next time you open the app, but you can also save for real right \
+                 now.",
+                "Save and Start New",
+                "Start New Without Saving",
+            ),
+            Some(PendingUnsavedAction::LoadProject(_)) => (
+                "Load without saving?",
+                "You have changes that haven't been saved to a project file yet. Loading a \
+                 different project will replace them - they're protected by autosave and can \
+                 be recovered next time you open the app, but you can also save for real right \
+                 now.",
+                "Save and Load",
+                "Load Without Saving",
+            ),
+            None => return,
+        };
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
-                ui.heading("Load without saving?");
+                ui.heading(heading);
                 ui.add_space(8.0);
                 ui.scope(|ui| {
                     ui.set_max_width(480.0);
-                    ui.label(
-                        "You have changes that haven't been saved to a project file yet. \
-                         Loading a different project will replace them - they're protected by \
-                         autosave and can be recovered next time you open the app, but you can \
-                         also save for real right now.",
-                    );
+                    ui.label(body);
                 });
                 ui.add_space(16.0);
 
                 ui.horizontal(|ui| {
                     ui.add_space(ui.available_width() / 2.0 - 150.0);
-                    if ui.button("Save and Load").clicked() {
+                    if ui.button(save_label).clicked() {
                         self.save_project();
                         if !self.has_unsaved_changes() {
-                            if let Some(path) = self.pending_project_load.take() {
-                                self.load_project_file(path);
+                            if let Some(action) = self.pending_unsaved_action.take() {
+                                self.run_pending_unsaved_action(action);
                             }
                         }
                         // Else the save was cancelled (e.g. the "Save
                         // Project As…" dialog was dismissed) or failed -
-                        // stay on this screen rather than loading anyway.
+                        // stay on this screen rather than continuing anyway.
                     }
-                    if ui.button("Load Without Saving").clicked() {
-                        if let Some(path) = self.pending_project_load.take() {
-                            self.load_project_file(path);
+                    if ui.button(discard_label).clicked() {
+                        if let Some(action) = self.pending_unsaved_action.take() {
+                            self.run_pending_unsaved_action(action);
                         }
                     }
                     if ui.button("Cancel").clicked() {
-                        self.pending_project_load = None;
+                        self.pending_unsaved_action = None;
                     }
                 });
             });
         });
+    }
+
+    fn run_pending_unsaved_action(&mut self, action: PendingUnsavedAction) {
+        match action {
+            PendingUnsavedAction::NewProject => self.start_new_project(),
+            PendingUnsavedAction::LoadProject(path) => self.load_project_file(path),
+        }
     }
 
     fn load_audio_dialog(&mut self) {
@@ -3232,6 +3307,12 @@ impl KaraokeApp {
         }
 
         let mut content_ui = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center), None);
+        // Safety net alongside the proportional sizing below: nothing drawn
+        // in here can spill past the visible mock-screen rect into the rest
+        // of the page, even in an edge case the proportional math doesn't
+        // quite cover (an unusually tall custom font's own line metrics,
+        // very long lines that wrap to extra rows, ...).
+        content_ui.set_clip_rect(rect);
         let ui = &mut content_ui;
         {
             let legend_singers = singer_legend(&timed);
@@ -3243,16 +3324,26 @@ impl KaraokeApp {
                 ui.add_space(height * 0.15);
 
                 if has_title_card && t < card_end {
+                    // Every size in this function is a fraction of `height`
+                    // (the preview rect's own pixel height), matching
+                    // video.rs's render_frame ratios exactly - not the
+                    // fixed pixel sizes this used to have, which were sized
+                    // for the small preview panel in isolation rather than
+                    // scaled to it, and could overflow the visible mock
+                    // screen for a custom font with taller natural line
+                    // metrics than the default one they were tuned against.
                     if !self.title.trim().is_empty() {
                         ui.colored_label(
                             self.color_title,
-                            egui::RichText::new(&self.title).size(20.0).strong(),
+                            egui::RichText::new(&self.title)
+                                .size(height * 0.10)
+                                .strong(),
                         );
                     }
                     if !self.artist.trim().is_empty() {
                         ui.colored_label(
                             self.color_artist,
-                            egui::RichText::new(format!("by {}", self.artist)).size(14.0),
+                            egui::RichText::new(format!("by {}", self.artist)).size(height * 0.05),
                         );
                     }
                     if !legend_singers.is_empty() {
@@ -3277,7 +3368,7 @@ impl KaraokeApp {
                                 0.0,
                                 egui::TextFormat {
                                     color: unsung,
-                                    font_id: egui::FontId::proportional(12.0),
+                                    font_id: egui::FontId::proportional(height * 0.04),
                                     ..Default::default()
                                 },
                             );
@@ -3288,7 +3379,7 @@ impl KaraokeApp {
                         ui.add_space(10.0);
                         ui.colored_label(
                             self.color_preview,
-                            egui::RichText::new(video::CREDIT_TEXT).size(11.0),
+                            egui::RichText::new(video::CREDIT_TEXT).size(height * 0.028),
                         );
                     }
                     return;
@@ -3341,17 +3432,20 @@ impl KaraokeApp {
                                     .cloned()
                                     .unwrap_or_else(|| vec![0]);
                                 let lyric_family = self.lyric_font_family();
+                                let reveal_alpha = lyrics::reveal_fade_alpha(cd_start, t);
                                 ui.add_space(10.0);
-                                for &idx in &block {
-                                    let line = &timed[idx];
-                                    let (unsung, _) = self.singer_colors(line.singer);
-                                    let normalized = lyrics::normalize_text(&line.text);
-                                    ui.colored_label(
-                                        unsung,
-                                        egui::RichText::new(normalized)
-                                            .size(18.0)
-                                            .family(lyric_family.clone()),
-                                    );
+                                if reveal_alpha > 0.0 {
+                                    for &idx in &block {
+                                        let line = &timed[idx];
+                                        let (unsung, _) = self.singer_colors(line.singer);
+                                        let normalized = lyrics::normalize_text(&line.text);
+                                        ui.colored_label(
+                                            faded_color(unsung, reveal_alpha),
+                                            egui::RichText::new(normalized)
+                                                .size(height * 0.055)
+                                                .family(lyric_family.clone()),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -3399,19 +3493,21 @@ impl KaraokeApp {
                             next_countdown_mode,
                             &self.timing_settings,
                         );
-                        let hide_upcoming = hide_upcoming_lines(
-                            current_line,
-                            t,
-                            next_countdown_mode,
-                            &self.timing_settings,
-                        ) && !cd_window
-                            .is_some_and(|(cd_start, _)| t >= cd_start);
-                        let blank_sung = blank_sung_lines(
+                        let hide_upcoming_base = hide_upcoming_lines(
                             current_line,
                             t,
                             next_countdown_mode,
                             &self.timing_settings,
                         );
+                        // `Some(cd_start)` only once the countdown that
+                        // reveals this block's upcoming lines has actually
+                        // started - used both to stop hiding them (below)
+                        // and, distinctly, to fade them in starting from
+                        // that exact moment - see the matching comment in
+                        // video.rs's render_frame.
+                        let revealed_at =
+                            cd_window.and_then(|(cd_start, _)| (t >= cd_start).then_some(cd_start));
+                        let hide_upcoming = hide_upcoming_base && revealed_at.is_none();
                         let lyric_family = self.lyric_font_family();
 
                         // Only draw the countdown if there's a real next line to
@@ -3454,13 +3550,13 @@ impl KaraokeApp {
                                 // counted into usually starts a *different*
                                 // on-screen block than `current_idx`'s own -
                                 // meaning there's nothing in `block` (below)
-                                // for the per-slot loop to reveal (by now
-                                // `blank_sung` is already guaranteed true
-                                // either way, so that loop would draw
-                                // nothing at all). Preview the *next* block
-                                // directly instead, same idea as the intro
-                                // countdown previewing the very first one -
-                                // see the matching comment in video.rs's
+                                // for the per-slot loop to reveal (every
+                                // line in it has already faded out by now
+                                // either way, per `sung_line_fade_alpha`).
+                                // Preview the *next* block directly instead,
+                                // same idea as the intro countdown
+                                // previewing the very first one - see the
+                                // matching comment in video.rs's
                                 // render_frame.
                                 let next_idx = current_idx + 1;
                                 if !block.contains(&next_idx) {
@@ -3469,16 +3565,19 @@ impl KaraokeApp {
                                         .find(|b| b.contains(&next_idx))
                                         .cloned()
                                         .unwrap_or_else(|| vec![next_idx]);
-                                    for &idx in &next_block {
-                                        let line = &timed[idx];
-                                        let (unsung, _) = self.singer_colors(line.singer);
-                                        let normalized = lyrics::normalize_text(&line.text);
-                                        ui.colored_label(
-                                            unsung,
-                                            egui::RichText::new(normalized)
-                                                .size(18.0)
-                                                .family(lyric_family.clone()),
-                                        );
+                                    let reveal_alpha = lyrics::reveal_fade_alpha(cd_start, t);
+                                    if reveal_alpha > 0.0 {
+                                        for &idx in &next_block {
+                                            let line = &timed[idx];
+                                            let (unsung, _) = self.singer_colors(line.singer);
+                                            let normalized = lyrics::normalize_text(&line.text);
+                                            ui.colored_label(
+                                                faded_color(unsung, reveal_alpha),
+                                                egui::RichText::new(normalized)
+                                                    .size(height * 0.055)
+                                                    .family(lyric_family.clone()),
+                                            );
+                                        }
                                     }
                                     return;
                                 }
@@ -3491,70 +3590,91 @@ impl KaraokeApp {
                             let normalized = lyrics::normalize_text(&line.text);
                             match slot.cmp(&slot_in_block) {
                                 std::cmp::Ordering::Less => {
-                                    // Already sung - shown fully in the highlight color.
-                                    if blank_sung {
-                                        ui.add_space(22.0);
-                                    } else {
+                                    // Already sung - full highlight color for a
+                                    // while, then fades out on its own timer
+                                    // (see `sung_line_fade_alpha`) rather than
+                                    // the whole block blanking at once - each
+                                    // line fades independently, top to bottom,
+                                    // as its own linger runs out.
+                                    let alpha = lyrics::sung_line_fade_alpha(line.sing_end, t);
+                                    if alpha > 0.0 {
                                         ui.colored_label(
-                                            highlight,
+                                            faded_color(highlight, alpha),
                                             egui::RichText::new(normalized)
-                                                .size(18.0)
+                                                .size(height * 0.055)
                                                 .family(lyric_family.clone()),
                                         );
+                                    } else {
+                                        ui.add_space(height * 0.11);
                                     }
                                 }
                                 std::cmp::Ordering::Equal => {
-                                    if blank_sung {
-                                        ui.add_space(22.0);
-                                        continue;
+                                    if t < line.sing_end {
+                                        let mut job = egui::text::LayoutJob {
+                                            halign: egui::Align::Center,
+                                            ..Default::default()
+                                        };
+                                        // Same continuous per-line fraction the video/CDG
+                                        // exporters use, so the wipe moves smoothly through a
+                                        // word's letters as it's held out instead of the whole
+                                        // word snapping to `highlight` the instant its
+                                        // timestamp is reached (which looked instantaneous for
+                                        // long-held words and words with few characters alike).
+                                        let chars: Vec<char> = normalized.chars().collect();
+                                        let spans = lyrics::word_char_spans(&normalized);
+                                        let boundary = lyrics::current_line_wipe_fraction(line, t)
+                                            * chars.len().max(1) as f32;
+                                        let font_id =
+                                            egui::FontId::new(height * 0.055, lyric_family.clone());
+                                        for (i, &(offset, len)) in spans.iter().enumerate() {
+                                            let word_text: String =
+                                                chars[offset..offset + len].iter().collect();
+                                            let split = ((boundary - offset as f32)
+                                                .round()
+                                                .clamp(0.0, len as f32))
+                                                as usize;
+                                            let sung_part: String =
+                                                word_text.chars().take(split).collect();
+                                            let rest: String =
+                                                word_text.chars().skip(split).collect();
+                                            let suffix = if i + 1 < spans.len() { " " } else { "" };
+                                            let append =
+                                                |ui_job: &mut egui::text::LayoutJob,
+                                                 text: &str,
+                                                 color: egui::Color32| {
+                                                    if text.is_empty() {
+                                                        return;
+                                                    }
+                                                    ui_job.append(
+                                                        text,
+                                                        0.0,
+                                                        egui::TextFormat {
+                                                            color,
+                                                            font_id: font_id.clone(),
+                                                            ..Default::default()
+                                                        },
+                                                    );
+                                                };
+                                            append(&mut job, &sung_part, highlight);
+                                            append(&mut job, &format!("{rest}{suffix}"), unsung);
+                                        }
+                                        ui.label(job);
+                                    } else {
+                                        // Just finished - same fade-out treatment as an
+                                        // already-sung line above, using this line's own
+                                        // sing_end (it only just became "already sung" itself).
+                                        let alpha = lyrics::sung_line_fade_alpha(line.sing_end, t);
+                                        if alpha > 0.0 {
+                                            ui.colored_label(
+                                                faded_color(highlight, alpha),
+                                                egui::RichText::new(normalized)
+                                                    .size(height * 0.055)
+                                                    .family(lyric_family.clone()),
+                                            );
+                                        } else {
+                                            ui.add_space(height * 0.11);
+                                        }
                                     }
-                                    let mut job = egui::text::LayoutJob {
-                                        halign: egui::Align::Center,
-                                        ..Default::default()
-                                    };
-                                    // Same continuous per-line fraction the video/CDG exporters
-                                    // use, so the wipe moves smoothly through a word's letters
-                                    // as it's held out instead of the whole word snapping to
-                                    // `highlight` the instant its timestamp is reached (which
-                                    // looked instantaneous for long-held words and words with
-                                    // few characters alike).
-                                    let chars: Vec<char> = normalized.chars().collect();
-                                    let spans = lyrics::word_char_spans(&normalized);
-                                    let boundary = lyrics::current_line_wipe_fraction(line, t)
-                                        * chars.len().max(1) as f32;
-                                    let font_id = egui::FontId::new(18.0, lyric_family.clone());
-                                    for (i, &(offset, len)) in spans.iter().enumerate() {
-                                        let word_text: String =
-                                            chars[offset..offset + len].iter().collect();
-                                        let split = ((boundary - offset as f32)
-                                            .round()
-                                            .clamp(0.0, len as f32))
-                                            as usize;
-                                        let sung_part: String =
-                                            word_text.chars().take(split).collect();
-                                        let rest: String = word_text.chars().skip(split).collect();
-                                        let suffix = if i + 1 < spans.len() { " " } else { "" };
-                                        let append =
-                                            |ui_job: &mut egui::text::LayoutJob,
-                                             text: &str,
-                                             color: egui::Color32| {
-                                                if text.is_empty() {
-                                                    return;
-                                                }
-                                                ui_job.append(
-                                                    text,
-                                                    0.0,
-                                                    egui::TextFormat {
-                                                        color,
-                                                        font_id: font_id.clone(),
-                                                        ..Default::default()
-                                                    },
-                                                );
-                                            };
-                                        append(&mut job, &sung_part, highlight);
-                                        append(&mut job, &format!("{rest}{suffix}"), unsung);
-                                    }
-                                    ui.label(job);
 
                                     // A backing/echo vocal (if any) draws directly
                                     // beneath the current line, smaller, in its own
@@ -3579,8 +3699,10 @@ impl KaraokeApp {
                                             let bv_boundary =
                                                 lyrics::backing_vocal_wipe_fraction(bv, t)
                                                     * bv_chars.len().max(1) as f32;
-                                            let bv_font_id =
-                                                egui::FontId::new(14.0, lyric_family.clone());
+                                            let bv_font_id = egui::FontId::new(
+                                                height * 0.0385,
+                                                lyric_family.clone(),
+                                            );
                                             let mut bv_job = egui::text::LayoutJob {
                                                 halign: egui::Align::Center,
                                                 ..Default::default()
@@ -3628,14 +3750,29 @@ impl KaraokeApp {
                                 }
                                 std::cmp::Ordering::Greater => {
                                     if hide_upcoming {
-                                        ui.add_space(22.0);
+                                        ui.add_space(height * 0.11);
                                     } else {
-                                        ui.colored_label(
-                                            unsung,
-                                            egui::RichText::new(normalized)
-                                                .size(18.0)
-                                                .family(lyric_family.clone()),
-                                        );
+                                        // Fading in only applies to a line that was
+                                        // actually hidden and just got revealed by the
+                                        // countdown starting (`revealed_at`) - a line
+                                        // that was never hidden in the first place (a
+                                        // gap too short to warrant a countdown at all)
+                                        // has always been fully visible and shouldn't
+                                        // suddenly gain a fade-in.
+                                        let alpha = match revealed_at {
+                                            Some(reveal_at) if hide_upcoming_base => {
+                                                lyrics::reveal_fade_alpha(reveal_at, t)
+                                            }
+                                            _ => 1.0,
+                                        };
+                                        if alpha > 0.0 {
+                                            ui.colored_label(
+                                                faded_color(unsung, alpha),
+                                                egui::RichText::new(normalized)
+                                                    .size(height * 0.055)
+                                                    .family(lyric_family.clone()),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -4248,8 +4385,8 @@ impl eframe::App for KaraokeApp {
             self.draw_quit_confirm_prompt(ctx);
             return;
         }
-        if self.pending_project_load.is_some() {
-            self.draw_load_confirm_prompt(ctx);
+        if self.pending_unsaved_action.is_some() {
+            self.draw_unsaved_action_confirm_prompt(ctx);
             return;
         }
 
@@ -4395,6 +4532,9 @@ impl eframe::App for KaraokeApp {
             }
 
             ui.horizontal(|ui| {
+                if ui.button("🆕 New Project").clicked() {
+                    self.request_new_project();
+                }
                 if ui.button("💾 Save Project").clicked() {
                     self.save_project();
                 }
@@ -5570,7 +5710,7 @@ impl eframe::App for KaraokeApp {
                                 };
                                 let start_resp = ui.add(
                                     egui::TextEdit::singleline(&mut start_buf)
-                                        .desired_width(78.0)
+                                        .desired_width(95.0)
                                         .hint_text("00:00.00"),
                                 );
                                 if start_resp.has_focus() {
@@ -5653,7 +5793,7 @@ impl eframe::App for KaraokeApp {
                                 };
                                 let end_resp = ui.add(
                                     egui::TextEdit::singleline(&mut end_buf)
-                                        .desired_width(78.0)
+                                        .desired_width(95.0)
                                         .hint_text(end_hint),
                                 );
                                 if end_resp.has_focus() {
@@ -5730,7 +5870,7 @@ impl eframe::App for KaraokeApp {
                                     if ui
                                         .add(
                                             egui::TextEdit::singleline(&mut custom_buf)
-                                                .desired_width(72.0)
+                                                .desired_width(100.0)
                                                 .hint_text("Custom name"),
                                         )
                                         .changed()

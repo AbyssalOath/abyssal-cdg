@@ -23,9 +23,10 @@
 #[cfg(test)]
 use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
-    backing_vocal_wipe_fraction, blank_sung_lines, countdown_window, countdown_window_between,
+    backing_vocal_wipe_fraction, countdown_window, countdown_window_between,
     current_line_wipe_fraction, effective_singer_label, group_into_blocks, hide_upcoming_lines,
-    normalize_text, singer_legend, Singer, TimedLine, TimingSettings,
+    normalize_text, reveal_fade_alpha, singer_legend, sung_line_fade_alpha, Singer, TimedLine,
+    TimingSettings,
 };
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
@@ -308,7 +309,11 @@ fn measure_width(font: &FontArc, scale: PxScale, text: &str) -> f32 {
 /// (`colors[i]` for the i-th char of `text`; if there are fewer colors
 /// than characters, the last one is reused). Shrinks the font uniformly if
 /// the line would be wider than `max_width` - the "adjust font size if it
-/// starts clipping" behavior.
+/// starts clipping" behavior. `opacity` (0.0-1.0) multiplies into every
+/// glyph pixel's own anti-aliasing coverage before blending - 1.0 for the
+/// normal fully-opaque case, used at less than that for the fade in/out
+/// transitions in `render_frame` (see [`crate::lyrics::sung_line_fade_alpha`]/
+/// [`crate::lyrics::reveal_fade_alpha`]).
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_chars(
     canvas: &mut Canvas,
@@ -319,8 +324,9 @@ fn draw_text_line_chars(
     text: &str,
     colors: &[Rgb8],
     max_width: f32,
+    opacity: f32,
 ) {
-    if text.is_empty() {
+    if text.is_empty() || opacity <= 0.0 {
         return;
     }
     let mut scale_px = scale_px;
@@ -346,7 +352,7 @@ fn draw_text_line_chars(
                 outlined.draw(|gx, gy, coverage| {
                     let px = bounds.min.x as i32 + gx as i32;
                     let py = bounds.min.y as i32 + gy as i32;
-                    canvas.blend_pixel(px, py, color, coverage);
+                    canvas.blend_pixel(px, py, color, coverage * opacity);
                 });
             }
         }
@@ -443,7 +449,8 @@ fn legend_text_and_colors(
     (text, colors)
 }
 
-/// Convenience wrapper for a whole line in a single uniform color.
+/// Convenience wrapper for a whole line in a single uniform color. See
+/// [`draw_text_line_chars`] for what `opacity` does.
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_uniform(
     canvas: &mut Canvas,
@@ -454,10 +461,11 @@ fn draw_text_line_uniform(
     text: &str,
     color: Rgb8,
     max_width: f32,
+    opacity: f32,
 ) {
     let colors = vec![color; text.chars().count().max(1)];
     draw_text_line_chars(
-        canvas, font, scale_px, center_x, baseline_y, text, &colors, max_width,
+        canvas, font, scale_px, center_x, baseline_y, text, &colors, max_width, opacity,
     );
 }
 
@@ -503,7 +511,8 @@ fn draw_countdown_dots(
 /// boundary, so the line being counted into usually isn't part of the same
 /// on-screen block at all (see `render_frame`'s own two call sites - a gap
 /// *within* one block is handled separately, by simply not hiding that
-/// block's own later slots once the countdown starts).
+/// block's own later slots once the countdown starts). `opacity` fades the
+/// whole block in - see [`draw_text_line_chars`].
 #[allow(clippy::too_many_arguments)]
 fn draw_upcoming_block_preview(
     canvas: &mut Canvas,
@@ -514,6 +523,7 @@ fn draw_upcoming_block_preview(
     w: f32,
     h: f32,
     max_width: f32,
+    opacity: f32,
 ) {
     let line_height = h * 0.11;
     let font_size = h * 0.055;
@@ -533,6 +543,7 @@ fn draw_upcoming_block_preview(
             &text,
             unsung,
             max_width,
+            opacity,
         );
     }
 }
@@ -575,6 +586,7 @@ fn render_frame(
                 ti,
                 palette.title,
                 max_width,
+                1.0,
             );
         }
         if let Some(a) = artist {
@@ -588,6 +600,7 @@ fn render_frame(
                 &by,
                 palette.artist,
                 max_width,
+                1.0,
             );
         }
         if !legend_singers.is_empty() {
@@ -601,6 +614,7 @@ fn render_frame(
                 &text,
                 &colors,
                 max_width,
+                1.0,
             );
         }
         if show_credit {
@@ -613,6 +627,7 @@ fn render_frame(
                 CREDIT_TEXT,
                 palette.preview,
                 max_width,
+                1.0,
             );
         }
         return;
@@ -652,6 +667,7 @@ fn render_frame(
                         w,
                         h,
                         max_width,
+                        reveal_fade_alpha(cd_start, t),
                     );
                 }
             }
@@ -727,24 +743,25 @@ fn render_frame(
                     w,
                     h,
                     max_width,
+                    reveal_fade_alpha(cd_start, t),
                 );
                 return;
             }
         }
     }
 
-    let hide_upcoming = hide_upcoming_lines(
-        &timed_lines[current_idx],
-        t,
-        next_countdown_mode,
-        timing_settings,
-    ) && !cd_window.is_some_and(|(cd_start, _)| t >= cd_start);
-    let blank_sung = blank_sung_lines(
+    let hide_upcoming_base = hide_upcoming_lines(
         &timed_lines[current_idx],
         t,
         next_countdown_mode,
         timing_settings,
     );
+    // `Some(cd_start)` only once the countdown that reveals this block's
+    // upcoming lines has actually started - used both to stop hiding them
+    // (below) and, distinctly, to fade them in starting from that exact
+    // moment rather than snapping straight to full opacity.
+    let revealed_at = cd_window.and_then(|(cd_start, _)| (t >= cd_start).then_some(cd_start));
+    let hide_upcoming = hide_upcoming_base && revealed_at.is_none();
 
     let line_height = h * 0.11;
     let font_size = h * 0.055;
@@ -759,8 +776,13 @@ fn render_frame(
 
         match slot.cmp(&slot_in_block) {
             std::cmp::Ordering::Less => {
-                // Already sung - shown fully in the highlight color.
-                if !blank_sung {
+                // Already sung - full highlight color for a while, then
+                // fades out on its own timer (see `sung_line_fade_alpha`)
+                // rather than the whole block blanking at once on a single
+                // collective cutoff - each line fades independently, top
+                // to bottom, as its own linger runs out.
+                let alpha = sung_line_fade_alpha(line.sing_end, t);
+                if alpha > 0.0 {
                     draw_text_line_uniform(
                         canvas,
                         regular,
@@ -770,11 +792,12 @@ fn render_frame(
                         &text,
                         highlight,
                         max_width,
+                        alpha,
                     );
                 }
             }
             std::cmp::Ordering::Equal => {
-                if !blank_sung {
+                if t < line.sing_end {
                     let wipe_fraction = current_line_wipe_fraction(line, t);
                     draw_text_line_wipe(
                         canvas,
@@ -788,45 +811,78 @@ fn render_frame(
                         wipe_fraction,
                         max_width,
                     );
+                } else {
+                    // Just finished - same fade-out treatment as an
+                    // already-sung line above, using this line's own
+                    // sing_end (it only just became "already sung" itself).
+                    let alpha = sung_line_fade_alpha(line.sing_end, t);
+                    if alpha > 0.0 {
+                        draw_text_line_uniform(
+                            canvas,
+                            regular,
+                            font_size,
+                            w / 2.0,
+                            y,
+                            &text,
+                            highlight,
+                            max_width,
+                            alpha,
+                        );
+                    }
+                }
 
-                    // A backing/echo vocal (if any) draws directly beneath
-                    // the current line, smaller, in its own color, with its
-                    // own independent wipe - only while its own (bounded
-                    // within the host's) window is actually active, same as
-                    // the `.cdg` export's backing row.
-                    if let Some(bv) = &line.backing_vocal {
-                        if t >= bv.start && t < bv.end {
-                            let (bv_unsung, bv_highlight) = palette.singer_colors(bv.singer);
-                            let bv_text = normalize_text(&bv.text);
-                            let bv_wipe = backing_vocal_wipe_fraction(bv, t);
-                            draw_text_line_wipe(
-                                canvas,
-                                regular,
-                                font_size * 0.7,
-                                w / 2.0,
-                                y + line_height * 0.5,
-                                &bv_text,
-                                bv_unsung,
-                                bv_highlight,
-                                bv_wipe,
-                                max_width,
-                            );
-                        }
+                // A backing/echo vocal (if any) draws directly beneath the
+                // current line, smaller, in its own color, with its own
+                // independent wipe - only while its own (bounded within the
+                // host's) window is actually active, same as the `.cdg`
+                // export's backing row. Independent of the fade above -
+                // it's gated purely by its own start/end, not the main
+                // line's own wipe/fade phase.
+                if let Some(bv) = &line.backing_vocal {
+                    if t >= bv.start && t < bv.end {
+                        let (bv_unsung, bv_highlight) = palette.singer_colors(bv.singer);
+                        let bv_text = normalize_text(&bv.text);
+                        let bv_wipe = backing_vocal_wipe_fraction(bv, t);
+                        draw_text_line_wipe(
+                            canvas,
+                            regular,
+                            font_size * 0.7,
+                            w / 2.0,
+                            y + line_height * 0.5,
+                            &bv_text,
+                            bv_unsung,
+                            bv_highlight,
+                            bv_wipe,
+                            max_width,
+                        );
                     }
                 }
             }
             std::cmp::Ordering::Greater => {
                 if !hide_upcoming {
-                    draw_text_line_uniform(
-                        canvas,
-                        regular,
-                        font_size,
-                        w / 2.0,
-                        y,
-                        &text,
-                        unsung,
-                        max_width,
-                    );
+                    // Fading in only applies to a line that was actually
+                    // hidden and just got revealed by the countdown
+                    // starting (`revealed_at`) - a line that was never
+                    // hidden in the first place (a gap too short to
+                    // warrant a countdown at all) has always been fully
+                    // visible and shouldn't suddenly gain a fade-in.
+                    let alpha = match revealed_at {
+                        Some(reveal_at) if hide_upcoming_base => reveal_fade_alpha(reveal_at, t),
+                        _ => 1.0,
+                    };
+                    if alpha > 0.0 {
+                        draw_text_line_uniform(
+                            canvas,
+                            regular,
+                            font_size,
+                            w / 2.0,
+                            y,
+                            &text,
+                            unsung,
+                            max_width,
+                            alpha,
+                        );
+                    }
                 }
             }
         }
@@ -1782,6 +1838,20 @@ mod tests {
         })
     }
 
+    /// The highest red-channel value anywhere in row `y` - used to gauge
+    /// fade opacity without needing to know a font's exact glyph coverage
+    /// at a specific pixel: `blend_pixel`'s blend is monotonic in opacity
+    /// for any fixed coverage, so the most-covered pixel's own value still
+    /// scales down as the text's overall opacity drops, even though
+    /// *which* pixel that is doesn't change.
+    fn max_red_in_row(canvas: &Canvas, y: f32) -> u8 {
+        let row = (y.round() as usize).min(canvas.h.saturating_sub(1));
+        (0..canvas.w)
+            .map(|x| canvas.buf[(row * canvas.w + x) * 3])
+            .max()
+            .unwrap_or(0)
+    }
+
     #[test]
     fn backing_vocal_renders_only_during_its_own_window() {
         let mut lines = vec![LyricLine::new("hello world")];
@@ -2046,6 +2116,90 @@ mod tests {
         assert!(
             row_has_non_background_pixel(&during_countdown, &palette, next_line_row_y),
             "\"there\" should be revealed once the countdown starts, even in its own block"
+        );
+    }
+
+    #[test]
+    fn already_sung_line_fades_out_gradually_instead_of_blanking_at_once() {
+        // "there" doesn't start until t=20.0, so every sample time below
+        // (all well under that) still has "hi" as the *current* line,
+        // exercising the `Ordering::Equal` "just finished, now fading"
+        // path rather than `Ordering::Less` - both call the exact same
+        // `sung_line_fade_alpha`/render position, so this still directly
+        // proves the fade is actually wired into rendering (its own pure
+        // math is covered separately in lyrics.rs's tests).
+        let mut lines = vec![LyricLine::new("hi"), LyricLine::new("there")];
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(20.0);
+        lines[1].starts_new_block = false;
+        let timed = resolve_timing(&lines, Some(30.0));
+        let sing_end = timed[0].sing_end;
+        let blocks = group_into_blocks(&timed);
+        assert_eq!(blocks, vec![vec![0, 1]], "sanity check: one shared block");
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let card_end = crate::export::title_card_end(&timed);
+        let (w, h) = (320usize, 180usize);
+        // Slot 0 of a 2-line block - see the shared block-layout formula
+        // used throughout this file's own render_frame/draw_upcoming_block_preview.
+        let line_height = h as f32 * 0.11;
+        let font_size = h as f32 * 0.055;
+        let start_y = h as f32 * 0.5 - line_height + line_height * 0.5;
+        let already_sung_row_y = start_y - font_size * 0.4;
+
+        let render_at = |t: f64| -> Canvas {
+            let mut canvas = Canvas::new(w, h);
+            canvas.fill(palette.background);
+            render_frame(
+                &mut canvas,
+                &regular,
+                &bold,
+                &timed,
+                &blocks,
+                &palette,
+                None,
+                None,
+                card_end,
+                t,
+                &TimingSettings::default(),
+                false,
+            );
+            canvas
+        };
+
+        let full = max_red_in_row(&render_at(sing_end + 0.1), already_sung_row_y);
+        let midway = max_red_in_row(
+            &render_at(
+                sing_end
+                    + crate::lyrics::SUNG_FADE_LINGER_SECS
+                    + crate::lyrics::SUNG_FADE_DURATION_SECS / 2.0,
+            ),
+            already_sung_row_y,
+        );
+        let faded = max_red_in_row(
+            &render_at(
+                sing_end
+                    + crate::lyrics::SUNG_FADE_LINGER_SECS
+                    + crate::lyrics::SUNG_FADE_DURATION_SECS
+                    + 1.0,
+            ),
+            already_sung_row_y,
+        );
+
+        assert!(
+            full > midway,
+            "expected the line to be more opaque right after finishing ({full}) than midway \
+             through its fade ({midway})"
+        );
+        assert!(
+            midway > faded,
+            "expected the line to be more opaque midway through its fade ({midway}) than once \
+             fully faded ({faded})"
+        );
+        assert_eq!(
+            faded, palette.background.r,
+            "expected the line to have faded all the way back to the background color"
         );
     }
 

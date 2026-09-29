@@ -205,19 +205,24 @@ word-pace estimate itself (seconds per word, and a minimum floor for very
 short lines) - these only affect words/lines you haven't fine-tuned by
 hand, and are saved with the project.
 
-During a break long enough to trigger the countdown, the already-sung
-line(s) also clear off screen partway through instead of sitting there for
-the whole gap: they linger briefly after singing ends, then the screen
-goes blank until the countdown dots appear. Lines still queued up further
-ahead in the same verse block are hidden the moment the current line
-finishes too, for the same reason - they're still a break away - but in
-the video export and live preview (not the `.cdg` export, whose 300x216
-display has no spare room for this), those upcoming lines reappear the
-moment the countdown itself starts, dimmed the same way they always are
-before singing reaches them, so there's time to read ahead during the
-countdown rather than only right as the words go live - the dots
-themselves sit near the top of the frame there too, specifically so they
-don't compete for space with the lines they're counting down to.
+In the video export and live preview (not the `.cdg` export, whose fixed
+16-color, 300x216 display has no reasonable way to do a smooth per-line
+fade), already-sung lines don't just blank out once a break runs long
+enough - each one fades out on its own, top to bottom, a couple of
+seconds after *it* finishes, rather than the whole block disappearing at
+once on a single collective timer. Once the countdown itself starts, the
+next lines fade back in the same way - dimmed, the same look they always
+have before singing reaches them - so there's time to read ahead during
+the countdown instead of the words only appearing right as they go live,
+closer to the smooth, rolling feel of a KaraFun-style display than a
+hard slideshow-style cut between blocks. The dots themselves sit near the
+top of the frame there too, specifically so they don't compete for space
+with the lines they're counting down to.
+
+The `.cdg` export keeps its simpler, older behavior instead: already-sung
+lines linger briefly after singing ends, then the screen goes blank until
+the countdown dots appear, and upcoming lines stay hidden until the line
+they belong to actually starts.
 
 ## The fine-tuning timeline
 
