@@ -25,8 +25,8 @@ use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
     backing_vocal_wipe_fraction, countdown_window, countdown_window_between,
     current_line_wipe_fraction, effective_singer_label, group_into_blocks, hide_upcoming_lines,
-    normalize_text, reveal_fade_alpha, singer_legend, sung_line_fade_alpha, Singer, TimedLine,
-    TimingSettings,
+    normalize_text, reveal_fade_alpha, rolling_preview_lines, singer_legend, slot_fade_alpha,
+    sung_line_fade_alpha, Singer, TimedLine, TimingSettings,
 };
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
@@ -768,10 +768,43 @@ fn render_frame(
     let total_height = block.len() as f32 * line_height;
     let start_y = h * 0.5 - total_height / 2.0 + line_height * 0.5;
 
+    // Once a block's leading slots have fully faded (top to bottom, since
+    // `slot_fade_alpha` is monotonic down a block), roll in a preview of
+    // whatever comes right after this block into those now-empty rows
+    // instead of leaving them blank until the next real line finally
+    // starts - a continuous, KaraFun-style hand-off rather than a hard
+    // cut, as long as the gap to what's rolled in is short enough that a
+    // countdown wouldn't trigger for it anyway (a real countdown-worthy
+    // gap is handled by the dedicated reveal logic above instead, not
+    // blended with this).
+    let freed_count = (0..=slot_in_block)
+        .take_while(|&s| slot_fade_alpha(&timed_lines[block[s]], t) <= 0.0)
+        .count();
+    let rolling = rolling_preview_lines(timed_lines, &block, freed_count, timing_settings);
+
     for (slot, &idx) in block.iter().enumerate() {
+        let y = start_y + slot as f32 * line_height;
+        if slot < freed_count {
+            if let Some(&roll_idx) = rolling.get(slot) {
+                let roll_line = &timed_lines[roll_idx];
+                let roll_text = normalize_text(&roll_line.text);
+                let (roll_unsung, _) = palette.singer_colors(roll_line.singer);
+                draw_text_line_uniform(
+                    canvas,
+                    regular,
+                    font_size,
+                    w / 2.0,
+                    y,
+                    &roll_text,
+                    roll_unsung,
+                    max_width,
+                    1.0,
+                );
+            }
+            continue;
+        }
         let line = &timed_lines[idx];
         let text = normalize_text(&line.text);
-        let y = start_y + slot as f32 * line_height;
         let (unsung, highlight) = palette.singer_colors(line.singer);
 
         match slot.cmp(&slot_in_block) {
@@ -2200,6 +2233,92 @@ mod tests {
         assert_eq!(
             faded, palette.background.r,
             "expected the line to have faded all the way back to the background color"
+        );
+    }
+
+    /// Builds the fixture `rolling_preview_rolls_into_a_freed_slot_across_a_short_gap`
+    /// and its long-gap negative-control variant share: "hi" (slot 0)
+    /// fully fades by t=5.25 (sing_end 1.0 + LINGER 2.5 + FADE 1.75), while
+    /// "there" (slot 1, sing_end 2.5) is still current and only partway
+    /// through its own fade at t=5.5 - so slot 0 is freed but slot 1 isn't,
+    /// exactly the "top line gone, second line still fading" moment the
+    /// rolling hand-off is for. `next_start` is the only difference between
+    /// the short-gap (rolls in) and long-gap (doesn't) cases.
+    fn rolling_preview_fixture(next_start: f64) -> (Vec<TimedLine>, Vec<Vec<usize>>) {
+        let mut lines = vec![
+            LyricLine::new("hi"),
+            LyricLine::new("there"),
+            LyricLine::new("friend"),
+        ];
+        lines[0].start = Some(0.0);
+        lines[0].sing_end_override = Some(1.0);
+        lines[1].start = Some(2.0);
+        lines[1].sing_end_override = Some(2.5);
+        lines[1].starts_new_block = false; // keep "hi"/"there" in one block
+        lines[2].start = Some(next_start);
+        let timed = resolve_timing(&lines, Some((next_start + 5.0).max(20.0)));
+        let blocks = group_into_blocks(&timed);
+        assert_eq!(
+            blocks[0],
+            vec![0, 1],
+            "sanity check: \"hi\"/\"there\" share one block"
+        );
+        (timed, blocks)
+    }
+
+    #[test]
+    fn rolling_preview_rolls_into_a_freed_slot_across_a_short_gap_but_not_a_long_one() {
+        let palette = test_palette();
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let (w, h) = (320usize, 180usize);
+        let line_height = h as f32 * 0.11;
+        let font_size = h as f32 * 0.055;
+        // Slot 0 of a 2-line block - same formula used throughout this
+        // file's own rendering and other tests.
+        let start_y = h as f32 * 0.5 - line_height + line_height * 0.5;
+        let slot0_row_y = start_y - font_size * 0.4;
+        let t = 5.5;
+
+        let render = |timed: &[TimedLine], blocks: &[Vec<usize>]| -> Canvas {
+            let mut canvas = Canvas::new(w, h);
+            canvas.fill(palette.background);
+            let card_end = crate::export::title_card_end(timed);
+            render_frame(
+                &mut canvas,
+                &regular,
+                &bold,
+                timed,
+                blocks,
+                &palette,
+                None,
+                None,
+                card_end,
+                t,
+                &TimingSettings::default(),
+                false,
+            );
+            canvas
+        };
+
+        // Short gap: "there".sing_end (2.5) to "friend".start (7.0) is a
+        // 4.5s gap - under the 5s countdown threshold, so "friend" should
+        // roll into "hi"'s now-empty slot 0.
+        let (short_timed, short_blocks) = rolling_preview_fixture(7.0);
+        let short_canvas = render(&short_timed, &short_blocks);
+        assert!(
+            row_has_non_background_pixel(&short_canvas, &palette, slot0_row_y),
+            "expected \"friend\" to roll into slot 0 across the short gap"
+        );
+
+        // Long gap: 20.0 - 2.5 = 17.5s - a real countdown-worthy gap, which
+        // the dedicated reveal mechanism owns instead - slot 0 must stay
+        // empty here, not also show a rolled-in preview.
+        let (long_timed, long_blocks) = rolling_preview_fixture(20.0);
+        let long_canvas = render(&long_timed, &long_blocks);
+        assert!(
+            !row_has_non_background_pixel(&long_canvas, &palette, slot0_row_y),
+            "slot 0 should stay empty across a real countdown-worthy gap, not roll anything in"
         );
     }
 

@@ -219,6 +219,20 @@ hard slideshow-style cut between blocks. The dots themselves sit near the
 top of the frame there too, specifically so they don't compete for space
 with the lines they're counting down to.
 
+That countdown-and-reveal handles a *real* break - long enough that a
+singer genuinely needs the heads-up. For the much more common case of
+one verse block simply running into the next with barely a breath
+between them, there's a separate, lighter-weight hand-off: as soon as a
+line's own fade-out finishes (freeing up its row), whatever comes right
+after the current block rolls into that empty row immediately, block
+boundary or not - so the last couple of lines of one verse and the first
+couple of the next can be on screen together, rolling up top to bottom,
+instead of the whole next block waiting to appear until the line
+currently playing actually reaches it. This only happens across a gap
+short enough that a countdown wouldn't trigger for it anyway; a real
+countdown-worthy gap is left entirely to the mechanism above, not mixed
+with this one.
+
 The `.cdg` export keeps its simpler, older behavior instead: already-sung
 lines linger briefly after singing ends, then the screen goes blank until
 the countdown dots appear, and upcoming lines stay hidden until the line

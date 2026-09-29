@@ -3584,7 +3584,45 @@ impl KaraokeApp {
                             }
                         }
 
+                        // Once a block's leading slots have fully faded (top
+                        // to bottom, since `slot_fade_alpha` is monotonic
+                        // down a block), roll in a preview of whatever comes
+                        // right after this block into those now-empty rows
+                        // instead of leaving them blank until the next real
+                        // line finally starts - a continuous, KaraFun-style
+                        // hand-off rather than a hard cut, as long as the gap
+                        // to what's rolled in is short enough that a
+                        // countdown wouldn't trigger for it anyway (a real
+                        // countdown-worthy gap is handled by the dedicated
+                        // reveal logic above instead, not blended with this).
+                        // See the matching comment in video.rs's render_frame.
+                        let freed_count = (0..=slot_in_block)
+                            .take_while(|&s| lyrics::slot_fade_alpha(&timed[block[s]], t) <= 0.0)
+                            .count();
+                        let rolling = lyrics::rolling_preview_lines(
+                            &timed,
+                            &block,
+                            freed_count,
+                            &self.timing_settings,
+                        );
+
                         for (slot, &idx) in block.iter().enumerate() {
+                            if slot < freed_count {
+                                if let Some(&roll_idx) = rolling.get(slot) {
+                                    let roll_line = &timed[roll_idx];
+                                    let (roll_unsung, _) = self.singer_colors(roll_line.singer);
+                                    let roll_normalized = lyrics::normalize_text(&roll_line.text);
+                                    ui.colored_label(
+                                        roll_unsung,
+                                        egui::RichText::new(roll_normalized)
+                                            .size(height * 0.055)
+                                            .family(lyric_family.clone()),
+                                    );
+                                } else {
+                                    ui.add_space(height * 0.11);
+                                }
+                                continue;
+                            }
                             let line = &timed[idx];
                             let (unsung, highlight) = self.singer_colors(line.singer);
                             let normalized = lyrics::normalize_text(&line.text);

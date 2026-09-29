@@ -236,6 +236,59 @@ pub fn reveal_fade_alpha(reveal_at: f64, t: f64) -> f32 {
     (since / REVEAL_FADE_DURATION_SECS.max(0.001)).clamp(0.0, 1.0) as f32
 }
 
+/// Opacity for a block slot showing `line` at time `t`: full while it's
+/// still the actively-singing current line or hasn't started yet (`t <
+/// line.sing_end`), otherwise the same fade-out curve as
+/// [`sung_line_fade_alpha`] once it's done. Slot opacity is monotonically
+/// non-increasing from the top of a block down (each line's `sing_end` is
+/// later than the one before it, so an earlier slot has always had at
+/// least as long to fade as a later one) - [`rolling_preview_lines`] relies
+/// on that to know a block's fully-faded slots are always a clean prefix,
+/// never a gap in the middle.
+pub fn slot_fade_alpha(line: &TimedLine, t: f64) -> f32 {
+    if t < line.sing_end {
+        1.0
+    } else {
+        sung_line_fade_alpha(line.sing_end, t)
+    }
+}
+
+/// For a block whose top `freed_slots` rows have fully faded out (opacity
+/// 0 via [`slot_fade_alpha`]), returns up to `freed_slots` line indices
+/// from *beyond* this block (in singing order) to preview in those now-
+/// empty rows - a rolling, KaraFun-style hand-off to whatever comes next
+/// when the gap is short enough that a countdown wouldn't trigger for it
+/// anyway. Stops (returning fewer than `freed_slots`) the moment a real
+/// countdown-worthy gap is hit - see [`countdown_window`] - or the song
+/// runs out of lines; that transition is left to the existing countdown/
+/// reveal mechanism instead, not blended with this one. `block` is the
+/// current on-screen block's own line indices, in order.
+pub fn rolling_preview_lines(
+    timed_lines: &[TimedLine],
+    block: &[usize],
+    freed_slots: usize,
+    settings: &TimingSettings,
+) -> Vec<usize> {
+    let mut result = Vec::new();
+    let Some(&last_idx) = block.last() else {
+        return result;
+    };
+    let mut prev = &timed_lines[last_idx];
+    let mut next_idx = last_idx + 1;
+    while result.len() < freed_slots {
+        let Some(candidate) = timed_lines.get(next_idx) else {
+            break;
+        };
+        if countdown_window(prev, candidate.countdown_mode, settings).is_some() {
+            break;
+        }
+        result.push(next_idx);
+        prev = candidate;
+        next_idx += 1;
+    }
+    result
+}
+
 fn estimate_sing_duration(text: &str, window: f64, settings: &TimingSettings) -> f64 {
     let word_count = text.split_whitespace().count().max(1);
     let est = (word_count as f64 * settings.seconds_per_word).max(settings.min_sing_duration);
@@ -1541,6 +1594,82 @@ mod tests {
             reveal_fade_alpha(reveal_at, reveal_at + REVEAL_FADE_DURATION_SECS + 5.0),
             1.0
         );
+    }
+
+    #[test]
+    fn slot_fade_alpha_matches_sung_line_fade_alpha_once_past_sing_end() {
+        let line = TimedLine::new("hi".into(), 0.0, 10.0, Singer::Male);
+        // Still actively singing (or hasn't started) - full opacity
+        // regardless of the fade curve.
+        assert_eq!(slot_fade_alpha(&line, line.sing_end - 0.01), 1.0);
+        // Once past sing_end, matches the fade curve exactly.
+        let t = line.sing_end + SUNG_FADE_LINGER_SECS + 0.5;
+        assert_eq!(
+            slot_fade_alpha(&line, t),
+            sung_line_fade_alpha(line.sing_end, t)
+        );
+    }
+
+    #[test]
+    fn rolling_preview_lines_borrows_across_a_short_gap_and_stops_at_a_long_one() {
+        // Lines 0-3 form one block (a real gap between blocks is the whole
+        // point of this test, so "d" -> "e" deliberately crosses a block
+        // boundary with only a 0.5s gap - short enough that no countdown
+        // would trigger for it). "e" -> "f" is the same. "f" -> "g" is an
+        // 11.5s gap - long enough to trigger a real countdown, where the
+        // rolling preview must stop rather than reaching past it.
+        let mut lines = vec![
+            LyricLine::new("a"),
+            LyricLine::new("b"),
+            LyricLine::new("c"),
+            LyricLine::new("d"),
+            LyricLine::new("e"),
+            LyricLine::new("f"),
+            LyricLine::new("g"),
+        ];
+        let starts = [0.0, 2.0, 4.0, 6.0, 7.0, 8.0, 20.0];
+        let sing_ends = [1.0, 3.0, 5.0, 6.5, 7.5, 8.5, 20.5];
+        for (i, l) in lines.iter_mut().enumerate() {
+            l.start = Some(starts[i]);
+            l.sing_end_override = Some(sing_ends[i]);
+        }
+        for l in &mut lines[1..4] {
+            l.starts_new_block = false; // keep 0..=3 in one block
+        }
+        let timed = resolve_timing(&lines, Some(25.0));
+        let settings = TimingSettings::default();
+        let block = vec![0, 1, 2, 3];
+
+        assert_eq!(
+            rolling_preview_lines(&timed, &block, 0, &settings),
+            Vec::<usize>::new()
+        );
+        assert_eq!(rolling_preview_lines(&timed, &block, 1, &settings), vec![4]);
+        assert_eq!(
+            rolling_preview_lines(&timed, &block, 2, &settings),
+            vec![4, 5]
+        );
+        // Asking for 3 still only returns 2 - "f" -> "g" is a real
+        // countdown-worthy gap, so borrowing stops there instead of
+        // reaching past it into "g".
+        assert_eq!(
+            rolling_preview_lines(&timed, &block, 3, &settings),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn rolling_preview_lines_stops_at_the_end_of_the_song() {
+        let mut lines = vec![LyricLine::new("a"), LyricLine::new("b")];
+        lines[0].start = Some(0.0);
+        lines[0].sing_end_override = Some(1.0);
+        lines[1].start = Some(2.0);
+        lines[1].sing_end_override = Some(2.5);
+        let timed = resolve_timing(&lines, Some(5.0));
+        let settings = TimingSettings::default();
+        // Block is just line 0 - "b" (idx 1) is the only thing beyond it,
+        // and there's nothing after that even though 5 slots were asked for.
+        assert_eq!(rolling_preview_lines(&timed, &[0], 5, &settings), vec![1]);
     }
 
     #[test]
