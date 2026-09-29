@@ -57,8 +57,12 @@ pub fn load_separator() -> Result<MdxSeparator> {
 /// same export run) can load the ~65MB model once and reuse it, instead
 /// of paying that cost twice.
 pub fn load_separator_with_model(model: MdxModel) -> Result<MdxSeparator> {
-    let model_path = model_assets::resolve_model(model.filename(), model.download_url())
-        .context("couldn't locate or download the vocal separation model")?;
+    let model_path = model_assets::resolve_model(
+        model.filename(),
+        model.download_url(),
+        model.download_sha256(),
+    )
+    .context("couldn't locate or download the vocal separation model")?;
     MdxSeparator::load(&model_path, model)
 }
 

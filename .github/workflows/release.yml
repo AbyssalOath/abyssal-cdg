@@ -33,7 +33,13 @@ jobs:
             ort_archive_ext: tgz
             ort_lib_name: libonnxruntime.dylib
             openh264_arch: arm64
-            openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-arm64.dylib.bz2
+            openh264_dl_url: https://ciscobinary.openh264.org/libopenh264-2.6.0-mac-arm64.dylib.bz2
+            # SHA-256 of the exact file at openh264_dl_url - verified
+            # directly against a real download, same pinned hash
+            # ffmpeg_path.rs checks for this same file at runtime. Checked
+            # here too since this build-time download becomes part of every
+            # shipped installer, not just a dev build's own fallback.
+            openh264_sha256: 6db362ee5abdab572311aeadb96d3f44b0617d9a4a4b9f4db4cb5ac4d968da71
             # -rpath,@executable_path: openh264 is linked with an
             # @rpath-relative install name (see scripts/build-ffmpeg.sh),
             # so ffmpeg needs to know @rpath means "next to me" - i.e.
@@ -58,7 +64,8 @@ jobs:
             ort_archive_ext: ""
             ort_lib_name: libonnxruntime.dylib
             openh264_arch: x86_64
-            openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-x64.dylib.bz2
+            openh264_dl_url: https://ciscobinary.openh264.org/libopenh264-2.6.0-mac-x64.dylib.bz2
+            openh264_sha256: 38b2ed6d1d45b6a3e408c734173f2d67ab44a10d0e154ff3489b89877cd60e7e
             # Cross-compiled on this same arm64 runner, mirroring the
             # ONNX Runtime cross-compile above - clang's own cross-arch
             # support handles this without needing a separate toolchain.
@@ -115,7 +122,8 @@ jobs:
             ort_archive_ext: tgz
             ort_lib_name: libonnxruntime.so
             openh264_arch: x86_64
-            openh264_dl_url: http://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2
+            openh264_dl_url: https://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2
+            openh264_sha256: 27ab53323c110b76214c1c72222f459d17febbcd1e252136cadc292b0308d75b
             # -rpath,$ORIGIN: without this, the built ffmpeg records a
             # bare "libopenh264.so" NEEDED entry with no hint where to
             # find it - fine for this app's own runtime (ffmpeg_path.rs
@@ -139,7 +147,8 @@ jobs:
             ort_archive_ext: zip
             ort_lib_name: onnxruntime.dll
             openh264_arch: x86_64
-            openh264_dl_url: http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2
+            openh264_dl_url: https://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2
+            openh264_sha256: dab5f2a872777f9a58b69bfa9fbcf20d9f82f2d6ec91383fd70bff49bd34ac9f
             ffmpeg_configure_extra: "--target-os=mingw32 --arch=x86_64"
 
     runs-on: ${{ matrix.platform }}
@@ -149,7 +158,7 @@ jobs:
     timeout-minutes: 150
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -182,7 +191,7 @@ jobs:
 
       - name: Set up MSYS2 (Windows ffmpeg build)
         if: matrix.platform == 'windows-latest'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64
           install: >-
@@ -249,17 +258,34 @@ jobs:
             sleep $((attempt * 15))
             [ "$attempt" = "3" ] && exit 1
           done
+          # Verified against the same pinned hash ffmpeg_path.rs checks for
+          # this exact file at runtime - this build-time download becomes
+          # part of every shipped installer, so a MITM/compromised-CDN swap
+          # here would ship malicious native code to every user, not just
+          # affect a single dev build's fallback. `sha256sum` (Linux, and
+          # Windows via Git Bash's bundled coreutils) isn't on macOS
+          # runners by default - `shasum -a 256` is the portable fallback.
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "assets/ffmpeg/openh264.bz2" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "assets/ffmpeg/openh264.bz2" | awk '{print $1}')"
+          fi
+          expected="${{ matrix.openh264_sha256 }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "openh264 download failed hash verification: expected $expected, got $actual"
+            exit 1
+          fi
           bunzip2 -f "assets/ffmpeg/openh264.bz2"
           mv "assets/ffmpeg/openh264" "assets/ffmpeg/$out_name"
           chmod +x "assets/ffmpeg/$out_name" 2>/dev/null || true
           ls -la assets/ffmpeg/
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
@@ -428,7 +454,7 @@ jobs:
           done
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: abyssal-cdg-${{ matrix.target }}
           path: dist/*
@@ -439,13 +465,22 @@ jobs:
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Generate checksums
+        # Lets anyone verify a downloaded installer wasn't corrupted or
+        # tampered with in transit (or via a compromised mirror/fork's own
+        # release page) - this doesn't replace real code signing (which
+        # would prove *who* built it), but it's a free way to prove
+        # *what was actually built here* matches what someone downloads.
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: ${{ github.ref_name }}
           files: dist/*

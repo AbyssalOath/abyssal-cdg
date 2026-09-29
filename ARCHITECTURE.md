@@ -304,7 +304,11 @@ against something this project builds or fetches itself:
   (a copy `scripts/build-ffmpeg.sh` compiles and discards, never
   distributed), but the actual bundled/downloaded runtime library is
   Cisco's official binary for that exact version - the same approach
-  Firefox/Chromium use for the same reason. Getting the two builds' ABI to
+  Firefox/Chromium use for the same reason. Fetched over HTTPS and checked
+  against a SHA-256 hash pinned in `ffmpeg_path.rs` before use - both at
+  runtime (a dev build's own fallback) and in the release workflow itself,
+  since that same download becomes part of every shipped installer.
+  Getting the two builds' ABI to
   actually agree took real, verified work: openh264's own build bakes a
   *versioned* library name into what it produces (e.g. `libopenh264.so.8`,
   or an absolute `/build/path/libopenh264.8.dylib` on macOS) which won't
@@ -325,7 +329,10 @@ against something this project builds or fetches itself:
   auto-align's own internal vocal isolation, ~65MB too) and auto-align's
   own language models (~1.2GB *each*, one per language) both instead
   download on first use into a local cache, the same shape - so only what
-  a given run actually needs ever leaves the installer's fixed size.
+  a given run actually needs ever leaves the installer's fixed size. Every
+  one of these downloads (bundled or on-first-use) is checked against a
+  SHA-256 hash pinned in `mdx.rs`/`align.rs` before it's ever loaded into
+  ONNX Runtime (`model_assets::resolve_model` - see SECURITY.md).
 - **The ONNX Runtime shared library itself** (`onnxrt.rs`) - a separate
   concern from either ML model file, needed by both of the features above.
   Loaded via `ort`'s `load-dynamic` feature rather than linked in at build

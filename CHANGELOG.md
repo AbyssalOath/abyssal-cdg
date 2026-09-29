@@ -375,6 +375,34 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 - The timing table's Start/End fields were slightly too narrow to show a full
   `00:00.00` value without clipping it.
 
+### Security
+
+- **Path traversal via a shared project's title**: the export dialog's base filename
+  auto-filled from a project's `title` field with no sanitization, then flowed
+  straight into every export path - a crafted `.abyzl` project (title like
+  `/etc/cron.d/evil` or `../../../elsewhere`) could silently redirect exports outside
+  the folder actually picked in the dialog. Now reduced to `Path::file_name()` (see
+  `sanitize_export_base_name` in `main.rs`) before use.
+- **Crash on opening a lyric file with a `"nan"` value**: Rust's float parser accepts
+  the literal string `"nan"` (and `"inf"`/`"infinity"`) as a valid `f64`, and the LRC/
+  UltraStar/KOK importers didn't reject it - a resulting `NaN` timestamp or BPM would
+  panic one of four `partial_cmp(...).unwrap()` sorts the instant the file was opened.
+  All three importers now reject non-finite values, and all four sorts fall back to
+  `Ordering::Equal` instead of unwrapping, as a second line of defense.
+- **openh264 downloaded over plain HTTP**: `ffmpeg_path.rs`'s runtime fallback and
+  `release.yml`'s own build-time fetch (which bundles the result into every shipped
+  installer) both used `http://ciscobinary.openh264.org/...`. Both now use HTTPS.
+  Cisco's CDN confirmed to serve byte-identical content either way.
+- **No integrity check on any downloaded binary/model**: openh264 and all 11 ML
+  models (both vocal-isolation models, all 9 forced-alignment models, including the
+  6 sourced from `FinDIT-Studio` rather than an established uploader) are now checked
+  against a SHA-256 hash pinned in this app's own source right after downloading -
+  before the file is ever loaded into ONNX Runtime or `dlopen`'d as native code. A
+  mismatch deletes the file instead of caching it.
+- **Release/CI hardening**: every GitHub Actions release now publishes a
+  `SHA256SUMS.txt` alongside the installers, and every action `release.yml`/`ci.yml`
+  runs is pinned to a commit SHA rather than a mutable version tag.
+
 ## [0.1.0] - 2026-09-13
 
 Initial release.

@@ -108,6 +108,18 @@ impl MdxModel {
         }
     }
 
+    /// SHA-256 of the exact file at [`Self::download_url`] (verified
+    /// directly against a real download of each, not copied from an
+    /// unverified third-party source) - checked by `model_assets::resolve_model`
+    /// right after downloading, before this model is ever loaded into
+    /// ONNX Runtime.
+    pub fn download_sha256(self) -> &'static str {
+        match self {
+            Self::InstHq3 => "317554b07fe1ea5279a77f2b1520a41ea4b93432560c4ffd08792c30fddf9adc",
+            Self::KimVocal2 => "ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b",
+        }
+    }
+
     fn params(self) -> ModelParams {
         match self {
             Self::InstHq3 => ModelParams {

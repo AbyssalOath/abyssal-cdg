@@ -1,6 +1,6 @@
 [package]
 name = "abyssal-cdg"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["LordSodomiser"]
 description = "Turns an audio file and pasted lyrics into a real karaoke .cdg file"
@@ -77,6 +77,10 @@ unicode-normalization = "0.1"
 # for why this app downloads that specific binary rather than bundling a
 # self-compiled one).
 bzip2-rs = "0.1"
+# SHA-256 verification of downloaded binaries/models (openh264, the MDX-Net
+# separation models, the forced-alignment models) against a pinned hash -
+# see model_assets.rs.
+sha2 = "0.10"
 
 # Only does anything when targeting Windows (see build.rs) - embeds the app
 # icon into the compiled .exe itself, since `cargo packager` only sets the

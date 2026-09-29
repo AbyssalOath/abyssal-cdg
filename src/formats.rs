@@ -147,6 +147,17 @@ fn parse_lrc_time_tag(tag: &str) -> Option<f64> {
     let mm: f64 = mm.parse().ok()?;
     let rest_norm = rest.replacen(':', ".", 1);
     let ss: f64 = rest_norm.parse().ok()?;
+    // `f64::parse` accepts "nan"/"inf"/"infinity" (case-insensitive) as
+    // valid floats - `mm`'s own all-ASCII-digit check above already rules
+    // those out for the minutes part, but `ss` (the seconds/centiseconds
+    // part after the colon) has no equivalent guard, so a tag like
+    // `[00:nan]` would otherwise silently produce a NaN timestamp that
+    // poisons the `sort_by` a few lines down in `import_lrc` (`NaN.partial_cmp`
+    // is `None`, and that sort's `.unwrap()` panics on it) - same class of
+    // bug `lyrics::parse_timecode` already guards against for manual entry.
+    if !mm.is_finite() || !ss.is_finite() || mm < 0.0 || ss < 0.0 {
+        return None;
+    }
     Some(mm * 60.0 + ss)
 }
 
@@ -216,7 +227,7 @@ pub fn import_lrc(text: &str) -> Vec<LyricLine> {
         }
     }
 
-    entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut result = Vec::with_capacity(entries.len());
     for (i, (start, content)) in entries.iter().enumerate() {
@@ -299,12 +310,21 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
             // Some files use a comma as the decimal separator here too.
             bpm = v.trim().replace(',', ".").parse().ok();
         } else if let Some(v) = l.strip_prefix("#GAP:") {
-            gap_ms = v.trim().replace(',', ".").parse().unwrap_or(0.0);
+            // `f64::parse` accepts "nan"/"inf"/"infinity" (case-insensitive)
+            // as valid floats, so `.unwrap_or(0.0)` alone would not catch a
+            // `#GAP:nan` header - it only covers genuinely unparseable text.
+            let g: f64 = v.trim().replace(',', ".").parse().unwrap_or(0.0);
+            gap_ms = if g.is_finite() { g } else { 0.0 };
         }
     }
     let bpm =
         bpm.ok_or_else(|| "missing #BPM: header - not a recognizable UltraStar file".to_string())?;
-    if bpm <= 0.0 {
+    // `!bpm.is_finite()` catches "nan"/"inf"/"-inf" values, which `f64::parse`
+    // accepts as valid floats but which `bpm <= 0.0` alone would not reject
+    // (every comparison with NaN is `false`) - left unchecked, a NaN BPM
+    // propagates into every line's timing via `ultrastar_beat_to_secs` and
+    // poisons the NaN-sensitive `sort_by` this file uses elsewhere.
+    if !bpm.is_finite() || bpm <= 0.0 {
         return Err(format!("invalid #BPM: value ({bpm})"));
     }
 
@@ -541,7 +561,13 @@ pub fn export_ultrastar(
 /// KOK uses a comma as the decimal separator (the format originates from
 /// French karaoke software), not as a thousands separator.
 fn parse_kok_time(tok: &str) -> Option<f64> {
-    tok.trim().replacen(',', ".", 1).parse().ok()
+    let t: f64 = tok.trim().replacen(',', ".", 1).parse().ok()?;
+    // `f64::parse` accepts "nan"/"inf"/"infinity" (case-insensitive) as
+    // valid floats - a bare `nan` token in a timestamp slot would
+    // otherwise silently produce a NaN timestamp that poisons the
+    // `sort_by` in `import_kok` below (`NaN.partial_cmp` is `None`, and
+    // that sort's `.unwrap()` panics on it).
+    (t.is_finite() && t >= 0.0).then_some(t)
 }
 
 /// Imports a KOK file (`digits,digits;text;` word-timestamp pairs - see
@@ -570,7 +596,7 @@ pub fn import_kok(text: &str) -> Vec<LyricLine> {
         }
         i += 2;
     }
-    words.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    words.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     const MAX_WORDS_PER_LINE: usize = 10;
     const WORD_GAP_THRESHOLD: f64 = 1.2;
@@ -869,6 +895,20 @@ mod tests {
     }
 
     #[test]
+    fn import_ultrastar_rejects_nan_bpm() {
+        let text = "#BPM:nan\n#GAP:0\n: 0 4 0 Hi\nE";
+        let err = import_ultrastar(text).unwrap_err();
+        assert!(err.contains("invalid #BPM"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn import_ultrastar_treats_nan_gap_as_zero() {
+        let text = "#BPM:200\n#GAP:nan\n: 0 4 0 Hi\nE";
+        let lines = import_ultrastar(text).unwrap();
+        assert_eq!(lines[0].start, Some(0.0));
+    }
+
+    #[test]
     fn import_ultrastar_maps_player_markers_to_singer() {
         let text = "#BPM:200\n#GAP:0\nP1\n: 0 4 0 His \n: 4 4 0 line\n- 8\nP2\n: 8 4 0 Her \n: 12 4 0 line\nE";
         let lines = import_ultrastar(text).unwrap();
@@ -891,6 +931,27 @@ mod tests {
         assert!(all_words.contains("first"));
         assert!(all_words.contains("line"));
         assert_eq!(lines[0].start, Some(1.56));
+    }
+
+    #[test]
+    fn parse_kok_time_rejects_non_finite_and_negative_values() {
+        assert_eq!(parse_kok_time("1,56000"), Some(1.56));
+        assert_eq!(parse_kok_time("nan"), None);
+        assert_eq!(parse_kok_time("inf"), None);
+        assert_eq!(parse_kok_time("-1,0"), None);
+    }
+
+    #[test]
+    fn import_kok_skips_a_word_with_a_nan_timestamp() {
+        let text = "nan;bad;1,0;good;";
+        let lines = import_kok(text);
+        let all_words: String = lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!all_words.contains("bad"));
+        assert!(all_words.contains("good"));
     }
 
     #[test]

@@ -1012,7 +1012,7 @@ pub fn resolve_timing_with_settings(
         .iter()
         .filter_map(|l| l.start.map(|s| (s, l)))
         .collect();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut out = Vec::with_capacity(sorted.len());
     for i in 0..sorted.len() {

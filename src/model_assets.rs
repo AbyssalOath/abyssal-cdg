@@ -12,6 +12,7 @@
 //! safety net, not the shipped app's normal path.
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -80,7 +81,17 @@ pub(crate) fn user_cache_subdir(name: &str) -> Result<PathBuf> {
 /// at packaging time - see `bundled_resource_candidates`), trying bundled
 /// locations first, then a per-user cache - downloading it from
 /// `download_url` into that cache if it's not anywhere yet.
-pub fn resolve_model(filename: &str, download_url: &str) -> Result<PathBuf> {
+///
+/// A freshly downloaded file is checked against `expected_sha256` (lowercase
+/// hex) before being handed back, and deleted (never left in the cache for a
+/// future run to pick up) if it doesn't match - this is consumed as ONNX
+/// inference data, not executed as code, but a compromised/MITM'd download
+/// still means silently wrong output for whoever's audio gets run through
+/// it. A file already found bundled or already sitting in the cache from an
+/// earlier successful download is *not* re-hashed here - that would mean
+/// re-hashing a >1GB alignment model on every single use, for a check that
+/// only protects against tampering *during* the download itself.
+pub fn resolve_model(filename: &str, download_url: &str, expected_sha256: &str) -> Result<PathBuf> {
     for candidate in bundled_resource_candidates(&format!("models/{filename}")) {
         if candidate.is_file() {
             return Ok(candidate);
@@ -101,6 +112,10 @@ pub fn resolve_model(filename: &str, download_url: &str) -> Result<PathBuf> {
              in a dev build - a packaged release bundles it instead)"
         )
     })?;
+    if let Err(e) = verify_sha256(&cached, expected_sha256) {
+        let _ = std::fs::remove_file(&cached);
+        return Err(e);
+    }
     Ok(cached)
 }
 
@@ -134,6 +149,47 @@ pub(crate) fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// SHA-256 of `reader`'s full contents, as lowercase hex - shared by
+/// [`verify_sha256`] (checking a file already on disk) and this module's
+/// own tests (computing the expected hash of an in-memory fixture).
+fn sha256_hex(mut reader: impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 256 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .context("failed reading data for hash verification")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Checks that `path`'s contents match `expected_hex` (a lowercase or
+/// uppercase SHA-256 hex digest) - see [`resolve_model`] and
+/// `ffmpeg_path.rs`'s openh264 download for where this guards a network
+/// download before it's trusted (loaded as an ONNX model, or `dlopen`'d as
+/// native code).
+pub(crate) fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {} for hash verification", path.display()))?;
+    let actual = sha256_hex(file)?;
+    if !actual.eq_ignore_ascii_case(expected_hex) {
+        bail!(
+            "{} failed hash verification (expected {expected_hex}, got {actual}) - the download \
+             may be corrupted or tampered with",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,9 +214,99 @@ mod tests {
         let path = cache_dir.join(&name);
         std::fs::write(&path, b"fake model bytes").unwrap();
 
-        let found = resolve_model(&name, "https://example.invalid/unused").unwrap();
+        // A file already sitting in the cache is never re-hashed (see
+        // `resolve_model`'s docs), so an obviously-wrong hash here still
+        // succeeds - this test is specifically about the cache-hit path,
+        // not verification.
+        let found = resolve_model(&name, "https://example.invalid/unused", "0000").unwrap();
         assert_eq!(found, path);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_sha256_accepts_a_matching_hash_case_insensitively() {
+        let path =
+            std::env::temp_dir().join(format!("abyssal-cdg-test-hash-ok-{}", std::process::id()));
+        std::fs::write(&path, b"hello world").unwrap();
+        let expected = sha256_hex(b"hello world".as_slice()).unwrap();
+
+        assert!(verify_sha256(&path, &expected).is_ok());
+        assert!(verify_sha256(&path, &expected.to_uppercase()).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_sha256_rejects_a_mismatched_hash() {
+        let path =
+            std::env::temp_dir().join(format!("abyssal-cdg-test-hash-bad-{}", std::process::id()));
+        std::fs::write(&path, b"hello world").unwrap();
+
+        let err = verify_sha256(&path, &"0".repeat(64)).unwrap_err();
+        assert!(
+            err.to_string().contains("failed hash verification"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A minimal single-request HTTP/1.1 server for exercising the real
+    /// download path (`download_to_file`/`resolve_model`) without hitting
+    /// the network - binds an ephemeral port, serves `body` for exactly one
+    /// request, then exits.
+    fn spawn_test_http_server(body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn resolve_model_deletes_a_download_that_fails_hash_verification() {
+        let url = spawn_test_http_server(b"not the real model".to_vec());
+        let cache_dir = user_cache_subdir("models").unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let name = format!("abyssal-cdg-test-badhash-{}.onnx", std::process::id());
+        let cached_path = cache_dir.join(&name);
+        let _ = std::fs::remove_file(&cached_path);
+
+        let result = resolve_model(&name, &url, &"0".repeat(64));
+
+        assert!(result.is_err());
+        assert!(
+            !cached_path.is_file(),
+            "a download that fails verification must not be left in the cache"
+        );
+    }
+
+    #[test]
+    fn resolve_model_keeps_a_download_that_matches_its_pinned_hash() {
+        let body = b"the real model".to_vec();
+        let expected = sha256_hex(body.as_slice()).unwrap();
+        let url = spawn_test_http_server(body.clone());
+        let cache_dir = user_cache_subdir("models").unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let name = format!("abyssal-cdg-test-goodhash-{}.onnx", std::process::id());
+        let cached_path = cache_dir.join(&name);
+        let _ = std::fs::remove_file(&cached_path);
+
+        let found = resolve_model(&name, &url, &expected).unwrap();
+
+        assert_eq!(found, cached_path);
+        assert_eq!(std::fs::read(&cached_path).unwrap(), body);
+        let _ = std::fs::remove_file(&cached_path);
     }
 }

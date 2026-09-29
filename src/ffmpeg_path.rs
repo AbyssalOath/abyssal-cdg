@@ -74,18 +74,47 @@ fn openh264_filename() -> &'static str {
 /// [`OPENH264_VERSION`] here rather than derived from a pattern that
 /// might not hold for a future version bump).
 fn openh264_download_url() -> Option<&'static str> {
+    // Cisco's CDN (CloudFront/S3) serves the exact same file over HTTPS as
+    // over plain HTTP (verified: identical ETag on both), but this binary
+    // gets `dlopen`'d into this process afterward with no hash/signature
+    // check of its own, so fetching it over plain HTTP would let a
+    // network-level attacker swap in an arbitrary shared library.
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => {
-            Some("http://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2")
+            Some("https://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2")
         }
         ("macos", "aarch64") => {
-            Some("http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-arm64.dylib.bz2")
+            Some("https://ciscobinary.openh264.org/libopenh264-2.6.0-mac-arm64.dylib.bz2")
         }
         ("macos", "x86_64") => {
-            Some("http://ciscobinary.openh264.org/libopenh264-2.6.0-mac-x64.dylib.bz2")
+            Some("https://ciscobinary.openh264.org/libopenh264-2.6.0-mac-x64.dylib.bz2")
         }
         ("windows", "x86_64") => {
-            Some("http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2")
+            Some("https://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2")
+        }
+        _ => None,
+    }
+}
+
+/// SHA-256 of the exact `.bz2` file at [`openh264_download_url`] for this
+/// platform (verified directly against a real download of each, not
+/// copied from an unverified third-party source) - checked right after
+/// download, before the archive is decompressed and the result is
+/// `dlopen`'d into this process. HTTPS alone only protects the connection;
+/// this protects against a compromised/tricked CDN or origin as well.
+fn openh264_download_sha256() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => {
+            Some("27ab53323c110b76214c1c72222f459d17febbcd1e252136cadc292b0308d75b")
+        }
+        ("macos", "aarch64") => {
+            Some("6db362ee5abdab572311aeadb96d3f44b0617d9a4a4b9f4db4cb5ac4d968da71")
+        }
+        ("macos", "x86_64") => {
+            Some("38b2ed6d1d45b6a3e408c734173f2d67ab44a10d0e154ff3489b89877cd60e7e")
+        }
+        ("windows", "x86_64") => {
+            Some("dab5f2a872777f9a58b69bfa9fbcf20d9f82f2d6ec91383fd70bff49bd34ac9f")
         }
         _ => None,
     }
@@ -147,16 +176,29 @@ fn resolve_openh264() -> Result<PathBuf> {
              happen on the platforms this app actually ships for."
         );
     };
+    // Every platform in `openh264_download_url` has a matching pinned hash
+    // here - if this is ever `None` for a platform that *does* have a
+    // download URL, refuse rather than `dlopen`ing an unverified download.
+    let Some(expected_sha256) = openh264_download_sha256() else {
+        bail!(
+            "no pinned hash for the openh264 v{OPENH264_VERSION} download on this platform (see \
+             ffmpeg_path.rs) - refusing to download and load unverified native code."
+        );
+    };
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("failed to create {}", cache_dir.display()))?;
-    download_and_decompress_bz2(url, &cached)
+    download_and_decompress_bz2(url, expected_sha256, &cached)
         .with_context(|| format!("failed to download openh264 from {url}"))?;
     Ok(cached)
 }
 
-fn download_and_decompress_bz2(url: &str, dest: &Path) -> Result<()> {
+fn download_and_decompress_bz2(url: &str, expected_sha256: &str, dest: &Path) -> Result<()> {
     let compressed_path = dest.with_extension("bz2.part");
     model_assets::download_to_file(url, &compressed_path)?;
+    if let Err(e) = model_assets::verify_sha256(&compressed_path, expected_sha256) {
+        let _ = std::fs::remove_file(&compressed_path);
+        return Err(e);
+    }
 
     let compressed = std::fs::read(&compressed_path)
         .with_context(|| format!("failed to read {}", compressed_path.display()))?;
@@ -232,6 +274,39 @@ pub fn check_available() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn download_and_decompress_bz2_rejects_a_download_that_fails_hash_verification() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = b"not the real openh264 binary".to_vec();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        let url = format!("http://{addr}");
+        let dest =
+            std::env::temp_dir().join(format!("abyssal-cdg-test-openh264-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+
+        let result = download_and_decompress_bz2(&url, &"0".repeat(64), &dest);
+
+        assert!(result.is_err());
+        assert!(
+            !dest.is_file(),
+            "a download that fails verification must not be left on disk"
+        );
+        let _ = std::fs::remove_file(dest.with_extension("bz2.part"));
+    }
 
     /// Real end-to-end smoke test against a real bundled/cached ffmpeg +
     /// openh264 (this project's own custom LGPL build - see

@@ -183,6 +183,29 @@ impl AlignLanguage {
             Self::Cmn => "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-chinese-zh-cn-onnx/resolve/main/model.onnx",
         }
     }
+
+    /// SHA-256 of the exact file at [`Self::model_download_url`] (verified
+    /// directly against a real download of each, not copied from an
+    /// unverified third-party source) - checked by
+    /// `model_assets::resolve_model` right after downloading, before the
+    /// model is ever loaded into ONNX Runtime. This matters most for the
+    /// six `FinDIT-Studio` models (see the module docs on sourcing): a
+    /// pinned hash means a future compromise of that account or its
+    /// uploads can't silently swap in a different model file for someone
+    /// who already fetched the real one once.
+    fn model_sha256(self) -> &'static str {
+        match self {
+            Self::Eng => "1a80d8866149b1208c4a2bbf8eb19c1ed637d766e74a7514a421449ecfd3b674",
+            Self::Spa => "3478c4d9beeee5d5f46ef3be4b4cfb896bed6b2baf2498c0b98123a7878e406a",
+            Self::Fra => "a26a555381f6525fbdc155a94664d5eafa0dab48f6c0194d42afe423af7be02b",
+            Self::Deu => "ee286242d24b0b0a07112692cff8a1486fc0373f180b21e6b8c7470ec17a42a2",
+            Self::Ita => "4c07d4d3bc86ff0d52a16d60dae69ce6aa7b9cc8363fe3cdc61321eb4ee2cf0f",
+            Self::Por => "c101cedd8f9c5ade278e5ed8c698975b1f1048545e0eb29744786b0f7159d536",
+            Self::Jpn => "1157d2e1078392f6469e87993d879e3af569fb9754a443c539dd5886cfbd4c5e",
+            Self::Kor => "c43c01d7827bda6aaae60b04b722fea9a63399dd94b495166e4ddb529cf81a54",
+            Self::Cmn => "4e92f1d33b6bf89b709d5e4512a0c98dcaafd37a9bf7928452b05b01edb83029",
+        }
+    }
 }
 
 /// A loaded aligner for one audio file/language pair - decodes the audio
@@ -202,14 +225,17 @@ impl Aligner {
         let vocab = Vocab::parse(language.vocab_json())
             .with_context(|| format!("failed to parse {} vocab", language.label()))?;
 
-        let model_path =
-            model_assets::resolve_model(language.model_filename(), language.model_download_url())
-                .with_context(|| {
-                format!(
-                    "couldn't locate or download the {} alignment model",
-                    language.label()
-                )
-            })?;
+        let model_path = model_assets::resolve_model(
+            language.model_filename(),
+            language.model_download_url(),
+            language.model_sha256(),
+        )
+        .with_context(|| {
+            format!(
+                "couldn't locate or download the {} alignment model",
+                language.label()
+            )
+        })?;
         let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("failed to create an ONNX Runtime session builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)

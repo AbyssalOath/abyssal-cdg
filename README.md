@@ -84,10 +84,14 @@ things to know before you install:
 
 Neither warning means the download was tampered with; it's the standard
 "nobody paid Apple/Microsoft to vouch for this build" message every
-unsigned/unnotarized indie app shows. See
-[SECURITY.md](SECURITY.md) if you want to verify what a release actually
-does before running it - it's all open source, built by the same CI
-workflow that produced the artifact.
+unsigned/unnotarized indie app shows. Every release also publishes a
+`SHA256SUMS.txt` alongside the installers, so you can confirm your download
+matches what was actually built (`sha256sum -c` on Linux/macOS, or
+`Get-FileHash` on Windows) - this proves the file wasn't corrupted or
+swapped in transit, though it's not a substitute for the paid code signing
+this project doesn't have. See [SECURITY.md](SECURITY.md) if you want to
+verify what a release actually does before running it - it's all open
+source, built by the same CI workflow that produced the artifact.
 
 ## Building
 

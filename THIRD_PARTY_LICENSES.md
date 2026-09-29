@@ -50,9 +50,10 @@ for exactly which is which and how each is located at runtime.
   compiled and discarded during the build, never distributed - see
   `scripts/build-ffmpeg.sh`), but the actual `libopenh264` shared library
   bundled with the app is Cisco's own official binary for the exact same
-  version (`ffmpeg_path.rs`), downloaded from
-  <http://ciscobinary.openh264.org/> - preserving that patent coverage,
-  the same approach Firefox and Chromium use for the same reason.
+  version (`ffmpeg_path.rs`), downloaded over HTTPS from
+  <https://ciscobinary.openh264.org/> and checked against a pinned SHA-256
+  hash before use - preserving that patent coverage, the same approach
+  Firefox and Chromium use for the same reason.
 
 ### LAME (statically linked into this project's ffmpeg build, for MP3 encoding)
 
@@ -149,6 +150,7 @@ file to stay current on its own.
     primitives crate embeds a fallback font under OFL-1.1/the Ubuntu Font License -
     same permissive font-license family already used for this project's own bundled
     fonts, see "Bundled binaries and models" above)
+(Apache-2.0 OR MIT) AND Unicode-3.0 (1): unicode-ident
 0BSD OR Apache-2.0 (1): audio-codec-algorithms
 0BSD OR Apache-2.0 OR MIT (1): adler2
 Apache-2.0 (15): ab_glyph, ab_glyph_rasterizer, codespan-reporting, cpal, gethostname, glutin, glutin_egl_sys, glutin_glx_sys, glutin_wgl_sys, hound, oboe, oboe-sys, owned_ttf_parser, spirv, winit
@@ -160,7 +162,7 @@ Apache-2.0 OR BSD-3-Clause OR MIT (2): num_enum, num_enum_derive
 Apache-2.0 OR CC0-1.0 (1): imgref
 Apache-2.0 OR ISC OR MIT (1): rustls
 Apache-2.0 OR LGPL-2.1-or-later OR MIT (2): r-efi, r-efi
-Apache-2.0 OR MIT (312): (see `cargo license` for the full list - too long to usefully inline; includes ort, ndarray, rustfft, realfft, rubato, hound, bzip2-rs, ureq, dirs, unicode-normalization, serde, egui_commonmark, egui_extras, and most of the rest of this project's direct dependencies)
+Apache-2.0 OR MIT (313): (see `cargo license` for the full list - too long to usefully inline; includes ort, ndarray, rustfft, realfft, rubato, hound, bzip2-rs, ureq, dirs, unicode-normalization, serde, egui_commonmark, egui_extras, sha2, and most of the rest of this project's direct dependencies)
 Apache-2.0 OR MIT OR Zlib (18): bytemuck, bytemuck_derive, cursor-icon, dispatch2, glow, miniz_oxide, objc2-app-kit, objc2-core-foundation, objc2-core-graphics, objc2-io-surface, raw-window-handle, raw-window-handle, tinyvec, visibility, xkeysym, zune-core, zune-inflate, zune-jpeg
 BSD-2-Clause (3): av1-grain, rav1e, v_frame
 BSD-3-Clause (5): avif-serialize, exr, lebe, ravif, subtle

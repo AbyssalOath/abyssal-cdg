@@ -149,6 +149,30 @@ fn faded_color(color: egui::Color32, alpha: f32) -> egui::Color32 {
     )
 }
 
+/// Reduces `base` to a plain filename with no path components, for safe
+/// use as the shared base name every export output path is built from
+/// (`{base}.cdg`, `{base}.mp4`, ...) - security-relevant, not just
+/// tidiness: `export_base_name` can be auto-filled from the project's own
+/// `title` field (see `open_export_dialog`), which comes straight from a
+/// `.abyzl` project file with no validation, and project files are
+/// explicitly meant to be shared between users. Without this, a crafted
+/// title like "/etc/cron.d/evil" or "../../../elsewhere" would let a
+/// shared project file silently redirect every export output to an
+/// arbitrary location instead of the folder actually picked in the
+/// export dialog. `Path::file_name()` already strips any directory
+/// components/traversal *and* discards an absolute-path override
+/// entirely (it only ever returns the final component, never lets one
+/// path override another's root) - falls back to `"karaoke"` (this app's
+/// own existing default) if nothing usable is left after that.
+fn sanitize_export_base_name(base: &str) -> String {
+    Path::new(base.trim())
+        .file_name()
+        .and_then(|f| f.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("karaoke")
+        .to_string()
+}
+
 /// Which timestamp clicking a word in the fine-tune panel sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum WordTapMode {
@@ -2332,7 +2356,7 @@ impl KaraokeApp {
             .enumerate()
             .filter_map(|(i, l)| l.start.map(|s| (i, s)))
             .collect();
-        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut timed = Vec::with_capacity(sorted.len());
         let mut indices = Vec::with_capacity(sorted.len());
@@ -2581,6 +2605,7 @@ impl KaraokeApp {
                     let t = self.title.trim();
                     (!t.is_empty()).then(|| t.to_string())
                 })
+                .map(|s| sanitize_export_base_name(&s))
                 .unwrap_or_else(|| "karaoke".to_string());
         }
         self.show_export_dialog = true;
@@ -2942,8 +2967,16 @@ impl KaraokeApp {
             self.status = "Choose an output folder first.".to_string();
             return;
         };
-        let base = self.export_base_name.trim();
-        let base = if base.is_empty() { "karaoke" } else { base }.to_string();
+        // Sanitized here, not just at the auto-fill above - `title` (one
+        // of that auto-fill's own sources) comes straight from a `.abyzl`
+        // project file with no validation, and a project file is
+        // explicitly meant to be shared between users. Without this, a
+        // crafted title like "/etc/cron.d/evil" or "../../../elsewhere"
+        // would silently redirect every export output to an arbitrary
+        // location instead of the folder actually picked below, the
+        // moment someone opens a shared project and clicks Export without
+        // noticing/editing the pre-filled name.
+        let base = sanitize_export_base_name(self.export_base_name.trim());
 
         let audio_path = self
             .audio
@@ -6129,6 +6162,44 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_export_base_name_strips_directory_components_and_traversal() {
+        // The actual attack this defends against: a project file's `title`
+        // (which export_base_name can be auto-filled from) pointing
+        // straight at an absolute path or a traversal sequence, which -
+        // unsanitized - would let a shared .abyzl project file redirect
+        // every export output away from the folder actually picked.
+        assert_eq!(
+            sanitize_export_base_name("/etc/cron.d/evil"),
+            "evil",
+            "an absolute path must be reduced to just its final component"
+        );
+        assert_eq!(
+            sanitize_export_base_name("../../../elsewhere"),
+            "elsewhere",
+            "a relative traversal sequence must be reduced to just its final component"
+        );
+        assert_eq!(
+            sanitize_export_base_name("foo/../bar"),
+            "bar",
+            "traversal in the middle of a path must still only keep the final component"
+        );
+    }
+
+    #[test]
+    fn sanitize_export_base_name_falls_back_to_karaoke_when_nothing_usable_remains() {
+        assert_eq!(sanitize_export_base_name(""), "karaoke");
+        assert_eq!(sanitize_export_base_name("   "), "karaoke");
+        assert_eq!(sanitize_export_base_name("/"), "karaoke");
+        assert_eq!(sanitize_export_base_name(".."), "karaoke");
+    }
+
+    #[test]
+    fn sanitize_export_base_name_leaves_an_ordinary_name_untouched() {
+        assert_eq!(sanitize_export_base_name("My Song Title"), "My Song Title");
+        assert_eq!(sanitize_export_base_name("  spaced out  "), "spaced out");
+    }
 
     #[test]
     fn parses_artist_and_title_from_the_expected_naming_scheme() {
