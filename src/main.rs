@@ -1308,7 +1308,19 @@ impl KaraokeApp {
     /// silently carry over between projects before `apply_project_file`
     /// was fixed to reset them - reconstructing the whole struct the same
     /// way startup does can't have the same kind of gap, by construction.
+    ///
+    /// The autosave slot is cleared first, specifically so `KaraokeApp::new`
+    /// doesn't immediately find its own leftover autosave and mistake it
+    /// for a crash to recover from: by the time this runs, the caller
+    /// (`request_new_project`) has already established that whatever was
+    /// open is either fully saved or explicitly OK to discard, so there's
+    /// nothing left that still needs recovering. Without this, the
+    /// still-on-disk autosave from the periodic 30s timer (never cleared by
+    /// "Save Project" itself, which writes to a completely different file)
+    /// would trigger the "Recover previous session?" prompt on every New
+    /// Project, even right after an explicit save.
     fn start_new_project(&mut self) {
+        project::clear_autosave(APP_ID);
         *self = KaraokeApp::new();
     }
 
