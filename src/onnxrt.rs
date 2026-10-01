@@ -120,8 +120,16 @@ fn load() -> Result<()> {
 }
 
 fn commit(path: &std::path::Path) -> Result<()> {
+    // `{e:?}` (Debug), not `{e}` (Display): `ort::LoadDynamicError::Dlopen`'s
+    // own Display only ever prints "dlopen failed" (and its `source()`
+    // override is the default, so it isn't exposed through anyhow's error
+    // chain either) - the real OS-level reason (wrong architecture, invalid
+    // code signature, file not found, ...) only shows up in `libloading`'s
+    // `Debug` output, which recurses into the actual `dlerror()` message.
+    // Losing that detail turns every real-world dlopen failure report into
+    // "dlopen failed" with nothing to diagnose from.
     ort::init_from(path)
-        .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime from {}: {e}", path.display()))?
+        .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime from {}: {e:?}", path.display()))?
         .commit();
     Ok(())
 }

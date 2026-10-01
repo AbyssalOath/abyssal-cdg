@@ -147,5 +147,28 @@ depends = ["libgtk-3-0", "libasound2", "libx11-6", "libxkbcommon0", "libfontconf
 # doesn't remove the Gatekeeper prompt (that still needs the README's
 # workaround, or a paid Developer ID + notarization, neither set up here)
 # - it only makes the arm64 build launchable at all in the first place.
+#
+# `entitlements`: cargo-packager ad-hoc-signs every Mach-O it finds in the
+# bundle *with the hardened runtime flag* (`codesign --options runtime`,
+# unconditional on its side, not something this config can turn off) -
+# which then enforces "library validation" on every one of those binaries:
+# a signed executable may only load a dylib signed by Apple or by its own
+# exact Team ID. Two ad-hoc signatures never share a Team ID (ad-hoc means
+# *no* Team ID), so this app's own `ffmpeg` refused to load the bundled
+# `libopenh264.dylib` at runtime ("different Team IDs") the same way this
+# app's own main executable refused to `dlopen` the bundled ONNX Runtime -
+# confirmed on a real Apple Silicon Mac, not guessed. Since every binary
+# this project bundles is either ad-hoc signed by this same build (ffmpeg,
+# the main executable) or a third party's own separately-signed official
+# release (Cisco's openh264, Microsoft's ONNX Runtime) that will never
+# carry *this* project's Team ID either way, library validation can never
+# actually pass here regardless of which binary is involved - so it's
+# disabled outright via this entitlement, applied uniformly since
+# cargo-packager passes the same entitlements file to every codesign call
+# it makes. This doesn't weaken anything the ad-hoc signature itself was
+# providing (AMFI's "something is signed" launch requirement, above) - it
+# only removes a same-Team-ID check that was never satisfiable in the
+# first place for an app with no paid Developer ID.
 [package.metadata.packager.macos]
 signing-identity = "-"
+entitlements = "assets/macos/entitlements.plist"
