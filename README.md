@@ -179,6 +179,11 @@ cargo test
   limitations/ideas for extending it.
 - [ARCHITECTURE.md](ARCHITECTURE.md) - module layout, data flow, and the
   design decisions behind the two export pipelines.
+- [docs/LEARN_THE_CODE.md](docs/LEARN_THE_CODE.md) - a longer, code-level
+  walkthrough of how every file actually works, with pointers to real
+  functions/structs, end-to-end deep dives, and practice exercises - also
+  built into the app's own in-app Codex. Start here if `ARCHITECTURE.md`'s
+  overview isn't enough and you want to read or change the source itself.
 - [CONTRIBUTING.md](CONTRIBUTING.md) - dev setup, coding conventions, and
   how to propose changes (including new lyric-file format support).
 - [SECURITY.md](SECURITY.md) - this app's attack surface and how to report

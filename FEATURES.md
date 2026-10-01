@@ -155,8 +155,9 @@ carrying over whatever the previous project had selected.
   blockier, more legible - closer to real commercial karaoke discs) when
   it's short enough to fit, automatically falling back to normal size for
   longer lines so nothing clips off-screen.
-- **`.mp4`** is a real video file (H.264 + AAC, at your choice of 1080p or
-  4K) with proper anti-aliased text - this is the "looks like a modern
+- **`.mp4`** is a real video file (AV1 by default, H.264 selectable for
+  compatibility - see "Known limitations" below - plus AAC audio, at
+  your choice of 1080p or 4K) with proper anti-aliased text - this is the "looks like a modern
   KaraFun/karadeo.com video" option, and it has no resolution ceiling at
   all. It's a much heavier file and needs `ffmpeg` (bundled with an
   installed copy of the app - see the README's Building section for a dev
@@ -464,10 +465,6 @@ folder-based player/game library.
   audio instead of guessing. The estimate's constants live at the top of
   `src/lyrics.rs` (`SECONDS_PER_WORD`, `MIN_SING_DURATION`) if you want to
   tune the default instead.
-- The countdown indicator triggers automatically whenever the estimated
-  leftover gap before the next line is at least 5 seconds
-  (`COUNTDOWN_GAP_THRESHOLD` in `src/lyrics.rs`); there's no manual override
-  if you want it to show up on a shorter gap.
 - The timeline's waveform backdrop is drawn from the *loaded audio file*,
   not the exported `.cdg`/`.mp4` - it's purely a visual aid for aligning
   bubbles against actual vocal onsets, not a preview of anything in the
@@ -502,18 +499,21 @@ folder-based player/game library.
   (`UVR-MDX-NET-Inst_HQ_3.onnx`) - there's no in-app way to pick a
   different separation model or tune its parameters (segment size,
   overlap, etc.) yet.
-- Exported `.mp4` video is H.264 via the bundled `openh264` encoder (see
-  `ffmpeg_path.rs` for why: LGPL-only, no x264) at a fixed bitrate
-  (`video_bitrate` in `src/video.rs` - currently 5M for 1080p, 14M for 4K,
-  sized for this app's own content: mostly-static lyric text over a still
-  or slow-moving background, not fast-motion footage). openh264 has no
-  real CRF-style "target a quality level, let file size float" mode to
-  replace that fixed number with, so file size can only be tuned by
-  guessing a better constant, not genuinely optimized. Swapping the
-  encoder to AV1 (e.g. via SVT-AV1, BSD-2-Clause-Patent - license-
-  compatible with this project the same way `dav1d` is for AV1 decoding)
-  would give real quality-targeted encoding and meaningfully smaller files
-  at equal quality, at the cost of a comparable-sized new from-source
-  build step across all 4 release platforms, slower encodes, and a small
-  AV1-in-MP4 playback-compatibility gap on older devices/editors - not
-  done yet, just scoped.
+- Exported `.mp4` video defaults to **AV1** (via the bundled SVT-AV1
+  encoder, BSD-2-Clause-Patent - see `src/video.rs`), a real
+  quality-targeted (CRF) encoder: one `crf` value (32, picked for this
+  app's own mostly-static lyric-text-over-a-background content) gives
+  consistent perceptual quality regardless of resolution, with no
+  per-resolution bitrate guessing needed, and meaningfully smaller files
+  than H.264 at equal quality. **H.264** (via the bundled `openh264`
+  encoder - see `ffmpeg_path.rs` for why openh264 rather than the
+  GPL-licensed x264 most ffmpeg builds default to) is kept selectable in
+  the export dialog for compatibility - older devices/software, or a
+  downstream tool that expects H.264 specifically. Unlike AV1, openh264
+  has no CRF-style "target a quality level, let file size float" mode, so
+  the H.264 option uses a fixed bitrate (`src/video.rs` - 5M for 1080p,
+  14M for 4K, already tuned down once against real exports to avoid
+  needlessly huge files for this app's low-motion content) rather than
+  genuinely optimized encoding. The export dialog discloses this
+  trade-off next to the codec picker rather than silently encoding
+  whichever one is default.

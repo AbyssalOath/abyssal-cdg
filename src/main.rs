@@ -448,7 +448,7 @@ struct KaraokeApp {
     /// Whether the in-app documentation ("Codex") window is open - see
     /// `codex.rs`/`draw_codex`.
     codex_open: bool,
-    /// Index into [`codex::ARTICLES`] of the currently-shown article.
+    /// Index into [`codex::all_articles`] of the currently-shown article.
     codex_selected: usize,
     /// `egui_commonmark`'s own per-viewer cache (parsed markdown, loaded
     /// images) - kept across frames so re-rendering the same article every
@@ -2658,7 +2658,7 @@ impl KaraokeApp {
     /// Draws the in-app documentation ("Codex") window, if open - a
     /// category/article sidebar plus a `CommonMarkViewer`-rendered main
     /// area. See `codex.rs`'s own module docs for what's in
-    /// [`codex::ARTICLES`] and why.
+    /// [`codex::all_articles`] and why.
     fn draw_codex(&mut self, ctx: &egui::Context) {
         if !self.codex_open {
             return;
@@ -2670,20 +2670,20 @@ impl KaraokeApp {
             .show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
-                        ui.set_width(180.0);
+                        ui.set_width(200.0);
                         egui::ScrollArea::vertical()
                             .id_source("codex_nav_scroll")
                             .show(ui, |ui| {
                                 // Grouped by category, in the fixed order
                                 // each category's first article appears in
-                                // `codex::ARTICLES` - a real category
+                                // `codex::all_articles` - a real category
                                 // picker (independent of article order)
-                                // isn't worth it yet for five single-
-                                // article categories; revisit once
-                                // "Internals" splits one category across
-                                // several articles.
+                                // isn't worth it yet; every category today
+                                // is still either one article, or (just
+                                // "Learn the Code") a handful of chapters
+                                // in their natural reading order.
                                 let mut last_category = "";
-                                for (i, article) in codex::ARTICLES.iter().enumerate() {
+                                for (i, article) in codex::all_articles().iter().enumerate() {
                                     if article.category != last_category {
                                         ui.add_space(if last_category.is_empty() {
                                             0.0
@@ -2704,7 +2704,7 @@ impl KaraokeApp {
                         .id_source("codex_article_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            if let Some(article) = codex::ARTICLES.get(self.codex_selected) {
+                            if let Some(article) = codex::all_articles().get(self.codex_selected) {
                                 egui_commonmark::CommonMarkViewer::new("codex_article").show(
                                     ui,
                                     &mut self.codex_cache,

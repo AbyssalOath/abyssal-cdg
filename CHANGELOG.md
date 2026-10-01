@@ -9,6 +9,14 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ### Added
 
+- **"Learn the Code" developer guide**: a new code-level, file-by-file walkthrough of
+  how this app actually works (`docs/LEARN_THE_CODE.md`), covering the full pipeline,
+  every module's purpose/key types/call graph/non-obvious gotchas, the DSP/ML ideas
+  behind vocal separation and forced alignment, cross-module data flow and threading,
+  end-to-end deep dives, and learning aids (Rust concepts used, how-to recipes,
+  practice exercises). Also wired into the in-app Codex as a new "Learn the Code"
+  category, split into one chapter per section automatically from that same file - one
+  source of truth in both places, not a second copy to drift out of sync.
 - **Configurable timing settings**: a "Timing" panel (right sidebar) lets you tune the
   word-pace estimate (seconds per word, and a minimum floor for very short lines) and
   the "get ready" countdown's gap threshold, instead of the fixed values every line

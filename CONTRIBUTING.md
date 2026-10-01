@@ -49,6 +49,9 @@ an old Rust toolchain, not a bug in this project.
   through the same overlap validation where applicable.
 - Update [CHANGELOG.md](CHANGELOG.md) under `## [Unreleased]` (add that heading at the
   top if it doesn't exist yet).
+- If you added, removed, or significantly changed what a module does, update
+  [docs/LEARN_THE_CODE.md](docs/LEARN_THE_CODE.md) too - see "Keeping Learn the Code
+  up to date" below for exactly what that means and how it reaches the in-app Codex.
 - If you added, removed, or updated a Cargo dependency, regenerate the crate license
   list in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) (`cargo license
   --avoid-dev-deps --avoid-build-deps`, see that file for the exact invocation) and
@@ -79,6 +82,41 @@ silently produce wrong timing. If you want to add support for either (or any oth
 format), the most useful thing you can attach to the PR is a real sample file (or a
 link to the format's actual spec) to verify the parser against - a guess dressed up as
 a parser is worse than no parser.
+
+## Keeping `Learn the Code` up to date
+
+[docs/LEARN_THE_CODE.md](docs/LEARN_THE_CODE.md) is a code-level, file-by-file guide to
+how this app works, kept as **one file, two renderings** - it's both a normal Markdown
+doc (readable on GitHub as-is) and, automatically, a set of chapters in the app's own
+in-app Codex (`src/codex.rs`'s `all_articles()` splits it on `## ` headings into one
+Codex article per chapter, under a "Learn the Code" category). There's no second copy
+to update separately and no code change needed in `codex.rs` for a new chapter - adding
+a `## Some New Chapter` heading to the file is enough for it to show up in the app the
+next time it's built.
+
+What this means for a real change:
+
+- **Added, removed, or substantially changed a module?** Find (or add) that module's
+  section - each one follows the same shape: purpose, key structs/enums/functions,
+  what calls it and what it calls, and any non-obvious design decisions or gotchas.
+  Keep that shape for consistency with the rest of the guide.
+- **Changed a cross-module relationship** (a new dependency between files, a new
+  shared type, a new background job)? Check the "How the Modules Talk" chapter's
+  dependency graph and background-job pattern section - these are meant to reflect
+  every real `use crate::...`/`crate::module::...` reference in the source, not a
+  one-time snapshot.
+- **Only use level-2 (`## `) headings for real chapter boundaries.** Anything inside a
+  chapter - subsections, the per-file breakdowns - must use `### ` or deeper, never
+  `## `, or it will silently split into its own separate Codex article instead of
+  staying part of the chapter it belongs to (see `src/codex.rs`'s own tests for exactly
+  how this split works, and its own doc comment for *why* it's done this way rather
+  than keeping the whole guide as one long article).
+- **Verify every specific claim against the real source before writing it down** -
+  function/struct names, constants, call sites. A guide that's confidently wrong is
+  worse than no guide; if you're not sure, say so in the text rather than guess.
+- After editing, `cargo build && cargo test` (the embedded copy is checked by
+  `codex.rs`'s own tests, which will fail if the file becomes unparseable) - there's
+  nothing else to wire up.
 
 ## Reporting bugs
 
