@@ -149,7 +149,25 @@ jobs:
             openh264_arch: x86_64
             openh264_dl_url: https://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2
             openh264_sha256: dab5f2a872777f9a58b69bfa9fbcf20d9f82f2d6ec91383fd70bff49bd34ac9f
-            ffmpeg_configure_extra: "--target-os=mingw32 --arch=x86_64"
+            # -static: this ffmpeg is built via MSYS2/MinGW (UCRT64 below),
+            # which by default dynamically links against the toolchain's own
+            # runtime DLLs (libstdc++-6.dll, libgcc_s_seh-1.dll,
+            # libwinpthread-1.dll) - present on this build runner (it's an
+            # MSYS2 environment) but not on a normal end-user Windows
+            # machine, which has never installed MSYS2/MinGW. Without this,
+            # the shipped ffmpeg.exe fails to start at all on a real user's
+            # machine - confirmed directly: it exits non-zero with *no*
+            # stdout/stderr at all (a loader-level missing-DLL failure
+            # happens before ffmpeg's own code, including its own error
+            # reporting, ever runs), exactly what a real Windows user hit.
+            # `-static` is the standard fix for distributing a MinGW-built
+            # .exe as a single file - it statically links the whole MinGW
+            # runtime chain instead, so the only DLLs this exe still depends
+            # on are core Windows system ones, always present everywhere.
+            # This is unrelated to - and doesn't affect - this project's
+            # deliberately *dynamic* link to libopenh264.dll (see the module
+            # docs in ffmpeg_path.rs for why that one stays dynamic).
+            ffmpeg_configure_extra: '--target-os=mingw32 --arch=x86_64 --extra-ldflags="-static -static-libgcc -static-libstdc++"'
 
     runs-on: ${{ matrix.platform }}
     # The macOS x86_64 from-source ONNX Runtime build is the slow one here
