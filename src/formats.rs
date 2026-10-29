@@ -33,6 +33,59 @@ use crate::lyrics::{LyricLine, Singer, TimedLine};
 /// [`crate::lyrics::parse_pasted_lyrics`]).
 const IMPORTED_BLOCK_GAP_THRESHOLD: f64 = 6.0;
 
+/// How far before the next line's start an imported line's estimated end
+/// is placed - see [`estimate_imported_sing_duration`].
+const IMPORTED_END_LEAD_SECS: f64 = 0.2;
+
+/// Generous per-word ceiling on an imported line's estimated singing time,
+/// for formats that only give a line's start - stops a line right before a
+/// long instrumental break from being estimated to last the whole break.
+/// Deliberately much looser than [`crate::lyrics::SECONDS_PER_WORD`]: the
+/// estimate is meant to cover slow/held lines too, since auto-align then
+/// narrows it down within that window.
+const IMPORTED_MAX_SECS_PER_WORD: f64 = 1.0;
+
+/// Floor for that same ceiling, so a one- or two-word line isn't capped
+/// shorter than a typical held phrase.
+const IMPORTED_MIN_SING_SECS: f64 = 2.0;
+
+/// Best-effort guess at how long an imported line is sung, in seconds from
+/// `start`, for formats with no real end time of their own - stored as
+/// [`LyricLine::estimated_sing_duration`], so it's an "auto" estimate (not
+/// a manual end) that's still much closer than a bare word count.
+///
+/// - With per-word times (`last_word` = the last word's start and text),
+///   the line ends shortly after its last word starts.
+/// - With only a line start, it runs up to just before the next line's
+///   start (`next_start`), capped by a generous words-per-second limit.
+///   Without a next line there's nothing better to go on than the plain
+///   word-count estimate, so this returns `None`.
+///
+/// Either way it never runs past [`IMPORTED_END_LEAD_SECS`] before the next
+/// line starts.
+fn estimate_imported_sing_duration(
+    start: f64,
+    word_count: usize,
+    last_word: Option<(f64, &str)>,
+    next_start: Option<f64>,
+) -> Option<f64> {
+    let ceiling = next_start.map(|n| n - start - IMPORTED_END_LEAD_SECS);
+    let dur = match last_word {
+        Some((word_start, word)) => {
+            let word_len = (word.chars().count() as f64 * 0.1).clamp(0.4, 2.0);
+            let dur = word_start - start + word_len;
+            // Never cut off before the last word has even started.
+            let floor = word_start - start + 0.05;
+            ceiling.map_or(dur, |c| dur.min(c)).max(floor)
+        }
+        None => {
+            let cap = (word_count as f64 * IMPORTED_MAX_SECS_PER_WORD).max(IMPORTED_MIN_SING_SECS);
+            ceiling?.min(cap)
+        }
+    };
+    (dur.is_finite() && dur > 0.05).then_some(dur)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LyricFormat {
     PlainText,
@@ -231,7 +284,7 @@ pub fn import_lrc(text: &str) -> Vec<LyricLine> {
 
     let mut result = Vec::with_capacity(entries.len());
     for (i, (start, content)) in entries.iter().enumerate() {
-        let (text_only, word_times) = parse_lrc2_inline_tags(content);
+        let (text_only, mut word_times) = parse_lrc2_inline_tags(content);
         let trimmed = text_only.trim();
         if trimmed.is_empty() {
             continue;
@@ -239,8 +292,34 @@ pub fn import_lrc(text: &str) -> Vec<LyricLine> {
         let mut line = LyricLine::new(trimmed);
         line.start = Some(*start);
         line.starts_new_block = i == 0 || is_new_block(entries[i - 1].0, *start);
-        if word_times.len() == line.word_overrides.len() {
+        let word_count = line.word_overrides.len();
+        // Enhanced LRC commonly puts one extra tag after the last word,
+        // marking when the line ends - a real end time, not a guess.
+        if word_count > 0 && word_times.len() == word_count + 1 {
+            let end = word_times.pop().unwrap();
+            if end > word_times[word_count - 1] {
+                line.sing_end_override = Some(end);
+            }
+        }
+        let has_word_times = word_times.len() == word_count;
+        if has_word_times {
             line.word_overrides = word_times.into_iter().map(Some).collect();
+        }
+        if line.sing_end_override.is_none() {
+            // Blank timed lines (instrumental markers) still count as "the
+            // next line" here - they're exactly where singing stops.
+            let next_start = entries.get(i + 1).map(|e| e.0);
+            let last_word = if has_word_times {
+                line.word_overrides
+                    .last()
+                    .copied()
+                    .flatten()
+                    .zip(line.words().last().copied())
+            } else {
+                None
+            };
+            line.estimated_sing_duration =
+                estimate_imported_sing_duration(*start, word_count, last_word, next_start);
         }
         result.push(line);
     }
@@ -333,22 +412,24 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
         word_times: Vec<f64>,
         at_word_start: bool,
         start: f64,
+        /// When the latest note seen so far finishes (start + length) -
+        /// the line's real sung end once every note has been read.
+        end: Option<f64>,
         singer: Singer,
     }
 
-    let mut lines: Vec<(f64, String, Vec<f64>, Singer)> = Vec::new();
+    let mut lines: Vec<PendingLine> = Vec::new();
     let mut current: Option<PendingLine> = None;
     // No `P`-marker seen yet - `Default` rather than an explicit `Male`, so
     // a plain (non-duet) UltraStar file that never uses player markers at
     // all doesn't make the app think every line was manually assigned.
     let mut current_singer = Singer::Default;
 
-    let finish = |current: &mut Option<PendingLine>,
-                  out: &mut Vec<(f64, String, Vec<f64>, Singer)>| {
-        if let Some(p) = current.take() {
-            let trimmed = p.text.trim_end().to_string();
-            if !trimmed.is_empty() {
-                out.push((p.start, trimmed, p.word_times, p.singer));
+    let finish = |current: &mut Option<PendingLine>, out: &mut Vec<PendingLine>| {
+        if let Some(mut p) = current.take() {
+            p.text.truncate(p.text.trim_end().len());
+            if !p.text.is_empty() {
+                out.push(p);
             }
         }
     };
@@ -410,8 +491,14 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
         let Some(start_beat) = rest[0].parse::<f64>().ok() else {
             continue;
         };
-        // rest[1] = length (unused), rest[2] = pitch (parsed to confirm
-        // shape, then intentionally discarded - see module docs).
+        // rest[1] = length in beats (gives the note's end - the line's
+        // real sung end is its last note's), rest[2] = pitch (parsed to
+        // confirm shape, then intentionally discarded - see module docs).
+        let note_end = rest[1]
+            .parse::<f64>()
+            .ok()
+            .filter(|len| len.is_finite() && *len >= 0.0)
+            .map(|len| ultrastar_beat_to_secs(start_beat + len, bpm, gap_ms));
         let _pitch: Option<i32> = rest[2].parse().ok();
         let syllable = rest[3].trim_end_matches(['\r']).to_string();
         let start_secs = ultrastar_beat_to_secs(start_beat, bpm, gap_ms);
@@ -423,6 +510,7 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
                     word_times: vec![start_secs],
                     at_word_start: syllable.ends_with(' '),
                     start: start_secs,
+                    end: note_end,
                     singer: current_singer,
                 });
             }
@@ -430,6 +518,10 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
                 if p.at_word_start {
                     p.word_times.push(start_secs);
                 }
+                p.end = match (p.end, note_end) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
                 p.text.push_str(&syllable);
                 p.at_word_start = syllable.ends_with(' ') || p.text.ends_with(' ');
             }
@@ -438,13 +530,15 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
     finish(&mut current, &mut lines);
 
     let mut result = Vec::with_capacity(lines.len());
-    for (i, (start, text, word_times, singer)) in lines.iter().enumerate() {
-        let mut line = LyricLine::new(text.as_str());
-        line.start = Some(*start);
-        line.singer = *singer;
-        line.starts_new_block = i == 0 || is_new_block(lines[i - 1].0, *start);
-        if word_times.len() == line.word_overrides.len() {
-            line.word_overrides = word_times.iter().map(|t| Some(*t)).collect();
+    for (i, p) in lines.iter().enumerate() {
+        let mut line = LyricLine::new(p.text.as_str());
+        line.start = Some(p.start);
+        line.singer = p.singer;
+        // Real note data, not a guess - stored as an actual end time.
+        line.sing_end_override = p.end.filter(|e| *e > p.start);
+        line.starts_new_block = i == 0 || is_new_block(lines[i - 1].start, p.start);
+        if p.word_times.len() == line.word_overrides.len() {
+            line.word_overrides = p.word_times.iter().map(|t| Some(*t)).collect();
         }
         result.push(line);
     }
@@ -635,9 +729,20 @@ pub fn import_kok(text: &str) -> Vec<LyricLine> {
             let prev_end = line_groups[i - 1].last().unwrap().0;
             is_new_block(prev_end, start)
         };
-        if group.len() == line.word_overrides.len() {
+        let has_word_times = group.len() == line.word_overrides.len();
+        if has_word_times {
             line.word_overrides = group.iter().map(|(t, _)| Some(*t)).collect();
         }
+        let next_start = line_groups.get(i + 1).map(|g| g[0].0);
+        let last_word = has_word_times
+            .then(|| group.last().map(|(t, w)| (*t, w.as_str())))
+            .flatten();
+        line.estimated_sing_duration = estimate_imported_sing_duration(
+            start,
+            line.word_overrides.len(),
+            last_word,
+            next_start,
+        );
         result.push(line);
     }
     result
@@ -974,5 +1079,85 @@ mod tests {
     fn import_plain_text_matches_native_parser() {
         let text = "a\nb\n\nc";
         assert_eq!(import_plain_text(text).len(), 3);
+    }
+
+    // --- imported end-time estimates ---------------------------------------
+
+    fn assert_close(actual: Option<f64>, expected: f64) {
+        let a = actual.expect("expected Some estimate");
+        assert!((a - expected).abs() < 1e-6, "expected {expected}, got {a}");
+    }
+
+    #[test]
+    fn import_lrc1_estimates_end_just_before_next_line() {
+        let lines = import_lrc("[00:10.00]one two three\n[00:13.00]four five");
+        // 3s gap minus the lead, under the 3-word cap of 3s.
+        assert_close(lines[0].estimated_sing_duration, 2.8);
+        assert_eq!(lines[0].sing_end_override, None);
+        // Last line: no next line to bound it - falls back to the default.
+        assert_eq!(lines[1].estimated_sing_duration, None);
+    }
+
+    #[test]
+    fn import_lrc1_estimate_is_capped_before_a_long_break() {
+        let lines = import_lrc("[00:10.00]hi there\n[00:40.00]next line");
+        assert_close(lines[0].estimated_sing_duration, IMPORTED_MIN_SING_SECS);
+    }
+
+    #[test]
+    fn import_lrc1_blank_timed_line_marks_where_singing_stops() {
+        let lines = import_lrc("[00:10.00]one two three four\n[00:12.00]\n[00:30.00]next");
+        assert_eq!(lines.len(), 2);
+        assert_close(lines[0].estimated_sing_duration, 1.8);
+    }
+
+    #[test]
+    fn import_lrc2_estimates_end_shortly_after_the_last_word() {
+        let lines = import_lrc("[00:10.00]<00:10.00>Hello <00:11.00>world\n[00:20.00]next");
+        // Last word starts 1.0s in; "world" (5 chars) gets 0.5s.
+        assert_close(lines[0].estimated_sing_duration, 1.5);
+        assert_eq!(lines[0].sing_end_override, None);
+    }
+
+    #[test]
+    fn import_lrc2_trailing_tag_is_a_real_line_end() {
+        let lines =
+            import_lrc("[00:10.00]<00:10.00>Hello <00:11.00>world <00:12.50>\n[00:20.00]next");
+        assert_eq!(lines[0].word_overrides, vec![Some(10.0), Some(11.0)]);
+        assert_eq!(lines[0].sing_end_override, Some(12.5));
+        assert_eq!(lines[0].estimated_sing_duration, None);
+    }
+
+    #[test]
+    fn import_ultrastar_stores_last_note_end_as_real_end() {
+        let text = "#BPM:200\n#GAP:0\n\
+                     : 0 4 0 Hel\n\
+                     : 4 4 0 lo \n\
+                     : 8 6 0 world\n\
+                     - 16\n\
+                     : 16 4 0 Bye\n\
+                     E";
+        let lines = import_ultrastar(text).unwrap();
+        // Last note: beat 8 + 6 = 14 -> 14 * 60 / 800 = 1.05s.
+        assert_close(lines[0].sing_end_override, 1.05);
+        // beat 16 + 4 = 20 -> 1.5s.
+        assert_close(lines[1].sing_end_override, 1.5);
+    }
+
+    #[test]
+    fn import_kok_estimates_end_from_last_word() {
+        // Two lines split by a long pause.
+        let text = "1,00000;One ;1,50000;two;10,00000;Three;";
+        let lines = import_kok(text);
+        assert_eq!(lines.len(), 2);
+        // Last word "two" starts 0.5s in, gets the 0.4s minimum.
+        assert_close(lines[0].estimated_sing_duration, 0.9);
+    }
+
+    #[test]
+    fn estimate_never_ends_before_the_last_word_starts() {
+        // Next line starts almost immediately after the last word.
+        let est = estimate_imported_sing_duration(10.0, 2, Some((11.0, "word")), Some(11.1));
+        assert_close(est, 1.05);
     }
 }

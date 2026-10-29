@@ -71,15 +71,13 @@ fn parse_artist_title_from_filename(path: &Path) -> Option<(String, String)> {
 }
 
 /// Applies one checkbox click in the timing table's selection column to
-/// `selected`/`anchor` - standard file-browser-style multi-select
-/// semantics: a plain click selects just this line (replacing whatever was
-/// selected); Shift-click extends the selection to every line between the
-/// anchor and this one (inclusive, in either direction), replacing the
-/// selection with that range rather than adding to it; Ctrl/Cmd-click
-/// toggles just this line's membership without touching the rest. Either
-/// modifier moves the anchor to `i` afterward, so a Shift-click chain
-/// extends from wherever you last clicked, not always from the very first
-/// click. A free function (rather than a `KaraokeApp` method) purely so it
+/// `selected`/`anchor` - plain checkbox semantics: a click toggles just
+/// this line's membership without touching the rest, so several lines can
+/// be ticked one by one; Shift-click selects every line between the anchor
+/// and this one (inclusive, in either direction), replacing the selection
+/// with that range rather than adding to it. Every click moves the anchor
+/// to `i` afterward, so a Shift-click chain extends from wherever you last
+/// clicked, not always from the very first click. A free function (rather than a `KaraokeApp` method) purely so it
 /// can be unit-tested directly, the same way `parse_artist_title_from_filename`
 /// above is.
 fn apply_row_selection_click(
@@ -87,18 +85,12 @@ fn apply_row_selection_click(
     anchor: &mut Option<usize>,
     i: usize,
     shift: bool,
-    cmd: bool,
 ) {
     if shift {
         let a = anchor.unwrap_or(i);
         let (lo, hi) = (a.min(i), a.max(i));
         *selected = (lo..=hi).collect();
-    } else if cmd {
-        if !selected.remove(&i) {
-            selected.insert(i);
-        }
-    } else {
-        selected.clear();
+    } else if !selected.remove(&i) {
         selected.insert(i);
     }
     *anchor = Some(i);
@@ -304,6 +296,11 @@ struct KaraokeApp {
     /// there's less to horizontally scroll through to reach the Singer/
     /// Countdown/action columns.
     compact_timing_table: bool,
+    /// Whether the live preview is shown in its own separate, resizable
+    /// window (see [`KaraokeApp::show_preview_window`]) instead of the
+    /// right panel. Session-only like `compact_timing_table` - not saved,
+    /// so the app never opens with an extra window you didn't just ask for.
+    preview_popped_out: bool,
     /// Line index + in-progress text while a start-time field in the
     /// timing table is focused - `None` the rest of the time, so the
     /// displayed text otherwise always mirrors the line's live value.
@@ -618,9 +615,10 @@ impl ColorPreset {
     /// applied once, alongside the colors, by `apply_color_preset` (see
     /// `fonts.rs`'s `BUNDLED_FONTS` docs for why "Nosifer" specifically is
     /// bundled rather than a system font lookup). `None` for every other
-    /// preset: they intentionally leave whatever font is already selected
-    /// alone, the same "set it now, don't keep enforcing it" behavior the
-    /// colors themselves already have.
+    /// preset: switching to one resets the font to the default only if the
+    /// current font came from a preset, and otherwise leaves the user's own
+    /// choice alone - the same "set it now, don't keep enforcing it"
+    /// behavior the colors themselves already have.
     fn default_font(self) -> Option<&'static str> {
         match self {
             Self::Abyssal => Some("Nosifer"),
@@ -676,6 +674,16 @@ const UNDO_HISTORY_LIMIT: usize = 100;
 /// enough lead-in to hear the transition, not so much that you're waiting
 /// through unrelated audio to get back to what you just changed.
 const AUDITION_REWIND_SECS: f64 = 2.0;
+
+/// The live preview's height (in points) at which its fixed pixel sizes
+/// (countdown dots, small gaps) were tuned - the preview's old maximum size
+/// (480x270). Above this, `draw_preview` scales them up proportionally.
+const PREVIEW_BASE_HEIGHT: f32 = 270.0;
+
+/// The 16:9 widths (in physical pixels) the live preview's background
+/// texture can be rendered at - see `draw_preview`. Capped at 1080p, which
+/// is more than any realistic preview panel/window needs.
+const PREVIEW_BG_WIDTHS: [usize; 4] = [480, 960, 1440, 1920];
 
 /// Key the custom lyric font is registered under in egui's font system -
 /// both the `font_data` entry and the `FontFamily::Name` that references
@@ -751,6 +759,7 @@ impl KaraokeApp {
             word_tap_mode: WordTapMode::default(),
             auto_follow_words: true,
             compact_timing_table: false,
+            preview_popped_out: false,
             start_edit: None,
             end_edit: None,
             selected_lines: std::collections::BTreeSet::new(),
@@ -916,8 +925,23 @@ impl KaraokeApp {
         self.color_screaming_unsung = color32_from_cdg(p.screaming_unsung);
         self.color_screaming_highlight = color32_from_cdg(p.screaming_highlight);
         self.color_preset = preset;
-        if let Some(font_name) = preset.default_font() {
-            self.selected_font_family = Some(font_name.to_string());
+        // A preset without its own font only resets the font if the current
+        // one is some preset's bundled default (e.g. Nosifer left over from
+        // Abyssal) - a font the user picked themselves is left alone. Checks
+        // every preset rather than just the previous one, since loading a
+        // project resets `color_preset` without touching the font.
+        let current_is_preset_font = self.selected_font_family.as_deref().is_some_and(|f| {
+            ALL_COLOR_PRESETS
+                .iter()
+                .any(|p| p.default_font() == Some(f))
+        });
+        let new_font = match preset.default_font() {
+            Some(font_name) => Some(Some(font_name.to_string())),
+            None if current_is_preset_font => Some(None),
+            None => None,
+        };
+        if let Some(font) = new_font {
+            self.selected_font_family = font;
             self.font_bytes = None;
             self.font_load_error = None;
         }
@@ -1638,7 +1662,8 @@ impl KaraokeApp {
     }
 
     /// Rebuilds the live preview's background texture if it's stale (i.e.
-    /// doesn't match `self.background` anymore). A no-op most frames -
+    /// doesn't match `self.background` anymore, or was rendered at a
+    /// different `w`x`h` than now requested). A no-op most frames -
     /// decoding an image or extracting a video's poster frame only happens
     /// once per background selection, not once per frame. A failed load
     /// (a moved/deleted file, an unreadable video, ...) is cached too - as
@@ -1651,7 +1676,9 @@ impl KaraokeApp {
         };
         let fit = self.background_fit;
         let color = self.color_bg;
-        if matches!(&self.background_preview, Some((cached, cached_fit, cached_color, _)) if *cached == bg && *cached_fit == fit && *cached_color == color)
+        // A failed load (`None` texture) counts as matching any size, so a
+        // panel resize doesn't retry it.
+        if matches!(&self.background_preview, Some((cached, cached_fit, cached_color, tex)) if *cached == bg && *cached_fit == fit && *cached_color == color && tex.as_ref().is_none_or(|t| t.size() == [w, h]))
         {
             return;
         }
@@ -2495,6 +2522,7 @@ impl KaraokeApp {
         for l in &mut self.lines {
             l.start = None;
             l.sing_end_override = None;
+            l.estimated_sing_duration = None;
         }
         self.next_untimed = 0;
         self.tap_phase = TapPhase::Start;
@@ -3305,6 +3333,142 @@ impl KaraokeApp {
         }
     }
 
+    /// Shows the popped-out preview as its own native window (an egui
+    /// "immediate" viewport - drawn as part of the main window's own frame,
+    /// so it repaints in step with it during playback with no extra
+    /// syncing). Letterboxed to 16:9 on black, so it can be resized or
+    /// maximized to any shape. Closing the window docks the preview back
+    /// into the right panel.
+    fn show_preview_window(&mut self, ctx: &egui::Context) {
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Abyssal CDG Creator - Preview")
+            .with_inner_size([960.0, 540.0])
+            .with_min_inner_size([320.0, 180.0]);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("preview_window"),
+            builder,
+            |ctx, class| {
+                if class == egui::ViewportClass::Embedded {
+                    // Backend without multi-window support - fall back to
+                    // a floating window inside the main one.
+                    let mut open = true;
+                    egui::Window::new("Preview")
+                        .open(&mut open)
+                        .resizable(true)
+                        .default_size([640.0, 360.0])
+                        .show(ctx, |ui| {
+                            let h = ui.available_height();
+                            self.draw_preview(ui, Some(h));
+                        });
+                    if !open {
+                        self.preview_popped_out = false;
+                    }
+                    return;
+                }
+
+                self.handle_keyboard_shortcuts(ctx);
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+                    .show(ctx, |ui| {
+                        let avail = ui.available_size();
+                        let height = avail.x.min(avail.y * 16.0 / 9.0) * 9.0 / 16.0;
+                        ui.add_space(((avail.y - height) / 2.0).max(0.0));
+                        ui.vertical_centered(|ui| self.draw_preview(ui, Some(avail.y)));
+                    });
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    self.preview_popped_out = false;
+                }
+            },
+        );
+    }
+
+    /// The app's keyboard shortcuts (save, tap/play, seek, undo/redo,
+    /// singer keys). Called for the main window and, while it's open, for
+    /// the popped-out preview window too - `ctx.input` only ever sees the
+    /// window currently being drawn's own key presses, so a press is
+    /// handled exactly once, by whichever window had focus. That keeps
+    /// tapping along with Space working while you watch the big preview.
+    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        // Ctrl+S / Ctrl+Shift+S save the project - unlike the shortcuts
+        // below, these are safe to fire even while a text field has focus,
+        // the same way most apps let Ctrl+S through while you're typing.
+        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+            self.save_project();
+        }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+            self.save_project_as_dialog();
+        }
+
+        // Keyboard shortcuts - only when no text field etc. has focus, so
+        // typing a space in the lyrics box or title/artist fields doesn't
+        // accidentally trigger a tap.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if !typing {
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                // Once there's nothing left to tap (no lyrics parsed yet,
+                // or every line already has both a start and an end),
+                // Space drives playback instead - much less hunting for the
+                // mouse while fine-tuning with the timeline/word panel.
+                if self.next_untimed >= self.lines.len() {
+                    self.toggle_play_pause();
+                } else {
+                    self.tap_next();
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                if let Some(a) = &mut self.audio {
+                    let target = (a.position() - 2.0).max(0.0);
+                    let _ = a.seek(target);
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                if let Some(a) = &mut self.audio {
+                    let target = a.position() + 2.0;
+                    let _ = a.seek(target);
+                }
+            }
+            // Undo/redo - gated the same way as the shortcuts above (not
+            // while a text field has focus, so a field's own native
+            // undo/redo isn't stolen by this), and additionally not
+            // mid-drag on the timeline, where applying a snapshot from
+            // before the drag started would fight with the drag still
+            // updating state every frame.
+            if self.timeline_drag.is_none() {
+                if ctx.input(|i| {
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z)
+                }) {
+                    self.undo();
+                }
+                if ctx.input(|i| {
+                    (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
+                        || (i.modifiers.command && i.key_pressed(egui::Key::Y))
+                }) {
+                    self.redo();
+                }
+            }
+            // Singer assignment - M/F/D/S set the voice of whichever line
+            // is next up to tap (mid-tapping) or, once everything's timed,
+            // whichever line the fine-tune-words panel is following - so a
+            // duet/multi-voice song's singer switches can be set with the
+            // same "hands stay on the keyboard while playing" flow as
+            // tapping itself, without reaching for each line's dropdown.
+            // Plain presses only (`!modifiers.command`), so this can't
+            // fire as a side effect of e.g. Ctrl+S.
+            if ctx.input(|i| i.key_pressed(egui::Key::M) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Male);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Female);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::D) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Duet);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Screaming);
+            }
+        }
+    }
+
     /// Draws the live "what will this look like" preview: a mock TV screen
     /// showing exactly what the exported CDG will show at the current
     /// playback position (or position 0 if nothing is playing). When a
@@ -3312,19 +3476,38 @@ impl KaraokeApp {
     /// else here too, so legibility can be judged without exporting first -
     /// though a background video shows a single representative frame here
     /// rather than true playback (see [`video::extract_video_background_thumbnail`]).
-    fn draw_preview(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// Fills the available width at 16:9; `max_height`, when given (the
+    /// popped-out preview window), also caps it to fit that height.
+    fn draw_preview(&mut self, ui: &mut egui::Ui, max_height: Option<f32>) {
         let t = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
         let (timed, _total) = self.resolved();
         let card_end = export::title_card_end(&timed);
 
-        let width = ui.available_width().min(480.0);
+        // Fills whatever width it's given (the right panel can be dragged
+        // wide), always 16:9. Text sizes below are already proportional to
+        // `height`; `s` scales the few remaining fixed pixel sizes (countdown
+        // dots, small gaps) and never drops below 1.0, so a preview at or
+        // below the panel's default width looks exactly as it always has.
+        let width = match max_height {
+            Some(h) => ui.available_width().min(h * 16.0 / 9.0),
+            None => ui.available_width(),
+        };
         let height = width * 9.0 / 16.0;
+        let s = (height / PREVIEW_BASE_HEIGHT).max(1.0);
 
-        // A fixed, modest resolution for the preview background - it's
-        // scaled up to whatever `width`x`height` ends up being when drawn,
-        // and doesn't need to match the export's real resolution.
-        const PREVIEW_BG_SIZE: (usize, usize) = (480, 270);
-        self.ensure_background_preview(ui.ctx(), PREVIEW_BG_SIZE.0, PREVIEW_BG_SIZE.1);
+        // The background texture is rendered at the smallest of a few fixed
+        // 16:9 resolutions that covers the preview's on-screen pixel width,
+        // rather than one that tracks it exactly - so dragging the panel
+        // only re-decodes the background when crossing a step, not every
+        // frame of the drag.
+        let px_width = width * ui.ctx().pixels_per_point();
+        let bg_width = PREVIEW_BG_WIDTHS
+            .iter()
+            .copied()
+            .find(|&w| w as f32 >= px_width)
+            .unwrap_or(PREVIEW_BG_WIDTHS[PREVIEW_BG_WIDTHS.len() - 1]);
+        self.ensure_background_preview(ui.ctx(), bg_width, bg_width * 9 / 16);
 
         let (rect, _response) =
             ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -3392,7 +3575,7 @@ impl KaraokeApp {
                         );
                     }
                     if !legend_singers.is_empty() {
-                        ui.add_space(6.0);
+                        ui.add_space(6.0 * s);
                         // Built as a single multi-colored label (rather than a
                         // `ui.horizontal` of separate labels) so
                         // `vertical_centered` centers the whole legend as one
@@ -3421,7 +3604,7 @@ impl KaraokeApp {
                         ui.label(job);
                     }
                     if self.show_credit_line {
-                        ui.add_space(10.0);
+                        ui.add_space(10.0 * s);
                         ui.colored_label(
                             self.color_preview,
                             egui::RichText::new(video::CREDIT_TEXT).size(height * 0.028),
@@ -3448,9 +3631,9 @@ impl KaraokeApp {
                                     .clamp(0.0, 1.0);
                                 let lit = ((frac * 4.0).floor() as i32 + 1).clamp(0, 4) as usize;
                                 let (_, highlight) = self.singer_colors(first.singer);
-                                ui.add_space(10.0);
+                                ui.add_space(10.0 * s);
                                 ui.horizontal(|ui| {
-                                    ui.add_space(width / 2.0 - 40.0);
+                                    ui.add_space(width / 2.0 - 40.0 * s);
                                     for dot in 0..4 {
                                         let color = if dot < lit {
                                             highlight
@@ -3458,11 +3641,11 @@ impl KaraokeApp {
                                             self.color_preview
                                         };
                                         let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(14.0, 14.0),
+                                            egui::vec2(14.0 * s, 14.0 * s),
                                             egui::Sense::hover(),
                                         );
-                                        ui.painter().circle_filled(rect.center(), 6.0, color);
-                                        ui.add_space(8.0);
+                                        ui.painter().circle_filled(rect.center(), 6.0 * s, color);
+                                        ui.add_space(8.0 * s);
                                     }
                                 });
 
@@ -3478,7 +3661,7 @@ impl KaraokeApp {
                                     .unwrap_or_else(|| vec![0]);
                                 let lyric_family = self.lyric_font_family();
                                 let reveal_alpha = lyrics::reveal_fade_alpha(cd_start, t);
-                                ui.add_space(10.0);
+                                ui.add_space(10.0 * s);
                                 if reveal_alpha > 0.0 {
                                     for &idx in &block {
                                         let line = &timed[idx];
@@ -3573,7 +3756,7 @@ impl KaraokeApp {
                                     .unwrap_or(current_line.singer);
                                 let (_, next_highlight) = self.singer_colors(next_singer);
                                 ui.horizontal(|ui| {
-                                    ui.add_space(width / 2.0 - 40.0);
+                                    ui.add_space(width / 2.0 - 40.0 * s);
                                     for dot in 0..4 {
                                         let color = if dot < lit {
                                             next_highlight
@@ -3581,14 +3764,14 @@ impl KaraokeApp {
                                             self.color_preview
                                         };
                                         let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(14.0, 14.0),
+                                            egui::vec2(14.0 * s, 14.0 * s),
                                             egui::Sense::hover(),
                                         );
-                                        ui.painter().circle_filled(rect.center(), 6.0, color);
-                                        ui.add_space(8.0);
+                                        ui.painter().circle_filled(rect.center(), 6.0 * s, color);
+                                        ui.add_space(8.0 * s);
                                     }
                                 });
-                                ui.add_space(10.0);
+                                ui.add_space(10.0 * s);
 
                                 // A real gap almost always falls at a
                                 // verse/chorus boundary, so the line being
@@ -3861,12 +4044,12 @@ impl KaraokeApp {
                             }
                         }
 
-                        ui.add_space(8.0);
+                        ui.add_space(8.0 * s);
                     }
                     None => {
                         ui.label(
                             egui::RichText::new("♪")
-                                .size(28.0)
+                                .size(28.0 * s)
                                 .color(self.color_preview),
                         );
                     }
@@ -4524,84 +4707,7 @@ impl eframe::App for KaraokeApp {
         self.ensure_egui_font_installed(ctx);
         self.auto_follow_word_tap_line();
 
-        // Ctrl+S / Ctrl+Shift+S save the project - unlike the shortcuts
-        // below, these are safe to fire even while a text field has focus,
-        // the same way most apps let Ctrl+S through while you're typing.
-        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
-            self.save_project();
-        }
-        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
-            self.save_project_as_dialog();
-        }
-
-        // Keyboard shortcuts - only when no text field etc. has focus, so
-        // typing a space in the lyrics box or title/artist fields doesn't
-        // accidentally trigger a tap.
-        let typing = ctx.memory(|m| m.focused().is_some());
-        if !typing {
-            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-                // Once there's nothing left to tap (no lyrics parsed yet,
-                // or every line already has both a start and an end),
-                // Space drives playback instead - much less hunting for the
-                // mouse while fine-tuning with the timeline/word panel.
-                if self.next_untimed >= self.lines.len() {
-                    self.toggle_play_pause();
-                } else {
-                    self.tap_next();
-                }
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                if let Some(a) = &mut self.audio {
-                    let target = (a.position() - 2.0).max(0.0);
-                    let _ = a.seek(target);
-                }
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                if let Some(a) = &mut self.audio {
-                    let target = a.position() + 2.0;
-                    let _ = a.seek(target);
-                }
-            }
-            // Undo/redo - gated the same way as the shortcuts above (not
-            // while a text field has focus, so a field's own native
-            // undo/redo isn't stolen by this), and additionally not
-            // mid-drag on the timeline, where applying a snapshot from
-            // before the drag started would fight with the drag still
-            // updating state every frame.
-            if self.timeline_drag.is_none() {
-                if ctx.input(|i| {
-                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z)
-                }) {
-                    self.undo();
-                }
-                if ctx.input(|i| {
-                    (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
-                        || (i.modifiers.command && i.key_pressed(egui::Key::Y))
-                }) {
-                    self.redo();
-                }
-            }
-            // Singer assignment - M/F/D/S set the voice of whichever line
-            // is next up to tap (mid-tapping) or, once everything's timed,
-            // whichever line the fine-tune-words panel is following - so a
-            // duet/multi-voice song's singer switches can be set with the
-            // same "hands stay on the keyboard while playing" flow as
-            // tapping itself, without reaching for each line's dropdown.
-            // Plain presses only (`!modifiers.command`), so this can't
-            // fire as a side effect of e.g. Ctrl+S.
-            if ctx.input(|i| i.key_pressed(egui::Key::M) && !i.modifiers.command) {
-                self.assign_singer_to_current_line(Singer::Male);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.command) {
-                self.assign_singer_to_current_line(Singer::Female);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::D) && !i.modifiers.command) {
-                self.assign_singer_to_current_line(Singer::Duet);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command) {
-                self.assign_singer_to_current_line(Singer::Screaming);
-            }
-        }
+        self.handle_keyboard_shortcuts(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -4960,16 +5066,46 @@ impl eframe::App for KaraokeApp {
                 });
             });
 
+        // Max width tracks the window so the panel can be dragged wide for a
+        // bigger preview, while always leaving room for the timing table.
+        let preview_panel_max = (ctx.screen_rect().width() * 0.65).max(560.0);
         egui::SidePanel::right("colors_preview_panel")
             .resizable(true)
             .default_width(340.0)
-            .width_range(260.0..=560.0)
+            .width_range(260.0..=preview_panel_max)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_source("right_panel_scroll")
                     .show(ui, |ui| {
-                        ui.label("4. Preview (matches the exported file):");
-                        self.draw_preview(ui);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("4. Preview (matches the exported file):");
+                            let label = if self.preview_popped_out {
+                                "Bring back"
+                            } else {
+                                "Pop out"
+                            };
+                            if ui
+                                .button(label)
+                                .on_hover_text(
+                                    "Show the preview in its own window you can resize or \
+                                     maximize - keyboard shortcuts keep working there.",
+                                )
+                                .clicked()
+                            {
+                                self.preview_popped_out = !self.preview_popped_out;
+                            }
+                        });
+                        if self.preview_popped_out {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Showing in its own window - close it or click \
+                                     \"Bring back\" to return it here.",
+                                )
+                                .weak(),
+                            );
+                        } else {
+                            self.draw_preview(ui, None);
+                        }
                         ui.add_space(10.0);
                         ui.separator();
                         egui::CollapsingHeader::new("Colors")
@@ -5650,8 +5786,8 @@ impl eframe::App for KaraokeApp {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Click a row's checkbox to select it - Shift-click for a range, \
-                         Ctrl/Cmd-click to add/remove one at a time.",
+                        "Click rows' checkboxes to select/deselect them one at a time - \
+                         Shift-click for a range.",
                     )
                     .small()
                     .weak(),
@@ -5699,7 +5835,7 @@ impl eframe::App for KaraokeApp {
                     let mut clear_idx: Option<usize> = None;
                     let mut commit_start: Option<(usize, String)> = None;
                     let mut commit_end: Option<(usize, String)> = None;
-                    let mut selection_click: Option<(usize, bool, bool)> = None;
+                    let mut selection_click: Option<(usize, bool)> = None;
 
                     // Both grids below use this same minimum row height,
                     // so the sticky checkbox column's rows can't drift out
@@ -5734,13 +5870,12 @@ impl eframe::App for KaraokeApp {
                                 #[allow(clippy::needless_range_loop)]
                                 for i in 0..self.lines.len() {
                                     // See `apply_row_selection_click` for
-                                    // the shift/ctrl-click semantics.
+                                    // the click/shift-click semantics.
                                     let mut checked = self.selected_lines.contains(&i);
                                     let checkbox_resp = ui.checkbox(&mut checked, "");
                                     if checkbox_resp.clicked() {
                                         let shift = ui.input(|inp| inp.modifiers.shift);
-                                        let cmd = ui.input(|inp| inp.modifiers.command);
-                                        selection_click = Some((i, shift, cmd));
+                                        selection_click = Some((i, shift));
                                     }
                                     ui.end_row();
                                 }
@@ -6044,13 +6179,12 @@ impl eframe::App for KaraokeApp {
                             });
                     });
 
-                    if let Some((i, shift, cmd)) = selection_click {
+                    if let Some((i, shift)) = selection_click {
                                 apply_row_selection_click(
                                     &mut self.selected_lines,
                                     &mut self.selection_anchor,
                                     i,
                                     shift,
-                                    cmd,
                                 );
                             }
                             if let Some(i) = retap_idx {
@@ -6121,6 +6255,10 @@ impl eframe::App for KaraokeApp {
                             }
                 });
         });
+
+        if self.preview_popped_out {
+            self.show_preview_window(ctx);
+        }
 
         // Record undo history for whatever changed this frame - see
         // `track_undo_history` for why a timeline drag or a focused text
@@ -6255,25 +6393,27 @@ mod tests {
     // --- apply_row_selection_click ---------------------------------------
 
     #[test]
-    fn plain_click_selects_only_that_line() {
-        let mut selected = std::collections::BTreeSet::from([0, 1, 2]);
-        let mut anchor = Some(0);
-        apply_row_selection_click(&mut selected, &mut anchor, 5, false, false);
-        assert_eq!(selected, std::collections::BTreeSet::from([5]));
-        assert_eq!(anchor, Some(5));
+    fn plain_clicks_accumulate_a_multi_line_selection() {
+        let mut selected = std::collections::BTreeSet::new();
+        let mut anchor = None;
+        apply_row_selection_click(&mut selected, &mut anchor, 1, false);
+        apply_row_selection_click(&mut selected, &mut anchor, 4, false);
+        apply_row_selection_click(&mut selected, &mut anchor, 9, false);
+        assert_eq!(selected, std::collections::BTreeSet::from([1, 4, 9]));
+        assert_eq!(anchor, Some(9));
     }
 
     #[test]
     fn shift_click_selects_the_inclusive_range_from_the_anchor() {
         let mut selected = std::collections::BTreeSet::new();
         let mut anchor = Some(2);
-        apply_row_selection_click(&mut selected, &mut anchor, 5, true, false);
+        apply_row_selection_click(&mut selected, &mut anchor, 5, true);
         assert_eq!(selected, std::collections::BTreeSet::from([2, 3, 4, 5]));
 
         // Works in either direction (clicking above the anchor, not just below).
         let mut anchor2 = Some(5);
         let mut selected2 = std::collections::BTreeSet::new();
-        apply_row_selection_click(&mut selected2, &mut anchor2, 2, true, false);
+        apply_row_selection_click(&mut selected2, &mut anchor2, 2, true);
         assert_eq!(selected2, std::collections::BTreeSet::from([2, 3, 4, 5]));
     }
 
@@ -6281,7 +6421,7 @@ mod tests {
     fn shift_click_replaces_rather_than_extends_a_prior_selection() {
         let mut selected = std::collections::BTreeSet::from([0, 10, 20]);
         let mut anchor = Some(0);
-        apply_row_selection_click(&mut selected, &mut anchor, 2, true, false);
+        apply_row_selection_click(&mut selected, &mut anchor, 2, true);
         assert_eq!(selected, std::collections::BTreeSet::from([0, 1, 2]));
     }
 
@@ -6289,22 +6429,22 @@ mod tests {
     fn shift_click_with_no_prior_anchor_just_selects_the_clicked_line() {
         let mut selected = std::collections::BTreeSet::new();
         let mut anchor = None;
-        apply_row_selection_click(&mut selected, &mut anchor, 3, true, false);
+        apply_row_selection_click(&mut selected, &mut anchor, 3, true);
         assert_eq!(selected, std::collections::BTreeSet::from([3]));
         assert_eq!(anchor, Some(3));
     }
 
     #[test]
-    fn cmd_click_toggles_one_line_without_touching_the_rest() {
+    fn plain_click_toggles_one_line_without_touching_the_rest() {
         let mut selected = std::collections::BTreeSet::from([1, 2]);
         let mut anchor = Some(2);
 
         // Not selected yet -> adds it.
-        apply_row_selection_click(&mut selected, &mut anchor, 5, false, true);
+        apply_row_selection_click(&mut selected, &mut anchor, 5, false);
         assert_eq!(selected, std::collections::BTreeSet::from([1, 2, 5]));
 
         // Already selected -> removes just that one.
-        apply_row_selection_click(&mut selected, &mut anchor, 2, false, true);
+        apply_row_selection_click(&mut selected, &mut anchor, 2, false);
         assert_eq!(selected, std::collections::BTreeSet::from([1, 5]));
     }
 
@@ -6312,7 +6452,7 @@ mod tests {
     fn any_click_moves_the_anchor_to_the_clicked_line() {
         let mut selected = std::collections::BTreeSet::new();
         let mut anchor = Some(0);
-        apply_row_selection_click(&mut selected, &mut anchor, 7, false, true);
+        apply_row_selection_click(&mut selected, &mut anchor, 7, false);
         assert_eq!(anchor, Some(7));
     }
 }

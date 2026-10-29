@@ -7,6 +7,63 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-28
+
+### Added
+
+- **Pop-out preview window**: a "Pop out" button next to the preview opens it in its
+  own native window that can be resized or maximized freely - letterboxed to 16:9 on
+  black at any shape - for checking lyric timing at close to real video size. Every
+  keyboard shortcut (Space to tap/play, arrow-key seeking, undo/redo, the M/F/D/S
+  singer keys, Ctrl+S) works while that window has focus too, so you can tap along
+  while watching it. Closing the window (or "Bring back") docks the preview back into
+  the right panel; it always starts docked.
+- **Bigger in-panel preview**: the preview now fills the right panel's full width
+  instead of stopping at 480px, and the panel itself can be dragged out to 65% of the
+  window. The background image/video frame is rendered at a resolution matched to the
+  preview's on-screen size (in steps, so dragging doesn't re-decode it every frame),
+  and the countdown dots and spacing scale up with it - a preview at or below its old
+  maximum size looks exactly as before.
+- **End-time estimates for imported lyrics**: importing a lyric file now makes a
+  best-effort guess at each line's end, rather than leaving every line on the generic
+  word-count estimate - so auto-align searches a sensible window straight away. Shown
+  as the End column's grey "auto" hint (not filled in as a manual end, so tap-through
+  still treats those lines as untimed):
+  - LRC with line times only: ends just before the next line starts, capped by a
+    generous words-per-second limit so a line before a long instrumental break doesn't
+    stretch across it. A blank timed line (instrumental marker) counts as the end.
+  - Enhanced LRC and KOK with word times: ends shortly after the last word starts.
+  - The estimate moves with the line if its start is re-tapped or dragged, and is kept
+    when editing the lyrics text box, the same as a manual end. Saved with the project
+    (older projects load unchanged).
+- **UltraStar note ends imported as real end times**: each line's end is now taken from
+  its last note's start + length (previously note lengths were discarded), and filled
+  in as an actual End value since it's real timing data rather than a guess.
+
+### Changed
+
+- **Timing-table checkboxes now toggle**: clicking a row's checkbox adds or removes just
+  that row, so several rows can be ticked one by one for bulk actions - previously a
+  plain click cleared every other selection, and multi-select needed Ctrl/Cmd-click.
+  Shift-click still selects a range.
+- **Color presets reset a preset font**: switching from the Abyssal preset to Classic,
+  High Contrast, Sunset or Ocean now resets the lyric font to the default, instead of
+  leaving Nosifer selected until "Reset to default" was clicked. A font you picked
+  yourself is never touched - only a preset's own bundled font is reset (including one
+  left over from a loaded project).
+
+### Fixed
+
+- **Enhanced LRC files losing all word timing**: a common enhanced-LRC convention puts
+  one extra time tag after a line's last word to mark its end. The importer saw one
+  more time than words, treated the line as mismatched, and discarded every word time
+  on it. Word times are now kept, and that trailing tag is used as the line's real end.
+
+## [0.2.2] - 2026-10-01
+
+Covers every change since 0.1.0 (releases 0.1.1 through 0.2.2 weren't recorded
+separately).
+
 ### Added
 
 - **"Learn the Code" developer guide**: a new code-level, file-by-file walkthrough of

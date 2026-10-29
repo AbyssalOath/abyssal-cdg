@@ -331,6 +331,18 @@ pub struct LyricLine {
     /// begins, so it's worth setting even if the last word already has its
     /// own [`word_end_overrides`] entry.
     pub sing_end_override: Option<f64>,
+    /// A lyric-file importer's best guess at how long this line is sung,
+    /// in seconds measured from `start` - used instead of the plain
+    /// word-count estimate (see [`estimate_sing_duration`]) when there's no
+    /// [`LyricLine::sing_end_override`], so it only ever shows up as the
+    /// End column's "auto" hint and in auto-align's search window, never
+    /// as a manually-set end. Relative to `start` (not absolute) so it
+    /// moves along with the line if its start is re-tapped or dragged.
+    /// See `formats.rs`'s `estimate_imported_sing_duration`. `None` (via
+    /// `#[serde(default)]`) for typed/pasted lines and every project saved
+    /// before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_sing_duration: Option<f64>,
     /// True if this line should start a new on-screen verse block in the
     /// video export - i.e. it was preceded by a blank line in the pasted
     /// lyrics (or it's the very first line). Defaults to `true` for lines
@@ -375,6 +387,7 @@ impl LyricLine {
             word_overrides: vec![None; word_count],
             word_end_overrides: vec![None; word_count],
             sing_end_override: None,
+            estimated_sing_duration: None,
             starts_new_block: true,
             backing_vocal: None,
             countdown_mode: CountdownMode::default(),
@@ -605,7 +618,7 @@ fn lcs_matches(old: &[LyricLine], new: &[LyricLine]) -> Vec<(usize, usize)> {
 /// same local gap (see [`merge_reparsed_lyrics`]) - i.e. treated as an
 /// edited version of the same line, not a brand new one, even though the
 /// text itself differs. Line-level timing (`start`, `sing_end_override`,
-/// `singer`) is always kept - a typo fix or reworded phrase doesn't change
+/// `estimated_sing_duration`, `singer`) is always kept - a typo fix or reworded phrase doesn't change
 /// *when* the line is sung. Word-level timing is only kept where it can
 /// still mean something: if the word count matches, each word slot whose
 /// text is unchanged at that position keeps its override; every other slot
@@ -618,6 +631,7 @@ fn merge_edited_line(old: &LyricLine, new: &LyricLine) -> (LyricLine, bool) {
     let mut merged = new.clone();
     merged.start = old.start;
     merged.sing_end_override = old.sing_end_override;
+    merged.estimated_sing_duration = old.estimated_sing_duration;
     merged.singer = old.singer;
     // A backing vocal is attached to the host line's *identity*, not to its
     // exact word count/text - a reworded host line (typo fix, rephrasing)
@@ -703,6 +717,7 @@ pub fn merge_reparsed_lyrics(old: &[LyricLine], raw: &str) -> (Vec<LyricLine>, R
             let mut kept = new[nj].clone();
             kept.start = old[oi].start;
             kept.sing_end_override = old[oi].sing_end_override;
+            kept.estimated_sing_duration = old[oi].estimated_sing_duration;
             kept.singer = old[oi].singer;
             kept.word_overrides = old[oi].word_overrides.clone();
             kept.word_end_overrides = old[oi].word_end_overrides.clone();
@@ -937,7 +952,10 @@ impl TimedLine {
         let sing_end = match line.sing_end_override {
             Some(manual) => manual.clamp(start, end),
             None => {
-                (start + estimate_sing_duration(&line.text, window, settings)).clamp(start, end)
+                let est = line
+                    .estimated_sing_duration
+                    .unwrap_or_else(|| estimate_sing_duration(&line.text, window, settings));
+                (start + est).clamp(start, end)
             }
         };
         let backing_vocal = line.backing_vocal.as_ref().and_then(|bv| {
@@ -1797,6 +1815,21 @@ mod tests {
         lines[0].sing_end_override = Some(25.0);
         let timed = resolve_timing(&lines, Some(20.0));
         assert_eq!(timed[0].sing_end, 20.0);
+    }
+
+    #[test]
+    fn estimated_sing_duration_replaces_word_count_estimate_but_not_override() {
+        let mut lines = vec![LyricLine::new("a b"), LyricLine::new("next")];
+        lines[0].start = Some(10.0);
+        lines[1].start = Some(20.0);
+        lines[0].estimated_sing_duration = Some(6.0);
+        let timed = resolve_timing(&lines, Some(30.0));
+        assert_eq!(timed[0].sing_end, 16.0);
+
+        // A manual end still wins over an imported estimate.
+        lines[0].sing_end_override = Some(12.0);
+        let timed = resolve_timing(&lines, Some(30.0));
+        assert_eq!(timed[0].sing_end, 12.0);
     }
 
     #[test]
