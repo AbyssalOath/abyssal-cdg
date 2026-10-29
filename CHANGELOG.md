@@ -59,6 +59,12 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
   more time than words, treated the line as mismatched, and discarded every word time
   on it. Word times are now kept, and that trailing tag is used as the line's real end.
 
+### Security
+
+- **Updated TLS dependencies** used for HTTPS downloads: `rustls` 0.23.46,
+  `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.11, fixing RUSTSEC-2026-0346,
+  -0347, -0348, -0349, -0381 and -0382 (flagged by `cargo audit` in CI).
+
 ## [0.2.2] - 2026-10-01
 
 Covers every change since 0.1.0 (releases 0.1.1 through 0.2.2 weren't recorded
