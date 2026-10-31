@@ -96,6 +96,48 @@ fn apply_row_selection_click(
     *anchor = Some(i);
 }
 
+/// Folds one edit of the lyrics text box into `edited` - the span of the
+/// box's text (in char offsets) changed since the last parse. `cursor` is
+/// the cursor's char offset right after the edit and `delta` how many chars
+/// it added (negative if it removed some): a typed or pasted run ends at the
+/// cursor, so it spans `cursor - delta..cursor`. Offsets in the earlier span
+/// past the edit point are shifted along with the text. Best-effort (e.g. a
+/// paste over a selection is treated as a plain insert) - it's only a
+/// tie-breaker hint for `merge_reparsed_lyrics`. Free function so it can be
+/// unit-tested directly.
+fn track_lyrics_edit(
+    edited: Option<std::ops::Range<usize>>,
+    cursor: usize,
+    delta: isize,
+) -> std::ops::Range<usize> {
+    let at = cursor.saturating_sub(delta.max(0) as usize);
+    let shift = |x: usize| {
+        if x <= at {
+            x
+        } else {
+            (x as isize + delta).max(at as isize) as usize
+        }
+    };
+    match edited {
+        Some(r) => shift(r.start).min(at)..shift(r.end).max(cursor),
+        None => at..cursor,
+    }
+}
+
+/// Converts a char-offset span of `text` (see [`track_lyrics_edit`]) into
+/// the range of `text.lines()` indices it touches - always at least the one
+/// line the span starts on, so a pure deletion still marks its line.
+fn char_span_to_line_range(text: &str, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let line_of = |offset: usize| text.chars().take(offset).filter(|&c| c == '\n').count();
+    let first = line_of(span.start);
+    let last = if span.end > span.start {
+        line_of(span.end - 1)
+    } else {
+        first
+    };
+    first..last + 1
+}
+
 /// Convert a CDG 4-bit-per-channel color to a full-range egui color for UI
 /// display / color pickers.
 fn color32_from_cdg(c: cdg::CdgColor) -> egui::Color32 {
@@ -227,6 +269,11 @@ struct KaraokeApp {
     audio_error: Option<String>,
 
     lyrics_raw: String,
+    /// Char-offset span of `lyrics_raw` typed/pasted into since the last
+    /// parse (see [`track_lyrics_edit`]) - tells "Parse lyrics" which copy of
+    /// a repeated line is the new one. `None` when there's no such edit to
+    /// go on (fresh parse, undo, load), which just means no tie-break hint.
+    lyrics_edited_span: Option<std::ops::Range<usize>>,
     lines: Vec<LyricLine>,
     /// Path this project was last saved to or loaded from - Ctrl+S / "Save
     /// Project" writes straight back here without a dialog; `None` means
@@ -744,6 +791,7 @@ impl KaraokeApp {
             audio,
             audio_error,
             lyrics_raw: String::new(),
+            lyrics_edited_span: None,
             current_project_path: None,
             pending_recovery: project::read_autosave(APP_ID),
             last_autosave: None,
@@ -1017,6 +1065,7 @@ impl KaraokeApp {
     /// text just changed underneath it).
     fn apply_undo_snapshot(&mut self, snapshot: UndoSnapshot) {
         self.lyrics_raw = snapshot.lyrics_raw;
+        self.lyrics_edited_span = None;
         self.lines = snapshot.lines;
         self.title = snapshot.title;
         self.artist = snapshot.artist;
@@ -1117,6 +1166,7 @@ impl KaraokeApp {
     /// makes sense carried into a different project's content.
     fn apply_project_file(&mut self, project: project::ProjectFile) {
         self.lyrics_raw = project.lyrics_raw;
+        self.lyrics_edited_span = None;
         self.lines = project.lines;
         self.title = project.title;
         self.artist = project.artist;
@@ -2080,7 +2130,12 @@ impl KaraokeApp {
     /// fix a typo, or insert/reorder a line, without re-tapping the whole
     /// song from scratch.
     fn parse_lyrics(&mut self) {
-        let (lines, report) = lyrics::merge_reparsed_lyrics(&self.lines, &self.lyrics_raw);
+        let edited_lines = self
+            .lyrics_edited_span
+            .take()
+            .map(|span| char_span_to_line_range(&self.lyrics_raw, span));
+        let (lines, report) =
+            lyrics::merge_reparsed_lyrics(&self.lines, &self.lyrics_raw, edited_lines);
         self.lines = lines;
         // Some/all lines may already be timed after the merge above -
         // resume tapping at the first line that still needs it, rather
@@ -2137,6 +2192,7 @@ impl KaraokeApp {
                     .map(|l| l.text.clone())
                     .collect::<Vec<_>>()
                     .join("\n");
+                self.lyrics_edited_span = None;
                 self.lines = lines;
                 self.recompute_next_untimed();
                 self.start_edit = None;
@@ -5009,11 +5065,22 @@ impl eframe::App for KaraokeApp {
                     .max_height(300.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.lyrics_raw)
-                                .desired_rows(14)
-                                .desired_width(f32::INFINITY),
-                        );
+                        let len_before = self.lyrics_raw.chars().count();
+                        let output = egui::TextEdit::multiline(&mut self.lyrics_raw)
+                            .desired_rows(14)
+                            .desired_width(f32::INFINITY)
+                            .show(ui);
+                        if output.response.changed() {
+                            if let Some(cursor) = output.cursor_range {
+                                let delta =
+                                    self.lyrics_raw.chars().count() as isize - len_before as isize;
+                                self.lyrics_edited_span = Some(track_lyrics_edit(
+                                    self.lyrics_edited_span.take(),
+                                    cursor.primary.ccursor.index,
+                                    delta,
+                                ));
+                            }
+                        }
                     });
                 if ui.button("Parse lyrics").clicked() {
                     self.parse_lyrics();
@@ -6312,6 +6379,21 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lyrics_edit_tracking_finds_a_pasted_block() {
+        // "w\nx\n" then "y\nz\n" pasted at offset 4 (the start of line 2).
+        let before = "w\nx\ny\nz";
+        let after = "w\nx\ny\nz\ny\nz";
+        let span = track_lyrics_edit(None, 8, 4);
+        assert_eq!(span, 4..8);
+        assert_eq!(char_span_to_line_range(after, span), 2..4);
+        // Typing a further character earlier on shifts the span along.
+        let span = track_lyrics_edit(Some(4..8), 1, 1);
+        assert_eq!(span, 0..9);
+        // A pure deletion still marks the line it happened on.
+        assert_eq!(char_span_to_line_range(before, 2..2), 1..2);
+    }
 
     #[test]
     fn sanitize_export_base_name_strips_directory_components_and_traversal() {

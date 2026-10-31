@@ -483,9 +483,19 @@ fn is_section_marker(line: &str) -> bool {
 /// your pasted lyrics is worth doing, even though neither becomes a
 /// timeable entry itself.
 pub fn parse_pasted_lyrics(raw: &str) -> Vec<LyricLine> {
-    let mut result = Vec::new();
+    parse_pasted_lyrics_with_sources(raw)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// Same as [`parse_pasted_lyrics`], but also returns, for each parsed line,
+/// the index of the `raw` text line it came from (blank lines and section
+/// markers count towards that index, since they're still lines of `raw`).
+fn parse_pasted_lyrics_with_sources(raw: &str) -> Vec<(LyricLine, usize)> {
+    let mut result: Vec<(LyricLine, usize)> = Vec::new();
     let mut pending_blank = false;
-    for raw_line in raw.lines() {
+    for (raw_idx, raw_line) in raw.lines().enumerate() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() || is_section_marker(trimmed) {
             pending_blank = true;
@@ -493,7 +503,7 @@ pub fn parse_pasted_lyrics(raw: &str) -> Vec<LyricLine> {
         }
         let mut line = LyricLine::new(trimmed);
         line.starts_new_block = result.is_empty() || pending_blank;
-        result.push(line);
+        result.push((line, raw_idx));
         pending_blank = false;
     }
     result
@@ -581,19 +591,42 @@ impl ReparseReport {
 /// first old occurrence can only ever match the first surviving new
 /// occurrence, never the second.
 ///
+/// When more than one alignment matches the same number of lines - e.g. a
+/// repeated line pasted in again right before an identical copy of itself,
+/// where text alone can't say which copy is the new one - `edited` breaks
+/// the tie: new lines flagged `true` (the region of the text box the user
+/// actually typed/pasted into) are left unmatched in preference to
+/// unflagged ones, so the untimed line lands where the user put it rather
+/// than on the other copy. `edited` may be shorter than `new` (missing
+/// entries count as `false`), so passing `&[]` means "no hint".
+///
 /// O(n*m) time and space - fine for realistic lyric line counts (tens to a
 /// few hundred), not chosen with e.g. a full song's worth of KOK-imported
 /// word-level fragments in mind.
-fn lcs_matches(old: &[LyricLine], new: &[LyricLine]) -> Vec<(usize, usize)> {
+fn lcs_matches(old: &[LyricLine], new: &[LyricLine], edited: &[bool]) -> Vec<(usize, usize)> {
     let n = old.len();
     let m = new.len();
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    // Each match is worth `full`, or one less inside the edited region -
+    // since at most `m` matches can each lose 1, the total penalty is always
+    // less than one whole match, so the number of matched lines is still
+    // maximized first and the hint only ever decides between equal-sized
+    // alignments.
+    let full = m as u64 + 1;
+    let weight = |j: usize| {
+        if edited.get(j).copied().unwrap_or(false) {
+            full - 1
+        } else {
+            full
+        }
+    };
+    let mut dp = vec![vec![0u64; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
+            let skip = dp[i + 1][j].max(dp[i][j + 1]);
             dp[i][j] = if old[i].text == new[j].text {
-                dp[i + 1][j + 1] + 1
+                skip.max(dp[i + 1][j + 1] + weight(j))
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
+                skip
             };
         }
     }
@@ -601,7 +634,7 @@ fn lcs_matches(old: &[LyricLine], new: &[LyricLine]) -> Vec<(usize, usize)> {
     let mut pairs = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
-        if old[i].text == new[j].text {
+        if old[i].text == new[j].text && dp[i][j] == dp[i + 1][j + 1] + weight(j) {
             pairs.push((i, j));
             i += 1;
             j += 1;
@@ -680,9 +713,25 @@ fn merge_edited_line(old: &LyricLine, new: &LyricLine) -> (LyricLine, bool) {
 /// A leftover old line with no new counterpart in its gap is dropped
 /// (nothing left to attach its timing to); a leftover new line with no old
 /// counterpart starts untimed, same as any brand new line.
-pub fn merge_reparsed_lyrics(old: &[LyricLine], raw: &str) -> (Vec<LyricLine>, ReparseReport) {
-    let new = parse_pasted_lyrics(raw);
-    let anchors = lcs_matches(old, &new);
+///
+/// `edited_raw_lines`, if known, is the range of `raw`'s text lines the
+/// user actually changed since the last parse - only used to break ties
+/// between identical lines (see [`lcs_matches`]), so `None` is always safe.
+pub fn merge_reparsed_lyrics(
+    old: &[LyricLine],
+    raw: &str,
+    edited_raw_lines: Option<std::ops::Range<usize>>,
+) -> (Vec<LyricLine>, ReparseReport) {
+    let (new, edited): (Vec<LyricLine>, Vec<bool>) = parse_pasted_lyrics_with_sources(raw)
+        .into_iter()
+        .map(|(line, raw_idx)| {
+            let edited = edited_raw_lines
+                .as_ref()
+                .is_some_and(|r| r.contains(&raw_idx));
+            (line, edited)
+        })
+        .unzip();
+    let anchors = lcs_matches(old, &new, &edited);
 
     let mut result = Vec::with_capacity(new.len());
     let mut report = ReparseReport::default();
@@ -2072,7 +2121,7 @@ mod tests {
         bv.end = Some(2.0);
         lines[0].backing_vocal = Some(bv.clone());
 
-        let (merged, report) = merge_reparsed_lyrics(&lines, raw);
+        let (merged, report) = merge_reparsed_lyrics(&lines, raw, None);
         assert_eq!(report.unchanged, 1);
         assert_eq!(merged[0].backing_vocal, Some(bv));
     }
@@ -2091,7 +2140,7 @@ mod tests {
         // exact one, per merge_edited_line - the backing vocal must still
         // survive, since it's attached to the host line's identity, not to
         // its exact wording.
-        let (merged, report) = merge_reparsed_lyrics(&lines, "hello there");
+        let (merged, report) = merge_reparsed_lyrics(&lines, "hello there", None);
         assert_eq!(report.reworded_same_word_count, 1);
         assert_eq!(merged[0].backing_vocal, Some(bv));
     }
@@ -2157,7 +2206,7 @@ mod tests {
     fn no_text_change_keeps_every_line_and_every_field_untouched() {
         let raw = "hello world\nsecond line";
         let old = timed_lines_from(raw, &[1.0, 5.0]);
-        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert_eq!(merged, old, "nothing about the lines should have changed");
         assert_eq!(report.unchanged, 2);
@@ -2176,7 +2225,7 @@ mod tests {
         // "hello world" -> "hello there": same word count, one word changed.
         let old = timed_lines_from("hello world\nsecond line", &[1.0, 5.0]);
         let raw = "hello there\nsecond line";
-        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert_eq!(merged.len(), 2);
         // Untouched line: byte-for-byte identical, including word timing.
@@ -2208,7 +2257,7 @@ mod tests {
     fn changing_a_lines_word_count_keeps_line_timing_but_resets_word_timing() {
         let old = vec![timed_line("hello world", 1.0)];
         let raw = "hello there world"; // 2 words -> 3 words
-        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "hello there world");
@@ -2227,7 +2276,7 @@ mod tests {
     fn inserting_a_new_line_in_the_middle_keeps_every_existing_lines_timing() {
         let old = timed_lines_from("first\nsecond\nthird", &[1.0, 5.0, 9.0]);
         let raw = "first\nbrand new line\nsecond\nthird";
-        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert_eq!(merged.len(), 4);
         assert_eq!(merged[0], old[0]); // "first" untouched
@@ -2247,7 +2296,7 @@ mod tests {
     fn deleting_a_line_only_loses_that_lines_timing() {
         let old = timed_lines_from("first\nsecond\nthird", &[1.0, 5.0, 9.0]);
         let raw = "first\nthird"; // "second" deleted
-        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0], old[0]);
@@ -2267,7 +2316,7 @@ mod tests {
         old[0].singer = Singer::Male;
         old[2].singer = Singer::Female;
         let (chorus1, chorus2) = (old[0].clone(), old[2].clone());
-        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0], chorus1, "first chorus keeps its own timing");
@@ -2287,7 +2336,7 @@ mod tests {
         // therefore their timing) doesn't change.
         let old = timed_lines_from("verse one\nverse two", &[10.0, 15.0]);
         let raw = "brand new intro line\nverse one\nverse two";
-        let (merged, _report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, _report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0].text, "brand new intro line");
@@ -2310,7 +2359,7 @@ mod tests {
         let mut old = vec![timed_line("first", 1.0), timed_line("second", 5.0)];
         old[1].starts_new_block = false;
         let raw = "first\n\nsecond"; // blank line inserted before "second"
-        let (merged, _report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, _report) = merge_reparsed_lyrics(&old, raw, None);
 
         assert!(merged[1].starts_new_block);
         // Timing itself is still preserved even though this flag wasn't.
@@ -2321,7 +2370,7 @@ mod tests {
     fn empty_old_lines_behaves_like_a_plain_first_parse() {
         let old: Vec<LyricLine> = Vec::new();
         let raw = "a\nb\nc";
-        let (merged, report) = merge_reparsed_lyrics(&old, raw);
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, None);
         assert_eq!(merged, parse_pasted_lyrics(raw));
         assert_eq!(report.added, 3);
         assert_eq!(report.unchanged, 0);
@@ -2330,16 +2379,55 @@ mod tests {
     #[test]
     fn clearing_the_text_entirely_drops_every_line_and_its_timing() {
         let old = vec![timed_line("first", 1.0), timed_line("second", 5.0)];
-        let (merged, report) = merge_reparsed_lyrics(&old, "");
+        let (merged, report) = merge_reparsed_lyrics(&old, "", None);
         assert!(merged.is_empty());
         assert_eq!(report.removed, 2);
+    }
+
+    #[test]
+    fn pasting_a_copy_of_the_following_lines_leaves_the_pasted_copy_untimed() {
+        // "y"/"z" copied and pasted in again right after "x" - the text alone
+        // reads the same whether the new pair is rows 2-3 or rows 4-5, so the
+        // edited region (raw lines 2-3) is what says which copy is new.
+        let old = timed_lines_from("w\nx\ny\nz", &[160.0, 175.0, 188.0, 208.0]);
+        let raw = "w\nx\ny\nz\ny\nz";
+        let (merged, report) = merge_reparsed_lyrics(&old, raw, Some(2..4));
+
+        assert_eq!(report.unchanged, 4);
+        assert_eq!(report.added, 2);
+        assert_timing_preserved(&merged[0], &old[0]);
+        assert_timing_preserved(&merged[1], &old[1]);
+        assert_eq!(merged[2].start, None);
+        assert_eq!(merged[3].start, None);
+        assert_timing_preserved(&merged[4], &old[2]);
+        assert_timing_preserved(&merged[5], &old[3]);
+
+        // Pasting the same pair *after* the original instead (raw lines
+        // 4-5) still leaves the original pair's timing where it was.
+        let (merged, _) = merge_reparsed_lyrics(&old, raw, Some(4..6));
+        assert_timing_preserved(&merged[2], &old[2]);
+        assert_timing_preserved(&merged[3], &old[3]);
+        assert_eq!(merged[4].start, None);
+        assert_eq!(merged[5].start, None);
+    }
+
+    #[test]
+    fn edited_region_never_costs_an_otherwise_matchable_line() {
+        // The hint covers every line, but the one genuinely new line is
+        // still the only one left untimed - it only breaks ties.
+        let old = timed_lines_from("a\nb\nc", &[1.0, 2.0, 3.0]);
+        let (merged, report) = merge_reparsed_lyrics(&old, "a\nnew\nb\nc", Some(0..4));
+        assert_eq!(report.unchanged, 3);
+        assert_eq!(report.added, 1);
+        assert_eq!(merged[1].start, None);
+        assert_timing_preserved(&merged[2], &old[1]);
     }
 
     #[test]
     fn lcs_matches_is_a_strictly_increasing_valid_alignment() {
         let old = parse_pasted_lyrics("a\nb\na\nc\nb");
         let new = parse_pasted_lyrics("x\na\nb\na\ny\nb");
-        let pairs = lcs_matches(&old, &new);
+        let pairs = lcs_matches(&old, &new, &[]);
         // Every matched pair must actually match by text...
         for &(i, j) in &pairs {
             assert_eq!(old[i].text, new[j].text);
