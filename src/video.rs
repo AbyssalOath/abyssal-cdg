@@ -23,10 +23,11 @@
 #[cfg(test)]
 use crate::lyrics::MAX_BLOCK_LINES;
 use crate::lyrics::{
-    backing_vocal_wipe_fraction, countdown_window, countdown_window_between,
-    current_line_wipe_fraction, effective_singer_label, group_into_blocks, hide_upcoming_lines,
-    normalize_text, reveal_fade_alpha, rolling_preview_lines, singer_legend, slot_fade_alpha,
-    sung_line_fade_alpha, Singer, TimedLine, TimingSettings,
+    active_backing_line, backing_display_windows, backing_line_alpha, countdown_window,
+    countdown_window_between, current_line_wipe_fraction, effective_singer_label,
+    group_into_blocks, hide_upcoming_lines, normalize_text, reveal_fade_alpha,
+    rolling_preview_lines, singer_legend, slot_fade_alpha, sung_line_fade_alpha, Singer, TimedLine,
+    TimingSettings,
 };
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, bail, Context, Result};
@@ -203,6 +204,8 @@ pub struct VideoPalette {
     pub artist: Rgb8,
     pub screaming_unsung: Rgb8,
     pub screaming_highlight: Rgb8,
+    pub backing_unsung: Rgb8,
+    pub backing_highlight: Rgb8,
 }
 
 impl VideoPalette {
@@ -213,6 +216,7 @@ impl VideoPalette {
             Singer::Female => (self.female_unsung, self.female_highlight),
             Singer::Duet => (self.duet_unsung, self.duet_highlight),
             Singer::Screaming => (self.screaming_unsung, self.screaming_highlight),
+            Singer::Backing => (self.backing_unsung, self.backing_highlight),
         }
     }
 }
@@ -548,6 +552,74 @@ fn draw_upcoming_block_preview(
     }
 }
 
+/// Vertical position (as a fraction of frame height) of the backing-track
+/// lane's text baseline - below where even a full 5-line block reaches
+/// (see `render_frame`'s block layout), so the two never collide. Shared
+/// with the live preview in `main.rs`.
+pub const BACKING_LANE_Y: f32 = 0.9;
+/// Backing-track text size, as a fraction of frame height - a bit smaller
+/// than a main line's (0.055) so it reads as the secondary voice.
+pub const BACKING_LANE_FONT: f32 = 0.045;
+
+/// Draws whichever backing-track line currently holds the backing lane
+/// (see [`crate::lyrics::backing_display_windows`]), if any: its unsung
+/// color while it's coming up, a word-wipe while it's sung, then its
+/// highlight color fading out.
+#[allow(clippy::too_many_arguments)]
+fn draw_backing_lane(
+    canvas: &mut Canvas,
+    font: &FontArc,
+    backing_track: &[TimedLine],
+    palette: &VideoPalette,
+    w: f32,
+    h: f32,
+    max_width: f32,
+    t: f64,
+) {
+    let windows = backing_display_windows(backing_track);
+    let Some(k) = active_backing_line(&windows, t) else {
+        return;
+    };
+    let line = &backing_track[k];
+    let text = normalize_text(&line.text);
+    let (unsung, highlight) = palette.singer_colors(line.singer);
+    let size = h * BACKING_LANE_FONT;
+    let y = h * BACKING_LANE_Y;
+    if t >= line.start && t < line.sing_end {
+        let wipe = current_line_wipe_fraction(line, t);
+        draw_text_line_wipe(
+            canvas,
+            font,
+            size,
+            w / 2.0,
+            y,
+            &text,
+            unsung,
+            highlight,
+            wipe,
+            max_width,
+        );
+    } else {
+        let color = if t >= line.sing_end {
+            highlight
+        } else {
+            unsung
+        };
+        let alpha = backing_line_alpha(line, windows[k], t);
+        draw_text_line_uniform(
+            canvas,
+            font,
+            size,
+            w / 2.0,
+            y,
+            &text,
+            color,
+            max_width,
+            alpha,
+        );
+    }
+}
+
 /// Draws one frame's lyrics/title-card/countdown content onto `canvas`.
 /// Does *not* touch the background - the caller fills `canvas` first,
 /// either with `palette.background` (the plain solid-color look) or a
@@ -560,6 +632,7 @@ fn render_frame(
     regular: &FontArc,
     bold: &FontArc,
     timed_lines: &[TimedLine],
+    backing_track: &[TimedLine],
     blocks: &[Vec<usize>],
     palette: &VideoPalette,
     title: Option<&str>,
@@ -573,7 +646,13 @@ fn render_frame(
     let h = canvas.h as f32;
     let max_width = w * 0.92;
 
-    let legend_singers = singer_legend(timed_lines);
+    // The backing track has its own fixed lane near the bottom of the
+    // frame, independent of everything below (which has several early
+    // returns) - a backing line can overlap any main line, a countdown, or
+    // nothing at all, so it's drawn first, on its own schedule.
+    draw_backing_lane(canvas, regular, backing_track, palette, w, h, max_width, t);
+
+    let legend_singers = singer_legend(timed_lines, backing_track);
     let has_title_card = title.is_some() || artist.is_some() || !legend_singers.is_empty();
     if has_title_card && t < card_end {
         if let Some(ti) = title {
@@ -860,33 +939,6 @@ fn render_frame(
                             highlight,
                             max_width,
                             alpha,
-                        );
-                    }
-                }
-
-                // A backing/echo vocal (if any) draws directly beneath the
-                // current line, smaller, in its own color, with its own
-                // independent wipe - only while its own (bounded within the
-                // host's) window is actually active, same as the `.cdg`
-                // export's backing row. Independent of the fade above -
-                // it's gated purely by its own start/end, not the main
-                // line's own wipe/fade phase.
-                if let Some(bv) = &line.backing_vocal {
-                    if t >= bv.start && t < bv.end {
-                        let (bv_unsung, bv_highlight) = palette.singer_colors(bv.singer);
-                        let bv_text = normalize_text(&bv.text);
-                        let bv_wipe = backing_vocal_wipe_fraction(bv, t);
-                        draw_text_line_wipe(
-                            canvas,
-                            regular,
-                            font_size * 0.7,
-                            w / 2.0,
-                            y + line_height * 0.5,
-                            &bv_text,
-                            bv_unsung,
-                            bv_highlight,
-                            bv_wipe,
-                            max_width,
                         );
                     }
                 }
@@ -1182,6 +1234,7 @@ pub fn extract_video_background_thumbnail(
 #[allow(clippy::too_many_arguments)]
 pub fn render_video(
     timed_lines: &[TimedLine],
+    backing_track: &[TimedLine],
     total_duration: f64,
     palette: &VideoPalette,
     title: Option<&str>,
@@ -1424,6 +1477,7 @@ pub fn render_video(
             &regular,
             &bold,
             timed_lines,
+            backing_track,
             &blocks,
             palette,
             title,
@@ -1585,6 +1639,8 @@ mod tests {
             artist: Rgb8::new(160, 160, 200),
             screaming_unsung: Rgb8::new(140, 30, 20),
             screaming_highlight: Rgb8::new(255, 60, 10),
+            backing_unsung: Rgb8::new(140, 190, 220),
+            backing_highlight: Rgb8::new(0, 255, 255),
         };
         let (text, colors) =
             legend_text_and_colors(&palette, &[(Singer::Male, None), (Singer::Female, None)]);
@@ -1621,6 +1677,7 @@ mod tests {
                 &regular,
                 &bold,
                 &timed,
+                &[],
                 &blocks,
                 &palette,
                 Some("Song"),
@@ -1798,6 +1855,8 @@ mod tests {
             artist: Rgb8::new(160, 160, 200),
             screaming_unsung: Rgb8::new(140, 30, 20),
             screaming_highlight: Rgb8::new(255, 60, 10),
+            backing_unsung: Rgb8::new(140, 190, 220),
+            backing_highlight: Rgb8::new(0, 255, 255),
         };
         let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
         let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
@@ -1813,6 +1872,7 @@ mod tests {
                 &regular,
                 &bold,
                 &timed,
+                &[],
                 &blocks,
                 &palette,
                 Some("T"),
@@ -1842,6 +1902,8 @@ mod tests {
             artist: Rgb8::new(160, 160, 200),
             screaming_unsung: Rgb8::new(140, 30, 20),
             screaming_highlight: Rgb8::new(255, 60, 10),
+            backing_unsung: Rgb8::new(140, 190, 220),
+            backing_highlight: Rgb8::new(0, 255, 255),
         }
     }
 
@@ -1886,27 +1948,31 @@ mod tests {
     }
 
     #[test]
-    fn backing_vocal_renders_only_during_its_own_window() {
-        let mut lines = vec![LyricLine::new("hello world")];
+    fn a_backing_line_renders_in_its_own_lane_only_during_its_display_window() {
+        let mut lines = vec![LyricLine::new("hello world"), LyricLine::new("next one")];
         lines[0].start = Some(0.0);
-        let mut bv = crate::lyrics::BackingVocal::new("hey");
-        bv.start = Some(3.0);
-        bv.end = Some(5.0);
-        lines[0].backing_vocal = Some(bv);
-        let timed = resolve_timing(&lines, Some(10.0));
+        lines[1].start = Some(8.0);
+        // Backing line spanning *across* both main lines - 6.0..10.0.
+        let mut bl = LyricLine::new("hey there");
+        bl.is_backing = true;
+        bl.start = Some(6.0);
+        bl.sing_end_override = Some(10.0);
+        bl.singer = Singer::Backing;
+        lines.push(bl);
+        let settings = TimingSettings::default();
+        let timed = resolve_timing(&lines, Some(20.0));
+        let backing = crate::lyrics::resolve_backing_track(&lines, &settings);
+        assert_eq!(timed.len(), 2);
+        assert_eq!(backing.len(), 1);
         let blocks = group_into_blocks(&timed);
-        assert!(timed[0].backing_vocal.is_some());
 
         let palette = test_palette();
         let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
         let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
         let card_end = crate::export::title_card_end(&timed);
         let (w, h) = (320usize, 180usize);
-
-        // Same geometry `render_frame` itself uses for a single-line block.
-        let line_height = h as f32 * 0.11;
-        let start_y = h as f32 * 0.5 - line_height / 2.0 + line_height * 0.5;
-        let backing_y = start_y + line_height * 0.5;
+        // Text is drawn on a baseline, so look a little above it.
+        let lane_y = h as f32 * (BACKING_LANE_Y - BACKING_LANE_FONT * 0.35);
 
         let render_at = |t: f64| {
             let mut canvas = Canvas::new(w, h);
@@ -1916,31 +1982,48 @@ mod tests {
                 &regular,
                 &bold,
                 &timed,
+                &backing,
                 &blocks,
                 &palette,
                 None,
                 None,
                 card_end,
                 t,
-                &TimingSettings::default(),
+                &settings,
                 false,
             );
             canvas
         };
 
-        // Before the backing vocal's own window (t=1.0, window is [3,5)) -
-        // nothing at its row.
-        let before = render_at(1.0);
-        assert!(!row_has_non_background_pixel(&before, &palette, backing_y));
-
-        // Inside its window - something's there.
-        let during = render_at(4.0);
-        assert!(row_has_non_background_pixel(&during, &palette, backing_y));
-
-        // After its window (still within the host's own [0,10) window) -
-        // gone again.
-        let after = render_at(7.0);
-        assert!(!row_has_non_background_pixel(&after, &palette, backing_y));
+        // Well before its lead-in - nothing in the lane.
+        assert!(!row_has_non_background_pixel(
+            &render_at(2.0),
+            &palette,
+            lane_y
+        ));
+        // During its lead-in (shown early, unsung) and while sung, across
+        // the main-line boundary at 8.0.
+        assert!(row_has_non_background_pixel(
+            &render_at(5.5),
+            &palette,
+            lane_y
+        ));
+        assert!(row_has_non_background_pixel(
+            &render_at(7.0),
+            &palette,
+            lane_y
+        ));
+        assert!(row_has_non_background_pixel(
+            &render_at(9.0),
+            &palette,
+            lane_y
+        ));
+        // Long after it's finished and lingered - gone again.
+        assert!(!row_has_non_background_pixel(
+            &render_at(14.0),
+            &palette,
+            lane_y
+        ));
     }
 
     #[test]
@@ -1967,6 +2050,7 @@ mod tests {
             &regular,
             &bold,
             &timed,
+            &[],
             &blocks,
             &palette,
             None,
@@ -2004,6 +2088,7 @@ mod tests {
             &regular,
             &bold,
             &timed,
+            &[],
             &blocks,
             &palette,
             None,
@@ -2063,6 +2148,7 @@ mod tests {
                 &regular,
                 &bold,
                 &timed,
+                &[],
                 &blocks,
                 &palette,
                 None,
@@ -2127,6 +2213,7 @@ mod tests {
                 &regular,
                 &bold,
                 &timed,
+                &[],
                 &blocks,
                 &palette,
                 None,
@@ -2189,6 +2276,7 @@ mod tests {
                 &regular,
                 &bold,
                 &timed,
+                &[],
                 &blocks,
                 &palette,
                 None,
@@ -2289,6 +2377,7 @@ mod tests {
                 &regular,
                 &bold,
                 timed,
+                &[],
                 blocks,
                 &palette,
                 None,
@@ -2353,6 +2442,7 @@ mod tests {
                 &regular,
                 &bold,
                 &timed,
+                &[],
                 &blocks,
                 &palette,
                 None,

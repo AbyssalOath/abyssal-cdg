@@ -38,7 +38,11 @@ Highlights:
 - **Vocal removal** built in (a real ML separation model, not a filter
   trick) - for an instrumental/vocals-only export, or to sing against.
 - **Custom colors/presets, a background image or video, and per-line
-  Male/Female/Duet/Screaming voices** for duets and intense sections.
+  Male/Female/Duet/Screaming/Backing voices** for duets and intense sections.
+- **Overlapping backing vocals** - mark any lyric line as a backing vocal
+  and it's timed independently, overlapping the main lyrics freely (a
+  screamed part behind the lead, a duet where both singers overlap with
+  different words), shown in its own lane.
 - **Imports** existing LRC, UltraStar, and KOK lyric files with their
   timing intact; **exports** to LRC/UltraStar too, not just `.cdg`/`.mp4`.
 

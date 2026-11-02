@@ -25,11 +25,15 @@ lyrics.rs    The data model: LyricLine (raw, user-entered - start, optional expl
              math, timecode format/parse, and start/end overlap validation all live
              here, shared by every renderer and by main.rs's tap/timeline/manual-entry
              code paths. Also strips Genius-style `[Verse 1]`/`[Chorus]` section
-             markers when parsing pasted lyrics. BackingVocal/TimedBackingVocal
-             (a second vocalist echoing part of a line) are embedded on the host
-             LyricLine/TimedLine rather than being independent top-level lines -
-             their own timing is bounded within their host's window, so the
-             sequential, non-overlapping TimedLine list itself never changes.
+             markers when parsing pasted lyrics. A line flagged `is_backing`
+             (a second vocalist singing different lyrics over the lead) stays an
+             ordinary entry in the line list - so re-parsing handles it like any
+             other line - but is left out of the sequential, non-overlapping main
+             track (resolve_timing_indexed) and resolved separately into the
+             *backing track* (resolve_backing_track), where each line's window is
+             independent and may overlap any main line. backing_display_windows
+             decides when each backing line holds the single on-screen backing
+             lane, shared by all three renderers.
 formats.rs   Import *and* export for LRC, UltraStar, and KOK lyric files, plus
              format auto-detection. Import produces LyricLine values, same as
              manual paste + tap; export is the direct inverse, consuming the same
@@ -48,18 +52,19 @@ font.rs      Renders characters into CDG's 6x12 tile format (and 2x/3x/... scale
 export.rs    The ".cdg renderer": lays out lines/words/countdown dots on the CDG
              canvas using cdg.rs + font.rs, driven by lyrics.rs's timing. Also owns
              the "paired audio" helper (copying the loaded audio next to a
-             `.cdg`/`.lrc`/UltraStar file under a matching base filename). A line's
-             backing vocal (if any) draws on its own row (BACKING_ROW) with its own
-             word-wipe running concurrently with the host's - the two lines' word
-             events are merged into one time-sorted sequence before being emitted,
-             since CdgWriter::advance_to is monotonic-only-forward.
+             `.cdg`/`.lrc`/UltraStar file under a matching base filename). The
+             backing track draws on its own row (BACKING_ROW) from a pre-computed,
+             time-sorted schedule (BackingLane) that every forward step of the main
+             loop flushes first, since CdgWriter::advance_to is
+             monotonic-only-forward and backing lines start/end independently of
+             the main lines.
 video.rs     The "video renderer": an independent RGB24 frame renderer (via
              `ab_glyph` for anti-aliased text) piped into an `ffmpeg` subprocess
              (this project's own bundled LGPL build, not a system install - see
              ffmpeg_path.rs), driven by the *same* lyrics.rs timing as export.rs.
-             A backing vocal draws directly beneath the current line, smaller,
-             with its own wipe, matching the same relationship the `.cdg` export
-             uses.
+             The backing track draws in its own fixed lane near the bottom of the
+             frame (BACKING_LANE_Y), smaller, with its own wipe - the live preview
+             mirrors it.
 ffmpeg_path.rs  Locates the bundled ffmpeg binary and the openh264 shared
              library its H.264 encoder needs (two different sourcing stories -
              see the "Bundled binaries and models" section below), the same

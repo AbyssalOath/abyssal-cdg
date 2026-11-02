@@ -574,6 +574,9 @@ fn singer_to_player_marker(singer: Singer) -> &'static str {
         // Not part of the base UltraStar spec, but the same reasonable
         // extension `import_ultrastar` already accepts on the way in.
         Singer::Screaming => "P4",
+        // No dedicated UltraStar slot for it - the second performer is
+        // the closest match for a backing voice.
+        Singer::Backing => "P2",
     }
 }
 

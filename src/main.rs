@@ -32,8 +32,8 @@ use audio::AudioPlayer;
 use eframe::egui;
 use export::Palette;
 use lyrics::{
-    countdown_window, group_into_blocks, hide_upcoming_lines, singer_legend, BackingVocal,
-    LyricLine, Singer, TimedLine,
+    countdown_window, group_into_blocks, hide_upcoming_lines, singer_legend, LyricLine, Singer,
+    TimedLine,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -166,6 +166,38 @@ fn rgb_color_from_color32(c: egui::Color32) -> project::RgbColor {
 
 fn color32_from_rgb_color(c: project::RgbColor) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
+}
+
+/// A one-line `LayoutJob` for `text` with the karaoke color wipe applied
+/// at `fraction` (0.0-1.0) of its characters - `highlight` up to there,
+/// `unsung` after. Same per-character rounding the live preview's main
+/// line uses.
+fn wipe_layout_job(
+    text: &str,
+    fraction: f32,
+    font_id: egui::FontId,
+    unsung: egui::Color32,
+    highlight: egui::Color32,
+) -> egui::text::LayoutJob {
+    let chars: Vec<char> = text.chars().collect();
+    let split = ((fraction * chars.len().max(1) as f32).round() as usize).min(chars.len());
+    let sung: String = chars[..split].iter().collect();
+    let rest: String = chars[split..].iter().collect();
+    let mut job = egui::text::LayoutJob::default();
+    for (part, color) in [(sung, highlight), (rest, unsung)] {
+        if !part.is_empty() {
+            job.append(
+                &part,
+                0.0,
+                egui::TextFormat {
+                    color,
+                    font_id: font_id.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    job
 }
 
 /// Fades `color` toward transparent (letting whatever's drawn underneath -
@@ -322,9 +354,6 @@ struct KaraokeApp {
     tap_phase: TapPhase,
     /// If set, the fine-tune-words panel is open for this line index.
     word_tap_line: Option<usize>,
-    /// If set, the backing/echo vocal panel is open for this line index -
-    /// see [`BackingVocal`].
-    backing_vocal_edit: Option<usize>,
     /// Whether clicking a word in the fine-tune panel sets its start or end
     /// time - see [`WordTapMode`].
     word_tap_mode: WordTapMode,
@@ -388,6 +417,8 @@ struct KaraokeApp {
     color_artist: egui::Color32,
     color_screaming_unsung: egui::Color32,
     color_screaming_highlight: egui::Color32,
+    color_backing_unsung: egui::Color32,
+    color_backing_highlight: egui::Color32,
     /// Which preset (if any) the current colors were last set from - purely
     /// cosmetic (which option the dropdown shows selected); manually
     /// tweaking an individual color afterward doesn't change or clear it.
@@ -803,7 +834,6 @@ impl KaraokeApp {
             next_untimed: 0,
             tap_phase: TapPhase::default(),
             word_tap_line: None,
-            backing_vocal_edit: None,
             word_tap_mode: WordTapMode::default(),
             auto_follow_words: true,
             compact_timing_table: false,
@@ -828,6 +858,8 @@ impl KaraokeApp {
             color_artist: color32_from_cdg(p.artist),
             color_screaming_unsung: color32_from_cdg(p.screaming_unsung),
             color_screaming_highlight: color32_from_cdg(p.screaming_highlight),
+            color_backing_unsung: color32_from_cdg(p.backing_unsung),
+            color_backing_highlight: color32_from_cdg(p.backing_highlight),
             color_preset: ColorPreset::default(),
             recent_files: recent::load(APP_ID),
             status: String::new(),
@@ -903,6 +935,8 @@ impl KaraokeApp {
             artist: cdg_from_color32(self.color_artist),
             screaming_unsung: cdg_from_color32(self.color_screaming_unsung),
             screaming_highlight: cdg_from_color32(self.color_screaming_highlight),
+            backing_unsung: cdg_from_color32(self.color_backing_unsung),
+            backing_highlight: cdg_from_color32(self.color_backing_highlight),
         }
     }
 
@@ -923,6 +957,8 @@ impl KaraokeApp {
             artist: c(self.color_artist),
             screaming_unsung: c(self.color_screaming_unsung),
             screaming_highlight: c(self.color_screaming_highlight),
+            backing_unsung: c(self.color_backing_unsung),
+            backing_highlight: c(self.color_backing_highlight),
         }
     }
 
@@ -933,6 +969,7 @@ impl KaraokeApp {
             Singer::Female => (self.color_female_unsung, self.color_female_highlight),
             Singer::Duet => (self.color_duet_unsung, self.color_duet_highlight),
             Singer::Screaming => (self.color_screaming_unsung, self.color_screaming_highlight),
+            Singer::Backing => (self.color_backing_unsung, self.color_backing_highlight),
         }
     }
 
@@ -972,6 +1009,8 @@ impl KaraokeApp {
         self.color_artist = color32_from_cdg(p.artist);
         self.color_screaming_unsung = color32_from_cdg(p.screaming_unsung);
         self.color_screaming_highlight = color32_from_cdg(p.screaming_highlight);
+        self.color_backing_unsung = color32_from_cdg(p.backing_unsung);
+        self.color_backing_highlight = color32_from_cdg(p.backing_highlight);
         self.color_preset = preset;
         // A preset without its own font only resets the font if the current
         // one is some preset's bundled default (e.g. Nosifer left over from
@@ -1001,10 +1040,22 @@ impl KaraokeApp {
         let duration_hint = self.audio.as_ref().and_then(|a| a.duration());
         let timed =
             lyrics::resolve_timing_with_settings(&self.lines, duration_hint, &self.timing_settings);
+        let backing_end = self
+            .resolved_backing()
+            .iter()
+            .map(|b| b.sing_end)
+            .fold(0.0, f64::max);
         let total = duration_hint
             .unwrap_or(0.0)
-            .max(timed.last().map(|t| t.end).unwrap_or(0.0));
+            .max(timed.last().map(|t| t.end).unwrap_or(0.0))
+            .max(backing_end);
         (timed, total)
+    }
+
+    /// The resolved backing track (see [`lyrics::resolve_backing_track`]) -
+    /// every timed backing line, independent of the main track.
+    fn resolved_backing(&self) -> Vec<TimedLine> {
+        lyrics::resolve_backing_track(&self.lines, &self.timing_settings)
     }
 
     /// Snapshots everything a project file needs to capture from the
@@ -1036,6 +1087,8 @@ impl KaraokeApp {
                 artist: rgb_color_from_color32(self.color_artist),
                 screaming_unsung: rgb_color_from_color32(self.color_screaming_unsung),
                 screaming_highlight: rgb_color_from_color32(self.color_screaming_highlight),
+                backing_unsung: Some(rgb_color_from_color32(self.color_backing_unsung)),
+                backing_highlight: Some(rgb_color_from_color32(self.color_backing_highlight)),
             },
             video_resolution: self.video_resolution,
             video_codec: self.video_codec,
@@ -1071,7 +1124,6 @@ impl KaraokeApp {
         self.artist = snapshot.artist;
         self.recompute_next_untimed();
         self.word_tap_line = None;
-        self.backing_vocal_edit = None;
         self.timeline_drag = None;
         self.start_edit = None;
         self.end_edit = None;
@@ -1168,6 +1220,11 @@ impl KaraokeApp {
         self.lyrics_raw = project.lyrics_raw;
         self.lyrics_edited_span = None;
         self.lines = project.lines;
+        // Projects saved with the old embedded "Echo" backing vocals get
+        // them turned into independent backing-track lines (text included
+        // in the lyrics box) - see `lyrics::migrate_legacy_backing_vocals`.
+        let migrated_echoes =
+            lyrics::migrate_legacy_backing_vocals(&mut self.lines, &mut self.lyrics_raw);
         self.title = project.title;
         self.artist = project.artist;
         self.video_resolution = project.video_resolution;
@@ -1206,6 +1263,17 @@ impl KaraokeApp {
         self.color_artist = color32_from_rgb_color(c.artist);
         self.color_screaming_unsung = color32_from_rgb_color(c.screaming_unsung);
         self.color_screaming_highlight = color32_from_rgb_color(c.screaming_highlight);
+        // A project saved before the Backing voice existed gets the
+        // default palette's own backing colors.
+        let default_palette = Palette::default();
+        self.color_backing_unsung = c
+            .backing_unsung
+            .map(color32_from_rgb_color)
+            .unwrap_or_else(|| color32_from_cdg(default_palette.backing_unsung));
+        self.color_backing_highlight = c
+            .backing_highlight
+            .map(color32_from_rgb_color)
+            .unwrap_or_else(|| color32_from_cdg(default_palette.backing_highlight));
         // A loaded project's colors may or may not match any preset - reset
         // to the neutral default label rather than keep showing whatever
         // preset happened to be selected before.
@@ -1213,7 +1281,6 @@ impl KaraokeApp {
 
         self.recompute_next_untimed();
         self.word_tap_line = None;
-        self.backing_vocal_edit = None;
         self.start_edit = None;
         self.end_edit = None;
         self.timeline_drag = None;
@@ -1273,6 +1340,12 @@ impl KaraokeApp {
             None => {
                 self.status = "Loaded project (no audio file was saved with it).".to_string();
             }
+        }
+        if migrated_echoes > 0 {
+            self.status = format!(
+                "{} Converted {migrated_echoes} old echo vocal(s) into backing-vocal lines.",
+                self.status
+            );
         }
     }
 
@@ -2330,7 +2403,13 @@ impl KaraokeApp {
                 }
                 self.lines[idx].sing_end_override = Some(pos);
                 self.tap_phase = TapPhase::Start;
-                self.next_untimed += 1;
+                // On to the next *main* line - backing lines are skipped
+                // (see `tap_backing_line`).
+                self.next_untimed = self.lines[idx + 1..]
+                    .iter()
+                    .position(|l| !l.is_backing)
+                    .map(|off| idx + 1 + off)
+                    .unwrap_or(self.lines.len());
 
                 if self.next_untimed >= self.lines.len() && !self.lines.is_empty() {
                     // Just finished the last line - open the fine-tune-words
@@ -2379,10 +2458,12 @@ impl KaraokeApp {
     /// used after any edit (manual entry, clearing a line, resetting) that
     /// could leave the tap-along workflow pointed somewhere stale.
     fn recompute_next_untimed(&mut self) {
+        // Backing lines are timed separately (see `tap_backing_line`), so
+        // tap-along never stops on one.
         self.next_untimed = self
             .lines
             .iter()
-            .position(|l| l.start.is_none() || l.sing_end_override.is_none())
+            .position(|l| !l.is_backing && (l.start.is_none() || l.sing_end_override.is_none()))
             .unwrap_or(self.lines.len());
         self.tap_phase = match self.lines.get(self.next_untimed) {
             Some(l) if l.start.is_some() => TapPhase::End,
@@ -2445,36 +2526,7 @@ impl KaraokeApp {
     /// original line, since `resolved()` sorts by start time).
     fn resolved_with_indices(&self) -> (Vec<TimedLine>, Vec<usize>) {
         let duration_hint = self.audio.as_ref().and_then(|a| a.duration());
-        let mut sorted: Vec<(usize, f64)> = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| l.start.map(|s| (i, s)))
-            .collect();
-        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut timed = Vec::with_capacity(sorted.len());
-        let mut indices = Vec::with_capacity(sorted.len());
-        for pos in 0..sorted.len() {
-            let (orig_idx, start) = sorted[pos];
-            let end = if pos + 1 < sorted.len() {
-                sorted[pos + 1].1
-            } else {
-                match duration_hint {
-                    Some(d) if d > start => d,
-                    _ => start + 4.0,
-                }
-            };
-            let line = &self.lines[orig_idx];
-            timed.push(TimedLine::from_line_with_settings(
-                line,
-                start,
-                end,
-                &self.timing_settings,
-            ));
-            indices.push(orig_idx);
-        }
-        (timed, indices)
+        lyrics::resolve_timing_indexed(&self.lines, duration_hint, &self.timing_settings)
     }
 
     /// Seeks playback to [`AUDITION_REWIND_SECS`] before `near_time`,
@@ -2505,73 +2557,73 @@ impl KaraokeApp {
         self.recompute_next_untimed();
     }
 
-    /// The resolved `(start, end)` window for `self.lines[idx]`, if it's
-    /// been timed at all - used to bound a backing vocal's own tapping to
-    /// its host's window (see [`lyrics::check_backing_vocal_start`]/
-    /// [`lyrics::check_backing_vocal_end`]). `resolved_with_indices` sorts
-    /// by start time, so the original index has to be looked up rather
-    /// than assumed to match position.
-    fn host_window_for(&self, idx: usize) -> Option<(f64, f64)> {
-        let (timed, indices) = self.resolved_with_indices();
-        let ti = indices.iter().position(|&oi| oi == idx)?;
-        let host = timed.get(ti)?;
-        Some((host.start, host.end))
-    }
-
-    /// Taps a backing vocal's own `start` while the song plays - must fall
-    /// within its host line's own resolved window (see
-    /// [`Self::host_window_for`]), so the host line needs to be timed
-    /// first.
-    fn tap_backing_vocal_start(&mut self, idx: usize) {
+    /// The per-row "Tap" button for a backing line (see
+    /// [`lyrics::LyricLine::is_backing`]). Tap-along skips backing lines
+    /// (their timing overlaps the main lines', so they can't fit into its
+    /// one-line-at-a-time start/end sequence), so each backing line is
+    /// tapped on its own instead: the first press sets its start, the next
+    /// its end - and once both are set, the next press starts over with a
+    /// new start. Usually done on a second play-through, after the main
+    /// lines are tapped.
+    fn tap_backing_line(&mut self, idx: usize) {
         let Some(audio) = &self.audio else { return };
         if !audio.is_playing() {
             self.status = "Press Play first, then tap.".to_string();
             return;
         }
         let pos = audio.position();
-        let Some((host_start, host_end)) = self.host_window_for(idx) else {
-            self.status = "Time this line's own start/end first.".to_string();
+        let Some(line) = self.lines.get(idx) else {
             return;
         };
-        if let Err(e) = lyrics::check_backing_vocal_start(pos, host_start, host_end) {
-            self.status = e;
-            return;
+        let wants_end = line.start.is_some_and(|s| s < pos) && line.sing_end_override.is_none();
+        if wants_end {
+            if let Err(e) = lyrics::check_end_change(&self.lines, idx, pos) {
+                self.status = e;
+                return;
+            }
+            self.lines[idx].sing_end_override = Some(pos);
+            self.status = format!(
+                "Backing line {} ended at {}.",
+                idx + 1,
+                lyrics::format_timecode(pos)
+            );
+        } else {
+            self.lines[idx].sing_end_override = None;
+            self.lines[idx].start = Some(pos);
+            self.status = format!(
+                "Backing line {} started at {} - tap it again for its end.",
+                idx + 1,
+                lyrics::format_timecode(pos)
+            );
         }
-        if let Some(bv) = self.lines[idx].backing_vocal.as_mut() {
-            bv.start = Some(pos);
-        }
-        self.audition_seek(pos);
     }
 
-    /// Taps a backing vocal's own `end` - must come after its own `start`
-    /// and not past the host line's own end.
-    fn tap_backing_vocal_end(&mut self, idx: usize) {
-        let Some(audio) = &self.audio else { return };
-        if !audio.is_playing() {
-            self.status = "Press Play first, then tap.".to_string();
-            return;
-        }
-        let pos = audio.position();
-        let Some((_, host_end)) = self.host_window_for(idx) else {
-            self.status = "Time this line's own start/end first.".to_string();
+    /// Turns a line into a backing-track line, or back into a main one -
+    /// see [`lyrics::LyricLine::is_backing`]. Switching to backing also
+    /// gives a still-`Default` line the dedicated Backing voice color (and
+    /// switching back undoes exactly that), so a backing line stands out
+    /// without an extra dropdown trip. Tap-along is re-pointed afterwards,
+    /// since it skips backing lines.
+    fn toggle_backing_line(&mut self, idx: usize) {
+        let Some(line) = self.lines.get_mut(idx) else {
             return;
         };
-        let Some(bv_start) = self.lines[idx]
-            .backing_vocal
-            .as_ref()
-            .and_then(|bv| bv.start)
-        else {
-            self.status = "Tap this backing vocal's own start first.".to_string();
-            return;
+        line.is_backing = !line.is_backing;
+        if line.is_backing && line.singer == Singer::Default && line.custom_singer_name.is_none() {
+            line.singer = Singer::Backing;
+        } else if !line.is_backing && line.singer == Singer::Backing {
+            line.singer = Singer::Default;
+        }
+        self.status = if line.is_backing {
+            format!(
+                "Line {} is now a backing vocal - time it with its own Tap button; it can \
+                 overlap any main line.",
+                idx + 1
+            )
+        } else {
+            format!("Line {} is back on the main track.", idx + 1)
         };
-        if let Err(e) = lyrics::check_backing_vocal_end(pos, bv_start, host_end) {
-            self.status = e;
-            return;
-        }
-        if let Some(bv) = self.lines[idx].backing_vocal.as_mut() {
-            bv.end = Some(pos);
-        }
-        self.audition_seek(pos);
+        self.recompute_next_untimed();
     }
 
     fn reset_timing(&mut self) {
@@ -2580,8 +2632,7 @@ impl KaraokeApp {
             l.sing_end_override = None;
             l.estimated_sing_duration = None;
         }
-        self.next_untimed = 0;
-        self.tap_phase = TapPhase::Start;
+        self.recompute_next_untimed();
         self.status = "Timing cleared.".to_string();
     }
 
@@ -3086,6 +3137,16 @@ impl KaraokeApp {
         }
 
         let (timed, total_duration) = self.resolved();
+        let backing = self.resolved_backing();
+        // LRC has no notion of a second track, but it doesn't need one:
+        // players just show whatever line's timestamp was reached most
+        // recently, so backing lines are interleaved by start time.
+        let mut lrc_lines: Vec<TimedLine> = timed.iter().chain(backing.iter()).cloned().collect();
+        lrc_lines.sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let timing_settings = self.timing_settings;
         let cdg_palette = self.palette();
         let video_palette = self.video_palette();
@@ -3150,6 +3211,7 @@ impl KaraokeApp {
             if do_cdg {
                 let bytes = export::render_cdg_with_settings(
                     &timed,
+                    &backing,
                     total_duration,
                     &cdg_palette,
                     title.as_deref(),
@@ -3172,8 +3234,12 @@ impl KaraokeApp {
             }
 
             if do_lrc {
-                let text =
-                    formats::export_lrc(&timed, lrc_enhanced, title.as_deref(), artist.as_deref());
+                let text = formats::export_lrc(
+                    &lrc_lines,
+                    lrc_enhanced,
+                    title.as_deref(),
+                    artist.as_deref(),
+                );
                 let r = std::fs::write(&lrc_path, text)
                     .map(|()| lrc_path.clone())
                     .map_err(|e| e.to_string());
@@ -3319,6 +3385,7 @@ impl KaraokeApp {
                     let video_phase = phase_index;
                     let r = video::render_video(
                         &timed,
+                        &backing,
                         total_duration,
                         &video_palette,
                         title.as_deref(),
@@ -3522,6 +3589,9 @@ impl KaraokeApp {
             if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Screaming);
             }
+            if ctx.input(|i| i.key_pressed(egui::Key::B) && !i.modifiers.command) {
+                self.assign_singer_to_current_line(Singer::Backing);
+            }
         }
     }
 
@@ -3538,6 +3608,7 @@ impl KaraokeApp {
     fn draw_preview(&mut self, ui: &mut egui::Ui, max_height: Option<f32>) {
         let t = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
         let (timed, _total) = self.resolved();
+        let backing = self.resolved_backing();
         let card_end = export::title_card_end(&timed);
 
         // Fills whatever width it's given (the right panel can be dragged
@@ -3599,7 +3670,7 @@ impl KaraokeApp {
         content_ui.set_clip_rect(rect);
         let ui = &mut content_ui;
         {
-            let legend_singers = singer_legend(&timed);
+            let legend_singers = singer_legend(&timed, &backing);
             let has_title_card = !self.title.trim().is_empty()
                 || !self.artist.trim().is_empty()
                 || !legend_singers.is_empty();
@@ -3997,78 +4068,6 @@ impl KaraokeApp {
                                             ui.add_space(height * 0.11);
                                         }
                                     }
-
-                                    // A backing/echo vocal (if any) draws directly
-                                    // beneath the current line, smaller, in its own
-                                    // color, with its own independent wipe - only
-                                    // while its own (bounded within the host's)
-                                    // window is actually active. Same idea as the
-                                    // main line's wipe job above, just for the
-                                    // (usually much shorter) echoed text - see the
-                                    // matching block in video.rs's render_frame,
-                                    // which this was missing entirely before, so a
-                                    // fully set-up backing vocal never showed
-                                    // anything here even though the real video
-                                    // export already rendered it correctly.
-                                    if let Some(bv) = &line.backing_vocal {
-                                        if t >= bv.start && t < bv.end {
-                                            let (bv_unsung, bv_highlight) =
-                                                self.singer_colors(bv.singer);
-                                            let bv_normalized = lyrics::normalize_text(&bv.text);
-                                            let bv_chars: Vec<char> =
-                                                bv_normalized.chars().collect();
-                                            let bv_spans = lyrics::word_char_spans(&bv_normalized);
-                                            let bv_boundary =
-                                                lyrics::backing_vocal_wipe_fraction(bv, t)
-                                                    * bv_chars.len().max(1) as f32;
-                                            let bv_font_id = egui::FontId::new(
-                                                height * 0.0385,
-                                                lyric_family.clone(),
-                                            );
-                                            let mut bv_job = egui::text::LayoutJob {
-                                                halign: egui::Align::Center,
-                                                ..Default::default()
-                                            };
-                                            for (i, &(offset, len)) in bv_spans.iter().enumerate() {
-                                                let word_text: String =
-                                                    bv_chars[offset..offset + len].iter().collect();
-                                                let split = ((bv_boundary - offset as f32)
-                                                    .round()
-                                                    .clamp(0.0, len as f32))
-                                                    as usize;
-                                                let sung_part: String =
-                                                    word_text.chars().take(split).collect();
-                                                let rest: String =
-                                                    word_text.chars().skip(split).collect();
-                                                let suffix =
-                                                    if i + 1 < bv_spans.len() { " " } else { "" };
-                                                let append_bv =
-                                                    |job: &mut egui::text::LayoutJob,
-                                                     text: &str,
-                                                     color: egui::Color32| {
-                                                        if text.is_empty() {
-                                                            return;
-                                                        }
-                                                        job.append(
-                                                            text,
-                                                            0.0,
-                                                            egui::TextFormat {
-                                                                color,
-                                                                font_id: bv_font_id.clone(),
-                                                                ..Default::default()
-                                                            },
-                                                        );
-                                                    };
-                                                append_bv(&mut bv_job, &sung_part, bv_highlight);
-                                                append_bv(
-                                                    &mut bv_job,
-                                                    &format!("{rest}{suffix}"),
-                                                    bv_unsung,
-                                                );
-                                            }
-                                            ui.label(bv_job);
-                                        }
-                                    }
                                 }
                                 std::cmp::Ordering::Greater => {
                                     if hide_upcoming {
@@ -4112,6 +4111,55 @@ impl KaraokeApp {
                 }
             });
         }
+
+        // The backing track's own lane, at the same fixed spot near the
+        // bottom the video export uses (see `video::BACKING_LANE_Y`) -
+        // painted directly rather than laid out with the flow above, since
+        // it's independent of whatever the main lines are doing.
+        let windows = lyrics::backing_display_windows(&backing);
+        if let Some(k) = lyrics::active_backing_line(&windows, t) {
+            let line = &backing[k];
+            let (unsung, highlight) = self.singer_colors(line.singer);
+            let font_id =
+                egui::FontId::new(height * video::BACKING_LANE_FONT, self.lyric_font_family());
+            let normalized = lyrics::normalize_text(&line.text);
+            let job = if t >= line.start && t < line.sing_end {
+                wipe_layout_job(
+                    &normalized,
+                    lyrics::current_line_wipe_fraction(line, t),
+                    font_id,
+                    unsung,
+                    highlight,
+                )
+            } else {
+                let color = if t >= line.sing_end {
+                    highlight
+                } else {
+                    unsung
+                };
+                let alpha = lyrics::backing_line_alpha(line, windows[k], t);
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &normalized,
+                    0.0,
+                    egui::TextFormat {
+                        color: faded_color(color, alpha),
+                        font_id,
+                        ..Default::default()
+                    },
+                );
+                job
+            };
+            let mut job = job;
+            job.wrap.max_width = rect.width() * 0.92;
+            job.halign = egui::Align::Center;
+            let galley = ui.fonts(|f| f.layout_job(job));
+            let baseline_y = rect.top() + height * video::BACKING_LANE_Y;
+            let pos = egui::pos2(rect.center().x, baseline_y - galley.size().y * 0.8);
+            ui.painter()
+                .with_clip_rect(rect)
+                .galley(pos, galley, egui::Color32::WHITE);
+        }
     }
 
     /// Draws the fine-tuning timeline: one draggable/resizable "bubble" per
@@ -4126,7 +4174,10 @@ impl KaraokeApp {
     /// tap-based workflow and the "Fine-tune words" panel do, so all three
     /// stay in sync automatically.
     fn draw_timeline(&mut self, ui: &mut egui::Ui) {
-        let (timed, indices) = self.resolved_with_indices();
+        let (main_timed, main_indices) = self.resolved_with_indices();
+        let (backing_timed, backing_indices) =
+            lyrics::resolve_backing_track_indexed(&self.lines, &self.timing_settings);
+        let has_backing = !backing_timed.is_empty();
         let area_width = ui.available_width();
 
         ui.horizontal(|ui| {
@@ -4140,7 +4191,12 @@ impl KaraokeApp {
                 self.timeline_view.zoom_at(1.5, 0.0, mid_time);
             }
             if ui.small_button("Fit").clicked() {
-                let last_end = timed.last().map(|t| t.end).unwrap_or(30.0).max(1.0);
+                let last_end = main_timed
+                    .last()
+                    .map(|t| t.end)
+                    .unwrap_or(30.0)
+                    .max(backing_timed.iter().map(|t| t.sing_end).fold(0.0, f64::max))
+                    .max(1.0);
                 self.timeline_view.px_per_sec = (area_width / last_end as f32)
                     .clamp(timeline::MIN_PX_PER_SEC, timeline::MAX_PX_PER_SEC);
                 self.timeline_view.scroll_secs = 0.0;
@@ -4154,7 +4210,7 @@ impl KaraokeApp {
             }
         });
 
-        if timed.is_empty() {
+        if main_timed.is_empty() && !has_backing {
             ui.label(
                 "Time at least one line (tap along, or use the table below) to use the timeline.",
             );
@@ -4165,7 +4221,12 @@ impl KaraokeApp {
         let line_row_h = 28.0;
         let row_gap = 6.0;
         let word_row_h = 28.0;
-        let height = ruler_h + 4.0 + line_row_h + row_gap + word_row_h + 4.0;
+        // Each track (main, and the backing track if there is one) gets its
+        // own lane: a line-bubble row with a word-bubble row under it.
+        let lane_h = line_row_h + row_gap + word_row_h;
+        let lane_gap = 10.0;
+        let backing_lane_h = if has_backing { lane_gap + lane_h } else { 0.0 };
+        let height = ruler_h + 4.0 + lane_h + backing_lane_h + 4.0;
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(area_width, height),
             egui::Sense::click_and_drag(),
@@ -4216,10 +4277,10 @@ impl KaraokeApp {
         // bubbles (and behind their semi-transparent fill, see below) so a
         // bubble's edge can be visually compared against an actual vocal
         // onset instead of just trusting the tapped/estimated timestamp.
-        let line_row_top = rect.top() + ruler_h + 4.0;
+        let main_lane_top = rect.top() + ruler_h + 4.0;
         if let Some(waveform) = &self.waveform {
-            let wave_top = line_row_top;
-            let wave_bottom = line_row_top + line_row_h + row_gap + word_row_h;
+            let wave_top = main_lane_top;
+            let wave_bottom = main_lane_top + lane_h + backing_lane_h;
             let wave_center = (wave_top + wave_bottom) / 2.0;
             let wave_half_h = (wave_bottom - wave_top) / 2.0 - 2.0;
             let wc = ui.visuals().weak_text_color();
@@ -4240,288 +4301,136 @@ impl KaraokeApp {
             }
         }
 
-        // Line bubbles - one per timed line, in start-time order.
-        for (i, line) in timed.iter().enumerate() {
-            let orig_idx = indices[i];
-            let x0 = self.timeline_view.time_to_x(rect.left(), line.start);
-            let x1 = self.timeline_view.time_to_x(rect.left(), line.sing_end);
-            if x1 < rect.left() || x0 > rect.right() {
-                continue; // fully off-screen - skip drawing and interaction
-            }
-            let bubble_rect = egui::Rect::from_min_max(
-                egui::pos2(x0.max(rect.left()), line_row_top),
-                egui::pos2(
-                    x1.max(x0 + 1.0).min(rect.right()),
-                    line_row_top + line_row_h,
-                ),
+        let backing_lane_top = main_lane_top + lane_h + lane_gap;
+        if has_backing {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), backing_lane_top - lane_gap / 2.0),
+                    egui::pos2(rect.right(), backing_lane_top - lane_gap / 2.0),
+                ],
+                egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color().gamma_multiply(0.5)),
             );
-
-            let id = ui.id().with(("timeline_bubble", orig_idx));
-            let bubble_response = ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
-
-            let (_, highlight) = self.singer_colors(line.singer);
-            let is_selected = self.word_tap_line == Some(orig_idx);
-            let fill = highlight.gamma_multiply(if is_selected { 0.85 } else { 0.55 });
-            // Real alpha (not just a darker color) so the waveform drawn
-            // behind bubbles is still visible through them - otherwise a
-            // misaligned bubble would hide the very peak it should be
-            // lined up against.
-            let fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 205);
-            let stroke = if is_selected {
-                egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
-            } else {
-                egui::Stroke::new(1.0_f32, highlight)
-            };
-            painter.rect_filled(bubble_rect, 3.0, fill);
-            painter.rect_stroke(bubble_rect, 3.0, stroke);
-            Self::draw_edge_grab_strips(&painter, bubble_rect);
-            if bubble_rect.width() > 16.0 {
-                painter.with_clip_rect(bubble_rect.shrink(2.0)).text(
-                    egui::pos2(bubble_rect.left() + 4.0, bubble_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &line.text,
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::WHITE,
-                );
-            }
-
-            let active_mode = self
-                .timeline_drag
-                .as_ref()
-                .filter(|d| d.line_idx == orig_idx && d.target == TimelineDragTarget::Line)
-                .map(|d| d.session.mode);
-            if let Some(icon) = timeline_cursor_icon(active_mode, &bubble_response, bubble_rect) {
-                ui.ctx().set_cursor_icon(icon);
-            }
-
-            if bubble_response.clicked() {
-                self.word_tap_line = Some(orig_idx);
-            }
-
-            if bubble_response.drag_started() {
-                // Deliberately *not* `interact_pointer_pos()` here - egui
-                // only recognizes a drag once the pointer has moved past
-                // its own click-vs-drag threshold (`MAX_CLICK_DIST`, 6px as
-                // of egui 0.28), so by the time `drag_started()` fires,
-                // `interact_pointer_pos()` already reflects that post-
-                // threshold position, shifted a few pixels in whatever
-                // direction the user's hand first moved. Classifying the
-                // drag mode from that shifted position - rather than the
-                // actual mouse-down point - was misclassifying an edge-grab
-                // as a whole-bubble move whenever the very first motion
-                // happened to be toward the bubble's interior (exactly the
-                // natural direction when shrinking via that edge), with
-                // "drag the other way first, then back" as the only
-                // workaround. `press_origin()` is the true mouse-down
-                // position, unaffected by that threshold.
-                if let Some(press_pos) = ui.input(|i| i.pointer.press_origin()) {
-                    let local_x = press_pos.x - bubble_rect.left();
-                    let mode = timeline::classify_drag(local_x, bubble_rect.width());
-                    let prev_sing_end = if i > 0 {
-                        Some(timed[i - 1].sing_end)
-                    } else {
-                        None
-                    };
-                    let next_start = timed.get(i + 1).map(|t| t.start);
-                    let bounds = timeline::drag_bounds(prev_sing_end, next_start);
-                    // Trimming the left edge must keep the right edge fixed -
-                    // if the end isn't already pinned, pin it now so the
-                    // automatic estimate doesn't shift out from under us as
-                    // `start` changes.
-                    if mode == timeline::DragMode::LeftEdge {
-                        if let Some(l) = self.lines.get_mut(orig_idx) {
-                            if l.sing_end_override.is_none() {
-                                l.sing_end_override = Some(line.sing_end);
-                            }
-                        }
-                    }
-                    self.timeline_drag = Some(TimelineDrag {
-                        line_idx: orig_idx,
-                        target: TimelineDragTarget::Line,
-                        session: timeline::DragSession::start(
-                            mode,
-                            line.start,
-                            line.sing_end,
-                            bounds,
-                            press_pos.x,
-                        ),
-                    });
-                }
-            }
-
-            if bubble_response.dragged() {
-                if let Some(pos) = bubble_response.interact_pointer_pos() {
-                    let resolved = self
-                        .timeline_drag
-                        .as_ref()
-                        .filter(|d| d.line_idx == orig_idx && d.target == TimelineDragTarget::Line)
-                        .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
-                    if let Some((new_start, new_sing_end)) = resolved {
-                        if let Some(l) = self.lines.get_mut(orig_idx) {
-                            if let Some(s) = new_start {
-                                l.start = Some(s);
-                            }
-                            if let Some(e) = new_sing_end {
-                                l.sing_end_override = Some(e);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if bubble_response.drag_stopped()
-                && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
-                    == Some((orig_idx, TimelineDragTarget::Line))
-            {
-                if let Some(mode) = self.timeline_drag.as_ref().map(|d| d.session.mode) {
-                    let seek_near = match mode {
-                        timeline::DragMode::RightEdge => self.lines[orig_idx]
-                            .sing_end_override
-                            .unwrap_or(line.sing_end),
-                        timeline::DragMode::Body | timeline::DragMode::LeftEdge => {
-                            self.lines[orig_idx].start.unwrap_or(line.start)
-                        }
-                    };
-                    self.audition_seek(seek_near);
-                }
-                self.timeline_drag = None;
-            }
+            painter.text(
+                egui::pos2(rect.left() + 2.0, backing_lane_top - lane_gap / 2.0),
+                egui::Align2::LEFT_CENTER,
+                "Backing",
+                egui::FontId::proportional(9.0),
+                ui.visuals().weak_text_color(),
+            );
         }
-
-        // Word bubbles for *every* line, not just a selected one - drawn
-        // the whole time, aligned under each line's own span in the row
-        // below, so fine-tuning individual words never requires first
-        // clicking a line's bubble to "activate" it.
-        let word_row_top = line_row_top + line_row_h + row_gap;
-        for (i, line) in timed.iter().enumerate() {
-            let orig_idx = indices[i];
-            // Quick reject on the line's own [start, end) span (its words'
-            // `held_until` can extend as far as `end` - see the first/last
-            // word special-casing below) before bothering to compute word
-            // timings for a line that's entirely off-screen anyway.
-            let line_x0 = self.timeline_view.time_to_x(rect.left(), line.start);
-            let line_x1 = self.timeline_view.time_to_x(rect.left(), line.end);
-            if line_x1 < rect.left() || line_x0 > rect.right() {
-                continue;
-            }
-            let words = lyrics::word_timings(line);
-            let prev_line_sing_end = if i > 0 {
-                Some(timed[i - 1].sing_end)
-            } else {
-                None
-            };
-            let last_word_idx = words.len().saturating_sub(1);
-            for (w, word) in words.iter().enumerate() {
-                let x0 = self.timeline_view.time_to_x(rect.left(), word.highlight_at);
-                let x1 = self.timeline_view.time_to_x(rect.left(), word.held_until);
+        let lanes: [(&[TimedLine], &[usize], f32, bool); 2] = [
+            (&main_timed, &main_indices, main_lane_top, false),
+            (&backing_timed, &backing_indices, backing_lane_top, true),
+        ];
+        for (timed, indices, line_row_top, is_backing_lane) in lanes {
+            // Line bubbles - one per timed line, in start-time order. A backing
+            // lane's lines overlap each other and the main lane freely, so its
+            // drags have no neighbor bounds at all.
+            for (i, line) in timed.iter().enumerate() {
+                let orig_idx = indices[i];
+                let x0 = self.timeline_view.time_to_x(rect.left(), line.start);
+                let x1 = self.timeline_view.time_to_x(rect.left(), line.sing_end);
                 if x1 < rect.left() || x0 > rect.right() {
-                    continue;
+                    continue; // fully off-screen - skip drawing and interaction
                 }
                 let bubble_rect = egui::Rect::from_min_max(
-                    egui::pos2(x0.max(rect.left()), word_row_top),
+                    egui::pos2(x0.max(rect.left()), line_row_top),
                     egui::pos2(
                         x1.max(x0 + 1.0).min(rect.right()),
-                        word_row_top + word_row_h,
+                        line_row_top + line_row_h,
                     ),
                 );
 
-                let id = ui.id().with(("timeline_word_bubble", orig_idx, w));
+                let id = ui.id().with(("timeline_bubble", orig_idx));
                 let bubble_response = ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
 
                 let (_, highlight) = self.singer_colors(line.singer);
-                let word_fill = highlight.gamma_multiply(0.7);
-                let word_fill = egui::Color32::from_rgba_unmultiplied(
-                    word_fill.r(),
-                    word_fill.g(),
-                    word_fill.b(),
-                    205,
-                );
-                painter.rect_filled(bubble_rect, 3.0, word_fill);
-                painter.rect_stroke(
-                    bubble_rect,
-                    3.0,
-                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE.gamma_multiply(0.5)),
-                );
+                let is_selected = self.word_tap_line == Some(orig_idx);
+                let fill = highlight.gamma_multiply(if is_selected { 0.85 } else { 0.55 });
+                // Real alpha (not just a darker color) so the waveform drawn
+                // behind bubbles is still visible through them - otherwise a
+                // misaligned bubble would hide the very peak it should be
+                // lined up against.
+                let fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 205);
+                let stroke = if is_selected {
+                    egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
+                } else {
+                    egui::Stroke::new(1.0_f32, highlight)
+                };
+                painter.rect_filled(bubble_rect, 3.0, fill);
+                painter.rect_stroke(bubble_rect, 3.0, stroke);
                 Self::draw_edge_grab_strips(&painter, bubble_rect);
-                if bubble_rect.width() > 14.0 {
+                if bubble_rect.width() > 16.0 {
                     painter.with_clip_rect(bubble_rect.shrink(2.0)).text(
-                        egui::pos2(bubble_rect.left() + 3.0, bubble_rect.center().y),
+                        egui::pos2(bubble_rect.left() + 4.0, bubble_rect.center().y),
                         egui::Align2::LEFT_CENTER,
-                        word.text,
-                        egui::FontId::proportional(11.0),
+                        &line.text,
+                        egui::FontId::proportional(12.0),
                         egui::Color32::WHITE,
                     );
                 }
 
-                let target = TimelineDragTarget::Word(w);
                 let active_mode = self
                     .timeline_drag
                     .as_ref()
-                    .filter(|d| d.line_idx == orig_idx && d.target == target)
+                    .filter(|d| d.line_idx == orig_idx && d.target == TimelineDragTarget::Line)
                     .map(|d| d.session.mode);
                 if let Some(icon) = timeline_cursor_icon(active_mode, &bubble_response, bubble_rect)
                 {
                     ui.ctx().set_cursor_icon(icon);
                 }
 
+                if bubble_response.clicked() {
+                    self.word_tap_line = Some(orig_idx);
+                }
+
                 if bubble_response.drag_started() {
-                    // See the matching comment on the line-bubble drag
-                    // above - `press_origin()`, not `interact_pointer_pos()`,
-                    // is what the drag mode must be classified from.
+                    // Deliberately *not* `interact_pointer_pos()` here - egui
+                    // only recognizes a drag once the pointer has moved past
+                    // its own click-vs-drag threshold (`MAX_CLICK_DIST`, 6px as
+                    // of egui 0.28), so by the time `drag_started()` fires,
+                    // `interact_pointer_pos()` already reflects that post-
+                    // threshold position, shifted a few pixels in whatever
+                    // direction the user's hand first moved. Classifying the
+                    // drag mode from that shifted position - rather than the
+                    // actual mouse-down point - was misclassifying an edge-grab
+                    // as a whole-bubble move whenever the very first motion
+                    // happened to be toward the bubble's interior (exactly the
+                    // natural direction when shrinking via that edge), with
+                    // "drag the other way first, then back" as the only
+                    // workaround. `press_origin()` is the true mouse-down
+                    // position, unaffected by that threshold.
                     if let Some(press_pos) = ui.input(|i| i.pointer.press_origin()) {
                         let local_x = press_pos.x - bubble_rect.left();
                         let mode = timeline::classify_drag(local_x, bubble_rect.width());
-                        // Bound by the *line's* own singing window, not
-                        // the immediate neighbor's position - words
-                        // default to touching edge-to-edge with zero
-                        // gap, so bounding a drag by a neighbor's
-                        // current position would leave zero room to
-                        // move (a body-drag's available range is its
-                        // *current* span subtracted from the bound, and
-                        // that span already exactly fills the gap to a
-                        // touching neighbor). Letting a word's bubble
-                        // freely overlap a neighbor's default position is
-                        // harmless for the wipe rendering, which always
-                        // hands off at the *next* word's own start
-                        // regardless of a dragged word's start/end - the
-                        // one thing worth keeping in mind is that this
-                        // gives up automatic protection against
-                        // reordering words relative to each other if you
-                        // drag one very far past its neighbors.
-                        //
-                        // The first/last word are further special-cased:
-                        // their line-window bound (`line.start` /
-                        // `line.sing_end`) is exactly where their own
-                        // *default* position already sits, so without
-                        // widening it they'd have the same zero-slack
-                        // problem all over again at that one edge - so
-                        // let them push past it into the line's
-                        // *display* window (up to the previous line's
-                        // end, or this line's own `end`), and the
-                        // `dragged()` handler below carries the line's
-                        // own `start`/`sing_end_override` along with
-                        // them when they actually do.
-                        let min_start = if w == 0 {
-                            prev_line_sing_end.unwrap_or(0.0)
+                        let prev_sing_end = if i > 0 && !is_backing_lane {
+                            Some(timed[i - 1].sing_end)
                         } else {
-                            line.start
+                            None
                         };
-                        let max_sing_end = if w == last_word_idx {
-                            line.end
-                        } else {
-                            line.sing_end
-                        };
-                        let bounds = timeline::DragBounds {
-                            min_start,
-                            max_sing_end,
-                        };
+                        let next_start = timed
+                            .get(i + 1)
+                            .filter(|_| !is_backing_lane)
+                            .map(|t| t.start);
+                        let bounds = timeline::drag_bounds(prev_sing_end, next_start);
+                        // Trimming the left edge must keep the right edge fixed -
+                        // if the end isn't already pinned, pin it now so the
+                        // automatic estimate doesn't shift out from under us as
+                        // `start` changes.
+                        if mode == timeline::DragMode::LeftEdge {
+                            if let Some(l) = self.lines.get_mut(orig_idx) {
+                                if l.sing_end_override.is_none() {
+                                    l.sing_end_override = Some(line.sing_end);
+                                }
+                            }
+                        }
                         self.timeline_drag = Some(TimelineDrag {
                             line_idx: orig_idx,
-                            target,
+                            target: TimelineDragTarget::Line,
                             session: timeline::DragSession::start(
                                 mode,
-                                word.highlight_at,
-                                word.held_until,
+                                line.start,
+                                line.sing_end,
                                 bounds,
                                 press_pos.x,
                             ),
@@ -4534,43 +4443,17 @@ impl KaraokeApp {
                         let resolved = self
                             .timeline_drag
                             .as_ref()
-                            .filter(|d| d.line_idx == orig_idx && d.target == target)
+                            .filter(|d| {
+                                d.line_idx == orig_idx && d.target == TimelineDragTarget::Line
+                            })
                             .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
-                        if let Some((new_start, new_end)) = resolved {
+                        if let Some((new_start, new_sing_end)) = resolved {
                             if let Some(l) = self.lines.get_mut(orig_idx) {
                                 if let Some(s) = new_start {
-                                    if let Some(slot) = l.word_overrides.get_mut(w) {
-                                        *slot = Some(s);
-                                    }
-                                    // The first word's start always tracks
-                                    // the line's own start, in both
-                                    // directions - not just when pushed
-                                    // earlier - so shrinking it back in
-                                    // pulls the line bubble back with it
-                                    // too, instead of leaving the line
-                                    // stuck wherever it was last pushed
-                                    // out to. Already safe unconditionally:
-                                    // `bounds.min_start` above caps this
-                                    // drag at the previous line's own
-                                    // sing_end, the same neighbor limit
-                                    // `check_start_change` enforces
-                                    // elsewhere.
-                                    if w == 0 {
-                                        l.start = Some(s);
-                                    }
+                                    l.start = Some(s);
                                 }
-                                if let Some(e) = new_end {
-                                    if let Some(slot) = l.word_end_overrides.get_mut(w) {
-                                        *slot = Some(e);
-                                    }
-                                    // Symmetrically, the last word's end
-                                    // always tracks the line's own
-                                    // sing_end - see the matching comment
-                                    // above (bounds.max_sing_end caps this
-                                    // at the next line's start).
-                                    if w == last_word_idx {
-                                        l.sing_end_override = Some(e);
-                                    }
+                                if let Some(e) = new_sing_end {
+                                    l.sing_end_override = Some(e);
                                 }
                             }
                         }
@@ -4579,27 +4462,242 @@ impl KaraokeApp {
 
                 if bubble_response.drag_stopped()
                     && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
-                        == Some((orig_idx, target))
+                        == Some((orig_idx, TimelineDragTarget::Line))
                 {
                     if let Some(mode) = self.timeline_drag.as_ref().map(|d| d.session.mode) {
                         let seek_near = match mode {
                             timeline::DragMode::RightEdge => self.lines[orig_idx]
-                                .word_end_overrides
-                                .get(w)
-                                .copied()
-                                .flatten()
-                                .unwrap_or(word.held_until),
-                            timeline::DragMode::Body | timeline::DragMode::LeftEdge => self.lines
-                                [orig_idx]
-                                .word_overrides
-                                .get(w)
-                                .copied()
-                                .flatten()
-                                .unwrap_or(word.highlight_at),
+                                .sing_end_override
+                                .unwrap_or(line.sing_end),
+                            timeline::DragMode::Body | timeline::DragMode::LeftEdge => {
+                                self.lines[orig_idx].start.unwrap_or(line.start)
+                            }
                         };
                         self.audition_seek(seek_near);
                     }
                     self.timeline_drag = None;
+                }
+            }
+
+            // Word bubbles for *every* line, not just a selected one - drawn
+            // the whole time, aligned under each line's own span in the row
+            // below, so fine-tuning individual words never requires first
+            // clicking a line's bubble to "activate" it.
+            let word_row_top = line_row_top + line_row_h + row_gap;
+            for (i, line) in timed.iter().enumerate() {
+                let orig_idx = indices[i];
+                // Quick reject on the line's own [start, end) span (its words'
+                // `held_until` can extend as far as `end` - see the first/last
+                // word special-casing below) before bothering to compute word
+                // timings for a line that's entirely off-screen anyway.
+                let line_x0 = self.timeline_view.time_to_x(rect.left(), line.start);
+                let line_x1 = self.timeline_view.time_to_x(rect.left(), line.end);
+                if line_x1 < rect.left() || line_x0 > rect.right() {
+                    continue;
+                }
+                let words = lyrics::word_timings(line);
+                let prev_line_sing_end = if i > 0 && !is_backing_lane {
+                    Some(timed[i - 1].sing_end)
+                } else {
+                    None
+                };
+                let last_word_idx = words.len().saturating_sub(1);
+                for (w, word) in words.iter().enumerate() {
+                    let x0 = self.timeline_view.time_to_x(rect.left(), word.highlight_at);
+                    let x1 = self.timeline_view.time_to_x(rect.left(), word.held_until);
+                    if x1 < rect.left() || x0 > rect.right() {
+                        continue;
+                    }
+                    let bubble_rect = egui::Rect::from_min_max(
+                        egui::pos2(x0.max(rect.left()), word_row_top),
+                        egui::pos2(
+                            x1.max(x0 + 1.0).min(rect.right()),
+                            word_row_top + word_row_h,
+                        ),
+                    );
+
+                    let id = ui.id().with(("timeline_word_bubble", orig_idx, w));
+                    let bubble_response =
+                        ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
+
+                    let (_, highlight) = self.singer_colors(line.singer);
+                    let word_fill = highlight.gamma_multiply(0.7);
+                    let word_fill = egui::Color32::from_rgba_unmultiplied(
+                        word_fill.r(),
+                        word_fill.g(),
+                        word_fill.b(),
+                        205,
+                    );
+                    painter.rect_filled(bubble_rect, 3.0, word_fill);
+                    painter.rect_stroke(
+                        bubble_rect,
+                        3.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::WHITE.gamma_multiply(0.5)),
+                    );
+                    Self::draw_edge_grab_strips(&painter, bubble_rect);
+                    if bubble_rect.width() > 14.0 {
+                        painter.with_clip_rect(bubble_rect.shrink(2.0)).text(
+                            egui::pos2(bubble_rect.left() + 3.0, bubble_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            word.text,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+
+                    let target = TimelineDragTarget::Word(w);
+                    let active_mode = self
+                        .timeline_drag
+                        .as_ref()
+                        .filter(|d| d.line_idx == orig_idx && d.target == target)
+                        .map(|d| d.session.mode);
+                    if let Some(icon) =
+                        timeline_cursor_icon(active_mode, &bubble_response, bubble_rect)
+                    {
+                        ui.ctx().set_cursor_icon(icon);
+                    }
+
+                    if bubble_response.drag_started() {
+                        // See the matching comment on the line-bubble drag
+                        // above - `press_origin()`, not `interact_pointer_pos()`,
+                        // is what the drag mode must be classified from.
+                        if let Some(press_pos) = ui.input(|i| i.pointer.press_origin()) {
+                            let local_x = press_pos.x - bubble_rect.left();
+                            let mode = timeline::classify_drag(local_x, bubble_rect.width());
+                            // Bound by the *line's* own singing window, not
+                            // the immediate neighbor's position - words
+                            // default to touching edge-to-edge with zero
+                            // gap, so bounding a drag by a neighbor's
+                            // current position would leave zero room to
+                            // move (a body-drag's available range is its
+                            // *current* span subtracted from the bound, and
+                            // that span already exactly fills the gap to a
+                            // touching neighbor). Letting a word's bubble
+                            // freely overlap a neighbor's default position is
+                            // harmless for the wipe rendering, which always
+                            // hands off at the *next* word's own start
+                            // regardless of a dragged word's start/end - the
+                            // one thing worth keeping in mind is that this
+                            // gives up automatic protection against
+                            // reordering words relative to each other if you
+                            // drag one very far past its neighbors.
+                            //
+                            // The first/last word are further special-cased:
+                            // their line-window bound (`line.start` /
+                            // `line.sing_end`) is exactly where their own
+                            // *default* position already sits, so without
+                            // widening it they'd have the same zero-slack
+                            // problem all over again at that one edge - so
+                            // let them push past it into the line's
+                            // *display* window (up to the previous line's
+                            // end, or this line's own `end`), and the
+                            // `dragged()` handler below carries the line's
+                            // own `start`/`sing_end_override` along with
+                            // them when they actually do.
+                            let min_start = if w == 0 {
+                                prev_line_sing_end.unwrap_or(0.0)
+                            } else {
+                                line.start
+                            };
+                            let max_sing_end = if w == last_word_idx && is_backing_lane {
+                                // A backing line's end has no neighbor to
+                                // stop at - its last word can stretch freely.
+                                f64::INFINITY
+                            } else if w == last_word_idx {
+                                line.end
+                            } else {
+                                line.sing_end
+                            };
+                            let bounds = timeline::DragBounds {
+                                min_start,
+                                max_sing_end,
+                            };
+                            self.timeline_drag = Some(TimelineDrag {
+                                line_idx: orig_idx,
+                                target,
+                                session: timeline::DragSession::start(
+                                    mode,
+                                    word.highlight_at,
+                                    word.held_until,
+                                    bounds,
+                                    press_pos.x,
+                                ),
+                            });
+                        }
+                    }
+
+                    if bubble_response.dragged() {
+                        if let Some(pos) = bubble_response.interact_pointer_pos() {
+                            let resolved = self
+                                .timeline_drag
+                                .as_ref()
+                                .filter(|d| d.line_idx == orig_idx && d.target == target)
+                                .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
+                            if let Some((new_start, new_end)) = resolved {
+                                if let Some(l) = self.lines.get_mut(orig_idx) {
+                                    if let Some(s) = new_start {
+                                        if let Some(slot) = l.word_overrides.get_mut(w) {
+                                            *slot = Some(s);
+                                        }
+                                        // The first word's start always tracks
+                                        // the line's own start, in both
+                                        // directions - not just when pushed
+                                        // earlier - so shrinking it back in
+                                        // pulls the line bubble back with it
+                                        // too, instead of leaving the line
+                                        // stuck wherever it was last pushed
+                                        // out to. Already safe unconditionally:
+                                        // `bounds.min_start` above caps this
+                                        // drag at the previous line's own
+                                        // sing_end, the same neighbor limit
+                                        // `check_start_change` enforces
+                                        // elsewhere.
+                                        if w == 0 {
+                                            l.start = Some(s);
+                                        }
+                                    }
+                                    if let Some(e) = new_end {
+                                        if let Some(slot) = l.word_end_overrides.get_mut(w) {
+                                            *slot = Some(e);
+                                        }
+                                        // Symmetrically, the last word's end
+                                        // always tracks the line's own
+                                        // sing_end - see the matching comment
+                                        // above (bounds.max_sing_end caps this
+                                        // at the next line's start).
+                                        if w == last_word_idx {
+                                            l.sing_end_override = Some(e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if bubble_response.drag_stopped()
+                        && self.timeline_drag.as_ref().map(|d| (d.line_idx, d.target))
+                            == Some((orig_idx, target))
+                    {
+                        if let Some(mode) = self.timeline_drag.as_ref().map(|d| d.session.mode) {
+                            let seek_near = match mode {
+                                timeline::DragMode::RightEdge => self.lines[orig_idx]
+                                    .word_end_overrides
+                                    .get(w)
+                                    .copied()
+                                    .flatten()
+                                    .unwrap_or(word.held_until),
+                                timeline::DragMode::Body | timeline::DragMode::LeftEdge => self
+                                    .lines[orig_idx]
+                                    .word_overrides
+                                    .get(w)
+                                    .copied()
+                                    .flatten()
+                                    .unwrap_or(word.highlight_at),
+                            };
+                            self.audition_seek(seek_near);
+                        }
+                        self.timeline_drag = None;
+                    }
                 }
             }
         }
@@ -5260,6 +5358,15 @@ impl eframe::App for KaraokeApp {
                                         );
                                         ui.end_row();
 
+                                        ui.label("Backing - upcoming");
+                                        ui.color_edit_button_srgba(&mut self.color_backing_unsung);
+                                        ui.end_row();
+                                        ui.label("Backing - sung");
+                                        ui.color_edit_button_srgba(
+                                            &mut self.color_backing_highlight,
+                                        );
+                                        ui.end_row();
+
                                         ui.label("Next-line preview");
                                         ui.color_edit_button_srgba(&mut self.color_preview);
                                         ui.end_row();
@@ -5685,109 +5792,6 @@ impl eframe::App for KaraokeApp {
                 }
             }
 
-            // Backing/echo vocal panel - only shown while a line is
-            // selected for it (see the "Echo" button in the timing table
-            // below).
-            if let Some(i) = self.backing_vocal_edit {
-                if i < self.lines.len() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong("Backing vocal for:");
-                            ui.label(&self.lines[i].text);
-                            if ui.small_button("Close").clicked() {
-                                self.backing_vocal_edit = None;
-                            }
-                        });
-                        match self.lines[i].backing_vocal.is_some() {
-                            false => {
-                                ui.label(
-                                    "A second vocalist echoing/repeating part of this line \
-                                     while it's still being sung - typically just the last \
-                                     word or phrase.",
-                                );
-                                if ui.button("+ Add backing vocal").clicked() {
-                                    self.lines[i].backing_vocal = Some(BackingVocal::new(""));
-                                }
-                            }
-                            true => {
-                                ui.horizontal(|ui| {
-                                    ui.label("Text:");
-                                    if let Some(bv) = self.lines[i].backing_vocal.as_mut() {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut bv.text)
-                                                .hint_text("Echoed text…")
-                                                .desired_width(220.0),
-                                        );
-                                    }
-                                });
-                                let (bv_start, bv_end, bv_singer) = {
-                                    let bv = self.lines[i].backing_vocal.as_ref().unwrap();
-                                    (bv.start, bv.end, bv.singer)
-                                };
-                                ui.horizontal(|ui| {
-                                    ui.label(format!(
-                                        "Start: {}",
-                                        bv_start
-                                            .map(lyrics::format_timecode)
-                                            .unwrap_or_else(|| "—".to_string())
-                                    ));
-                                    if ui.small_button("Tap start").clicked() {
-                                        self.tap_backing_vocal_start(i);
-                                    }
-                                    ui.label(format!(
-                                        "End: {}",
-                                        bv_end
-                                            .map(lyrics::format_timecode)
-                                            .unwrap_or_else(|| "—".to_string())
-                                    ));
-                                    if ui.small_button("Tap end").clicked() {
-                                        self.tap_backing_vocal_end(i);
-                                    }
-                                });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Tap while the main line is playing - the backing \
-                                         vocal's own window must fall within the main line's \
-                                         own start/end.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                                ui.horizontal(|ui| {
-                                    ui.label("Voice:");
-                                    egui::ComboBox::from_id_source(("backing_vocal_singer", i))
-                                        .width(82.0)
-                                        .selected_text(bv_singer.label())
-                                        .show_ui(ui, |ui| {
-                                            for singer in Singer::ALL {
-                                                if ui
-                                                    .selectable_label(
-                                                        bv_singer == singer,
-                                                        singer.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    if let Some(bv) =
-                                                        self.lines[i].backing_vocal.as_mut()
-                                                    {
-                                                        bv.singer = singer;
-                                                    }
-                                                }
-                                            }
-                                        });
-                                });
-                                if ui.small_button("Remove backing vocal").clicked() {
-                                    self.lines[i].backing_vocal = None;
-                                }
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-                } else {
-                    self.backing_vocal_edit = None;
-                }
-            }
-
             // `self.lines` can change out from under a stale selection
             // (re-parsing, undo/redo, loading a different file, ...) -
             // drop anything that no longer points at a real line before
@@ -5894,10 +5898,16 @@ impl eframe::App for KaraokeApp {
                         }
                         prev_sing_end = Some(t.sing_end);
                     }
+                    let (backing_for_grid, backing_indices_for_grid) =
+                        lyrics::resolve_backing_track_indexed(&self.lines, &self.timing_settings);
+                    for (t, &orig_idx) in backing_for_grid.iter().zip(backing_indices_for_grid.iter())
+                    {
+                        estimated_end[orig_idx] = Some(t.sing_end);
+                    }
 
                     let mut retap_idx: Option<usize> = None;
                     let mut words_idx: Option<usize> = None;
-                    let mut backing_idx: Option<usize> = None;
+                    let mut backing_toggle_idx: Option<usize> = None;
                     let mut nudge: Option<(usize, f64)> = None;
                     let mut clear_idx: Option<usize> = None;
                     let mut commit_start: Option<(usize, String)> = None;
@@ -6028,10 +6038,24 @@ impl eframe::App for KaraokeApp {
                                     } else {
                                         220.0
                                     });
+                                    // Backing lines are indented and italic so
+                                    // the second voice reads as tucked in under
+                                    // the main lyrics around it.
+                                    let shown_text: std::borrow::Cow<str> =
+                                        if self.lines[i].is_backing {
+                                            std::borrow::Cow::Owned(format!("↳ {shown_text}"))
+                                        } else {
+                                            shown_text
+                                        };
                                     let text_label = if is_next {
                                         egui::RichText::new(shown_text.as_ref()).strong()
                                     } else {
                                         egui::RichText::new(shown_text.as_ref())
+                                    };
+                                    let text_label = if self.lines[i].is_backing {
+                                        text_label.italics()
+                                    } else {
+                                        text_label
                                     };
                                     // Clicking the lyric text itself opens/switches the
                                     // "Fine-tune words" panel to this line - the same as
@@ -6117,6 +6141,7 @@ impl eframe::App for KaraokeApp {
                                                 (Singer::Female, "Female"),
                                                 (Singer::Duet, "Duet"),
                                                 (Singer::Screaming, "Screaming"),
+                                                (Singer::Backing, "Backing"),
                                             ] {
                                                 let selected = self.lines[i].singer == base
                                                     && self.lines[i].custom_singer_name.is_none();
@@ -6207,25 +6232,43 @@ impl eframe::App for KaraokeApp {
                                     }
                                 });
 
-                                if ui.small_button("Tap").clicked() {
+                                if self.lines[i].is_backing {
+                                    // Backing lines aren't part of tap-along,
+                                    // so their own Tap button does both ends:
+                                    // see `tap_backing_line`.
+                                    let wants_end = self.lines[i].start.is_some()
+                                        && self.lines[i].sing_end_override.is_none();
+                                    let label = if wants_end { "Tap end" } else { "Tap start" };
+                                    if ui
+                                        .small_button(label)
+                                        .on_hover_text(
+                                            "While the song plays: tap when the backing vocal \
+                                             starts, then again when it ends. Backing lines are \
+                                             skipped by tap-along, so time them here (a second \
+                                             play-through works well).",
+                                        )
+                                        .clicked()
+                                    {
+                                        retap_idx = Some(i);
+                                    }
+                                } else if ui.small_button("Tap").clicked() {
                                     retap_idx = Some(i);
                                 }
                                 if ui.small_button("Words").clicked() {
                                     words_idx = Some(i);
                                 }
-                                let echo_label = if self.lines[i].backing_vocal.is_some() {
-                                    "Echo ●"
-                                } else {
-                                    "Echo"
-                                };
                                 if ui
-                                    .small_button(echo_label)
+                                    .selectable_label(self.lines[i].is_backing, "Backing")
                                     .on_hover_text(
-                                        "Add/edit a backing vocal overlapping this line.",
+                                        "Make this a backing vocal: a second voice singing \
+                                         different lyrics over the main line(s). It's timed \
+                                         independently and can overlap any main line, and \
+                                         shows in its own lane below the main lyrics. Click \
+                                         again to put it back on the main track.",
                                     )
                                     .clicked()
                                 {
-                                    backing_idx = Some(i);
+                                    backing_toggle_idx = Some(i);
                                 }
                                 ui.horizontal(|ui| {
                                     if self.lines[i].start.is_some() {
@@ -6255,13 +6298,17 @@ impl eframe::App for KaraokeApp {
                                 );
                             }
                             if let Some(i) = retap_idx {
-                                self.retap_line(i);
+                                if self.lines[i].is_backing {
+                                    self.tap_backing_line(i);
+                                } else {
+                                    self.retap_line(i);
+                                }
                             }
                             if let Some(i) = words_idx {
                                 self.word_tap_line = Some(i);
                             }
-                            if let Some(i) = backing_idx {
-                                self.backing_vocal_edit = Some(i);
+                            if let Some(i) = backing_toggle_idx {
+                                self.toggle_backing_line(i);
                             }
                             if let Some((i, delta)) = nudge {
                                 if let Some(s) = &mut self.lines[i].start {

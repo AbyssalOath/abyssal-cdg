@@ -7,6 +7,42 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-02
+
+### Added
+
+- **Overlapping backing vocals (two-lane duets)**: any lyric line can be
+  switched to a backing vocal with the new **Backing** button in the timing
+  table. A backing line is timed fully independently of the main lyrics -
+  it can start mid-line and run across any number of main lines - for a
+  backing vocalist singing/screaming different words behind the lead, or a
+  duet where both singers overlap with their own lyrics. Lyric parsing is
+  unchanged: backing lines are ordinary lines in the pasted lyrics (type in
+  any that are missing and re-parse - timing is kept). Tap-along skips
+  them; each has its own Tap start/Tap end button instead. They render in
+  their own lane below the main lyrics in the live preview and video
+  export, on their own row in the `.cdg` export, and in their own lane on
+  the timeline. LRC export interleaves them by time.
+- **Backing voice color**: a 6th voice (alongside Default/Male/Female/
+  Duet/Screaming) with its own customizable color pair in every preset,
+  given to a line automatically when it's switched to a backing vocal.
+  Keyboard shortcut **B**. This fills the `.cdg` palette's last two free
+  slots.
+
+### Changed
+
+- **The "Echo" backing vocal is replaced by backing lines** (above), which
+  aren't limited to their host line's own window. Projects saved with echo
+  vocals are converted automatically on load - each becomes a backing line
+  right under its old host line, with its timing, voice and text intact
+  (the text is added to the lyrics box too).
+
+### Fixed
+
+- **Re-parsing lyrics no longer resets a line's custom singer name or
+  Countdown mode** - both are now carried over like the line's timing and
+  voice, for unchanged and reworded lines alike.
+
 ## [0.2.3] - 2026-10-28
 
 ### Added

@@ -76,6 +76,13 @@ pub struct ProjectColors {
     pub artist: RgbColor,
     pub screaming_unsung: RgbColor,
     pub screaming_highlight: RgbColor,
+    /// The `Backing` voice's color pair - `None` in every project saved
+    /// before it existed (via `#[serde(default)]`); callers fall back to
+    /// the default palette's own backing colors in that case.
+    #[serde(default)]
+    pub backing_unsung: Option<RgbColor>,
+    #[serde(default)]
+    pub backing_highlight: Option<RgbColor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -254,6 +261,8 @@ mod tests {
             artist: c(10),
             screaming_unsung: c(11),
             screaming_highlight: c(12),
+            backing_unsung: Some(c(15)),
+            backing_highlight: Some(c(16)),
         }
     }
 
@@ -266,12 +275,10 @@ mod tests {
         lines[0].word_overrides[0] = Some(1.6);
         lines[0].word_end_overrides[1] = Some(3.0);
         lines[0].countdown_mode = crate::lyrics::CountdownMode::Force;
-        let mut bv = crate::lyrics::BackingVocal::new("echo");
-        bv.start = Some(2.0);
-        bv.end = Some(2.8);
-        bv.singer = Singer::Female;
-        lines[0].backing_vocal = Some(bv);
         lines[1].start = Some(4.0);
+        lines[1].is_backing = true;
+        lines[1].sing_end_override = Some(6.0);
+        lines[1].singer = Singer::Backing;
 
         let project = ProjectFile {
             version: CURRENT_VERSION,
@@ -367,6 +374,9 @@ mod tests {
         let colors: ProjectColors = serde_json::from_value(json).unwrap();
         assert_eq!(colors.default_unsung, None);
         assert_eq!(colors.default_highlight, None);
+        // Same for the later-added Backing voice.
+        assert_eq!(colors.backing_unsung, None);
+        assert_eq!(colors.backing_highlight, None);
     }
 
     #[test]

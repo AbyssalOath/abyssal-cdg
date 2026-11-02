@@ -41,8 +41,10 @@ create afterward.
    says which one (start or end, and which line) the next press will set.
    Skipping the end-tap is fine too - it just falls back to an automatic
    estimate until you set it, either later or via the timeline/table below.
-   Press **M/F/D/S** at any point to set the current line's voice
-   (Male/Female/Duet/Screaming) without reaching for the mouse. Once every
+   Press **M/F/D/S/B** at any point to set the current line's voice
+   (Male/Female/Duet/Screaming/Backing) without reaching for the mouse.
+   Tap-along skips backing-vocal lines (see step 7) - they're timed
+   separately. Once every
    line has both a start and an end, Space stops tapping and instead
    pauses/resumes playback (or starts it, if the song isn't playing yet) -
    handy for fine-tuning without reaching for the mouse each time.
@@ -57,7 +59,7 @@ create afterward.
    screen partway through a long one, not sitting there the whole time),
    all rendered live from the same logic used to generate the actual
    exported file.
-7. **Assign a voice per line** (Male / Female / Duet / Screaming) for duet
+7. **Assign a voice per line** (Male / Female / Duet / Screaming / Backing) for duet
    songs or intense sections - each gets its own color pair so singers can
    tell whose line is whose (or when to belt it) at a glance. For a song
    with more than one voice in the same category (two different men, three
@@ -70,6 +72,35 @@ create afterward.
    there's no separate color budget for arbitrarily many distinct singers,
    especially in the `.cdg` export's fixed 16-color palette - it's a
    distinct *label*, not a distinct color.
+
+   **Overlapping backing vocals / two-lane duets.** When a second voice
+   sings *different* lyrics at the same time as the lead - a backing
+   vocalist screaming behind the main line, or a duet where both singers
+   overlap with their own words - put that part on its own line in the
+   pasted lyrics (typically right under the main line it goes with; if
+   your pasted lyrics are missing it, just type it in and click
+   **Parse lyrics** again - existing timing is kept and the new line lands
+   where you typed it). Then click that line's **Backing** button in the
+   timing table. A backing line:
+   - is timed completely independently of the main lines, so it can start
+     mid-line and run past the end of the line it goes with, into the next
+     one (or several);
+   - is skipped by tap-along, and gets its own **Tap start / Tap end**
+     button instead - easiest on a second play-through once the main lines
+     are tapped (or type its times, or drag its bubble on the timeline,
+     where backing lines get their own lane);
+   - gets the dedicated **Backing** voice color by default (customizable in
+     Colors, like every other voice), though any voice/custom name works;
+   - shows in its own lane below the main lyrics in the preview and video,
+     and on its own row under the current line in the `.cdg` - appearing a
+     moment before it starts, with its own word-wipe running alongside the
+     main line's.
+
+   Click **Backing** again to put a line back on the main track. Only one
+   backing line shows at a time - if two backing lines overlap each other,
+   the later one takes over the lane when it starts. LRC export includes
+   backing lines interleaved by time; UltraStar export includes main lines
+   only.
 8. **Fine-tune individual words** a few ways:
    - Click a lyric line (or the "Words" button next to it) to open a strip
      of clickable word buttons for it, and a Start/End toggle above them.

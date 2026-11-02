@@ -20,24 +20,22 @@
 //! current line renders at 2x size (each character spanning a 2x2 grid of
 //! tiles) whenever it's short enough to fit, and automatically falls back
 //! to normal size for longer lines so nothing runs off-screen or clips. A
-//! backing vocal always renders at 1x - a smaller, visually secondary row.
+//! backing-track line always renders at 1x - a smaller, visually secondary
+//! row.
 //!
-//! Color palette: the CDG format gives us 16 color slots. We use 14 of
-//! them: 8 for background/voice text colors (loaded via the low CLUT,
-//! completely full: background + 3 voices x 2 colors + preview), and 6
-//! more for the title/artist card plus the "screaming" and "default" voice
-//! color pairs (loaded via the high CLUT, which has 2 of its 8 slots left
-//! free for future use). A backing vocal doesn't need any of those free
-//! slots - it reuses [`crate::lyrics::Singer`] for its own color instead of
-//! a dedicated category, so it can be colored distinctly from its host
-//! (e.g. host = Male, backing = Female) using colors that are already loaded.
+//! Color palette: the CDG format gives us 16 color slots, and all 16 are
+//! used: 8 for background/voice text colors (loaded via the low CLUT,
+//! completely full: background + 3 voices x 2 colors + preview), and 8
+//! more for the title/artist card plus the "screaming", "default" and
+//! "backing" voice color pairs (loaded via the high CLUT, also full). There
+//! is no room left for another voice color pair.
 
 use crate::cdg::{CdgColor, CdgWriter, BLANK_TILE, SAFE_COLS};
 use crate::font;
 #[cfg(test)]
 use crate::lyrics::CountdownMode;
 use crate::lyrics::{
-    backing_vocal_word_timings, countdown_window, countdown_window_between, effective_singer_label,
+    backing_display_windows, countdown_window, countdown_window_between, effective_singer_label,
     singer_legend, word_timings, Singer, TimedLine, TimingSettings, SUNG_LINGER_SECS,
 };
 use anyhow::{Context, Result};
@@ -50,13 +48,16 @@ const ARTIST_ROW: u8 = 4;
 /// the title/artist card for songs with more than one voice color in play.
 const LEGEND_ROW: u8 = 5;
 const CURRENT_ROW: u8 = 6;
-/// A backing/echo vocal (see [`crate::lyrics::BackingVocal`]) renders here,
-/// directly beneath the current line's own band, always at 1x scale - a
-/// smaller row for what's meant to read as a secondary, subordinate voice,
-/// with its own independent word-wipe running concurrently with the
-/// current line's. Free during normal singing (rows 8-9, 11-12, and 14-15
-/// are all otherwise unused outside the title card), so this doesn't
-/// crowd anything else out.
+/// The backing track (see [`crate::lyrics::LyricLine::is_backing`])
+/// renders here, directly beneath the current line's own band, always at
+/// 1x scale - a smaller row for what's meant to read as a secondary voice,
+/// with its own independent word-wipe running concurrently with whatever
+/// main line is playing. This row is owned entirely by the backing track's
+/// own schedule (see [`BackingLane`]), independent of the main lines'
+/// loop, since a backing line can start/end anywhere relative to them.
+/// Free during normal singing (rows 8-9, 11-12, and 14-15 are all
+/// otherwise unused outside the title card), so this doesn't crowd
+/// anything else out.
 const BACKING_ROW: u8 = 8;
 const PREVIEW_ROW: u8 = 10;
 const COUNTDOWN_ROW: u8 = 13;
@@ -74,13 +75,15 @@ const FEMALE_HIGHLIGHT: u8 = 4;
 const DUET_UNSUNG: u8 = 5;
 const DUET_HIGHLIGHT: u8 = 6;
 const PREVIEW: u8 = 7;
-// High CLUT (palette indices 8-15, loaded separately; 14-15 unused):
+// High CLUT (palette indices 8-15, loaded separately; all 8 used):
 const TITLE: u8 = 8;
 const ARTIST: u8 = 9;
 const SCREAMING_UNSUNG: u8 = 10;
 const SCREAMING_HIGHLIGHT: u8 = 11;
 const DEFAULT_UNSUNG: u8 = 12;
 const DEFAULT_HIGHLIGHT: u8 = 13;
+const BACKING_UNSUNG: u8 = 14;
+const BACKING_HIGHLIGHT: u8 = 15;
 
 /// A fully customizable set of on-screen colors. All defaults produce the
 /// classic white/yellow karaoke look; duet voices get their own color pair
@@ -105,6 +108,10 @@ pub struct Palette {
     pub artist: CdgColor,
     pub screaming_unsung: CdgColor,
     pub screaming_highlight: CdgColor,
+    /// Color pair for [`Singer::Backing`] - the default voice of a
+    /// backing-track line.
+    pub backing_unsung: CdgColor,
+    pub backing_highlight: CdgColor,
 }
 
 impl Default for Palette {
@@ -124,6 +131,8 @@ impl Default for Palette {
             artist: CdgColor::new(9, 9, 12),
             screaming_unsung: CdgColor::new(9, 2, 1),
             screaming_highlight: CdgColor::new(15, 3, 0),
+            backing_unsung: CdgColor::new(8, 11, 13),
+            backing_highlight: CdgColor::new(0, 15, 15),
         }
     }
 }
@@ -148,6 +157,8 @@ impl Palette {
             artist: CdgColor::new(11, 11, 11),
             screaming_unsung: CdgColor::new(9, 2, 2),
             screaming_highlight: CdgColor::new(15, 0, 0),
+            backing_unsung: CdgColor::new(6, 8, 9),
+            backing_highlight: CdgColor::new(0, 15, 8),
         }
     }
 
@@ -168,6 +179,8 @@ impl Palette {
             artist: CdgColor::new(11, 7, 9),
             screaming_unsung: CdgColor::new(8, 1, 2),
             screaming_highlight: CdgColor::new(15, 2, 3),
+            backing_unsung: CdgColor::new(8, 7, 11),
+            backing_highlight: CdgColor::new(13, 8, 15),
         }
     }
 
@@ -188,6 +201,8 @@ impl Palette {
             artist: CdgColor::new(9, 11, 13),
             screaming_unsung: CdgColor::new(2, 3, 8),
             screaming_highlight: CdgColor::new(9, 0, 15),
+            backing_unsung: CdgColor::new(6, 10, 8),
+            backing_highlight: CdgColor::new(12, 15, 15),
         }
     }
 
@@ -229,6 +244,11 @@ impl Palette {
             // lightness jump, and no hue reliance whatsoever.
             screaming_unsung: CdgColor::new(5, 1, 1),
             screaming_highlight: CdgColor::new(15, 15, 15),
+            // Dim olive-brown -> pale straw - another dark/bright split,
+            // on a yellow axis distinct from the gold default highlight by
+            // being much paler.
+            backing_unsung: CdgColor::new(5, 4, 1),
+            backing_highlight: CdgColor::new(15, 15, 9),
             // Dim red-grey, one step brighter than the black background -
             // barely-there, matching every other preset's "preview" being a
             // dim/desaturated tone near its own background.
@@ -255,7 +275,6 @@ impl Palette {
     }
 
     fn high_clut(&self) -> [CdgColor; 8] {
-        let zero = CdgColor::new(0, 0, 0);
         [
             self.title,
             self.artist,
@@ -263,8 +282,8 @@ impl Palette {
             self.screaming_highlight,
             self.default_unsung,
             self.default_highlight,
-            zero,
-            zero,
+            self.backing_unsung,
+            self.backing_highlight,
         ]
     }
 
@@ -276,6 +295,7 @@ impl Palette {
             Singer::Female => (FEMALE_UNSUNG, FEMALE_HIGHLIGHT),
             Singer::Duet => (DUET_UNSUNG, DUET_HIGHLIGHT),
             Singer::Screaming => (SCREAMING_UNSUNG, SCREAMING_HIGHLIGHT),
+            Singer::Backing => (BACKING_UNSUNG, BACKING_HIGHLIGHT),
         }
     }
 }
@@ -290,17 +310,128 @@ struct LineLayout {
     scale: u8,
 }
 
-/// One character's scheduled highlight redraw - the current line's and a
-/// backing vocal's word events are collected into a single `Vec` of these
-/// and time-sorted before being emitted, so the two rows' wipes can be
-/// interleaved correctly (see the comment where they're merged in
-/// `render_cdg`).
+/// One character's scheduled highlight redraw on the current line's row.
 struct HighlightEvent {
     at: f64,
-    row: u8,
     char_idx: usize,
     ch: char,
     highlight_idx: u8,
+}
+
+/// Something the backing lane (see [`BACKING_ROW`]) needs to do at a given
+/// time - see [`BackingLane`].
+enum BackingOp {
+    /// Draw backing line `k`'s whole text in its unsung color.
+    Show(usize),
+    /// Highlight one character of backing line `k`.
+    Highlight {
+        k: usize,
+        char_idx: usize,
+        ch: char,
+        color: u8,
+    },
+    Clear,
+}
+
+/// The backing track's own pre-computed draw schedule. `CdgWriter::advance_to`
+/// is monotonic-only-forward (a target earlier than the writer's current
+/// position silently no-ops), and backing lines start/end independently of
+/// the main lines - so rather than trying to fit them into the main loop,
+/// every backing-lane operation is computed up front and time-sorted here,
+/// and *every* forward step the main loop takes goes through
+/// [`Self::advance`], which first emits whatever backing operations fall
+/// before that point. The two schedules interleave exactly as they would in
+/// real time.
+struct BackingLane {
+    layouts: Vec<LineLayout>,
+    unsung: Vec<u8>,
+    ops: Vec<(f64, BackingOp)>,
+    next: usize,
+}
+
+impl BackingLane {
+    fn new(track: &[TimedLine], palette: &Palette) -> Self {
+        let windows = backing_display_windows(track);
+        let mut layouts = Vec::with_capacity(track.len());
+        let mut unsung = Vec::with_capacity(track.len());
+        let mut ops: Vec<(f64, BackingOp)> = Vec::new();
+        for (k, (line, &(show, hide))) in track.iter().zip(windows.iter()).enumerate() {
+            let layout = layout_line_scaled(&line.text, 1);
+            let (unsung_idx, highlight_idx) = palette.singer_colors(line.singer);
+            if hide > show {
+                ops.push((show, BackingOp::Show(k)));
+                let chars: Vec<char> = layout.text.chars().collect();
+                let spans = word_spans(&layout.text);
+                for (tw, &(offset, len)) in word_timings(line).iter().zip(spans.iter()) {
+                    // A word that would only light up after this line has
+                    // already lost the lane (cut short by the next backing
+                    // line) must not draw over that next line's text.
+                    if tw.highlight_at >= hide {
+                        continue;
+                    }
+                    for c in 0..len {
+                        let char_idx = offset + c;
+                        ops.push((
+                            tw.highlight_at.max(show),
+                            BackingOp::Highlight {
+                                k,
+                                char_idx,
+                                ch: chars.get(char_idx).copied().unwrap_or(' '),
+                                color: highlight_idx,
+                            },
+                        ));
+                    }
+                }
+                ops.push((hide, BackingOp::Clear));
+            }
+            layouts.push(layout);
+            unsung.push(unsung_idx);
+        }
+        // Stable sort - ops pushed in order for line k all precede line
+        // k+1's at the same instant, so a line's Clear at exactly the next
+        // line's Show time still runs first.
+        ops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        Self {
+            layouts,
+            unsung,
+            ops,
+            next: 0,
+        }
+    }
+
+    /// Advances `w` to `t`, emitting every pending backing-lane operation
+    /// scheduled at or before `t` along the way.
+    fn advance(&mut self, w: &mut CdgWriter, t: f64) {
+        self.emit_until(w, t);
+        w.advance_to(t);
+    }
+
+    /// Emits every pending operation scheduled at or before `t`, without
+    /// moving the writer past the last one emitted.
+    fn emit_until(&mut self, w: &mut CdgWriter, t: f64) {
+        while let Some((at, op)) = self.ops.get(self.next) {
+            if *at > t {
+                break;
+            }
+            w.advance_to(*at);
+            match *op {
+                BackingOp::Show(k) => {
+                    clear_row(w, BACKING_ROW);
+                    draw_row_scaled(w, BACKING_ROW, &self.layouts[k], BG, self.unsung[k]);
+                }
+                BackingOp::Highlight {
+                    k,
+                    char_idx,
+                    ch,
+                    color,
+                } => {
+                    draw_char_at(w, BACKING_ROW, &self.layouts[k], char_idx, ch, BG, color);
+                }
+                BackingOp::Clear => clear_row(w, BACKING_ROW),
+            }
+            self.next += 1;
+        }
+    }
 }
 
 /// Lay out `text` at `preferred_scale`, automatically falling back to 1x
@@ -510,15 +641,21 @@ fn draw_countdown_dot(w: &mut CdgWriter, col: u8, color1: u8) {
 /// all 4 are already lit and stay that way, rather than the last dot only
 /// lighting up for a single instant exactly as the next line begins (which
 /// is effectively invisible).
-fn schedule_countdown_dots(w: &mut CdgWriter, cd_start: f64, cd_end: f64, lit_color: u8) {
-    w.advance_to(cd_start);
+fn schedule_countdown_dots(
+    w: &mut CdgWriter,
+    lane: &mut BackingLane,
+    cd_start: f64,
+    cd_end: f64,
+    lit_color: u8,
+) {
+    lane.advance(w, cd_start);
     let cols = countdown_columns();
     for &col in &cols {
         draw_countdown_dot(w, col, PREVIEW);
     }
     for (k, &col) in cols.iter().enumerate() {
         let t = cd_start + (k as f64) * (cd_end - cd_start) / 4.0;
-        w.advance_to(t);
+        lane.advance(w, t);
         draw_countdown_dot(w, col, lit_color);
     }
 }
@@ -540,6 +677,7 @@ pub fn render_cdg(
 ) -> Vec<u8> {
     render_cdg_with_settings(
         timed_lines,
+        &[],
         total_duration,
         palette,
         title,
@@ -549,8 +687,12 @@ pub fn render_cdg(
 }
 
 /// Render a complete karaoke CDG stream, padded to `total_duration` seconds.
+/// `backing_track` is the resolved backing track (see
+/// [`crate::lyrics::resolve_backing_track`]), drawn on its own row
+/// concurrently with `timed_lines` (the main track).
 pub fn render_cdg_with_settings(
     timed_lines: &[TimedLine],
+    backing_track: &[TimedLine],
     total_duration: f64,
     palette: &Palette,
     title: Option<&str>,
@@ -558,6 +700,7 @@ pub fn render_cdg_with_settings(
     timing_settings: &TimingSettings,
 ) -> Vec<u8> {
     let mut w = CdgWriter::new();
+    let mut lane = BackingLane::new(backing_track, palette);
 
     w.load_color_table(&palette.low_clut(), false);
     w.load_color_table(&palette.high_clut(), true);
@@ -582,7 +725,7 @@ pub fn render_cdg_with_settings(
             ARTIST,
         );
     }
-    let legend_singers = singer_legend(timed_lines);
+    let legend_singers = singer_legend(timed_lines, backing_track);
     if !legend_singers.is_empty() {
         let (text, colors) = legend_text_and_colors(palette, &legend_singers);
         draw_legend_row(&mut w, LEGEND_ROW, &layout_line_scaled(&text, 1), &colors);
@@ -594,7 +737,7 @@ pub fn render_cdg_with_settings(
     // song with no lyric lines at all.
     let card_end = title_card_end(timed_lines);
     if title.is_some() || artist.is_some() || !legend_singers.is_empty() {
-        w.advance_to(card_end);
+        lane.advance(&mut w, card_end);
         clear_band(&mut w, TITLE_ROW, PREFERRED_SCALE);
         clear_row(&mut w, ARTIST_ROW);
         clear_row(&mut w, LEGEND_ROW);
@@ -612,16 +755,15 @@ pub fn render_cdg_with_settings(
             countdown_window_between(card_end, first.start, first.countdown_mode, timing_settings)
         {
             let (_, highlight_idx) = palette.singer_colors(first.singer);
-            schedule_countdown_dots(&mut w, cd_start, cd_end, highlight_idx);
-            w.advance_to(cd_end);
+            schedule_countdown_dots(&mut w, &mut lane, cd_start, cd_end, highlight_idx);
+            lane.advance(&mut w, cd_end);
             clear_row(&mut w, COUNTDOWN_ROW);
         }
     }
 
     for (i, line) in timed_lines.iter().enumerate() {
-        w.advance_to(line.start);
+        lane.advance(&mut w, line.start);
         clear_band(&mut w, CURRENT_ROW, PREFERRED_SCALE);
-        clear_row(&mut w, BACKING_ROW);
         clear_row(&mut w, PREVIEW_ROW);
         clear_row(&mut w, COUNTDOWN_ROW);
 
@@ -635,17 +777,6 @@ pub fn render_cdg_with_settings(
             draw_row_scaled(&mut w, PREVIEW_ROW, &next_layout, BG, PREVIEW);
         }
 
-        // A backing/echo vocal (if any) draws its own base row now,
-        // alongside the current line's - its word-highlight events get
-        // merged into the same time-ordered sequence as the current line's
-        // own, below, so the two wipes can run concurrently.
-        let backing = line.backing_vocal.as_ref().map(|bv| {
-            let (bv_unsung_idx, bv_highlight_idx) = palette.singer_colors(bv.singer);
-            let bv_layout = layout_line_scaled(&bv.text, 1);
-            draw_row_scaled(&mut w, BACKING_ROW, &bv_layout, BG, bv_unsung_idx);
-            (bv_layout, bv_highlight_idx)
-        });
-
         let spans = word_spans(&layout.text);
         let words = word_timings(line);
         let chars: Vec<char> = layout.text.chars().collect();
@@ -655,50 +786,21 @@ pub fn render_cdg_with_settings(
                 let char_idx = offset + k;
                 events.push(HighlightEvent {
                     at: tw.highlight_at,
-                    row: CURRENT_ROW,
                     char_idx,
                     ch: chars.get(char_idx).copied().unwrap_or(' '),
                     highlight_idx,
                 });
             }
         }
-        if let (Some(bv), Some((bv_layout, bv_highlight_idx))) =
-            (line.backing_vocal.as_ref(), &backing)
-        {
-            let bv_spans = word_spans(&bv_layout.text);
-            let bv_words = backing_vocal_word_timings(bv);
-            let bv_chars: Vec<char> = bv_layout.text.chars().collect();
-            for (tw, &(offset, len)) in bv_words.iter().zip(bv_spans.iter()) {
-                for k in 0..len {
-                    let char_idx = offset + k;
-                    events.push(HighlightEvent {
-                        at: tw.highlight_at,
-                        row: BACKING_ROW,
-                        char_idx,
-                        ch: bv_chars.get(char_idx).copied().unwrap_or(' '),
-                        highlight_idx: *bv_highlight_idx,
-                    });
-                }
-            }
-        }
-        // `CdgWriter::advance_to` is monotonic-only-forward (a target
-        // earlier than the writer's current position silently no-ops), so
-        // the current line's and a backing vocal's word events - which
-        // interleave in real time whenever the two overlap, the whole
-        // point of a backing vocal - must be emitted in one time-sorted
-        // sequence, not "all current-line words, then all backing words".
-        events.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap());
+        // Manual word overrides can put words slightly out of order -
+        // `advance_to` only moves forward, so emit in time order.
+        events.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
         for ev in &events {
-            w.advance_to(ev.at);
-            let ev_layout = if ev.row == BACKING_ROW {
-                &backing.as_ref().unwrap().0
-            } else {
-                &layout
-            };
+            lane.advance(&mut w, ev.at);
             draw_char_at(
                 &mut w,
-                ev.row,
-                ev_layout,
+                CURRENT_ROW,
+                &layout,
                 ev.char_idx,
                 ev.ch,
                 BG,
@@ -718,7 +820,7 @@ pub fn render_cdg_with_settings(
             // clear it as soon as this line is done being sung, so the
             // screen reads as "done, waiting" and then the countdown dots,
             // rather than showing a line that's still a break away.
-            w.advance_to(line.sing_end);
+            lane.advance(&mut w, line.sing_end);
             clear_row(&mut w, PREVIEW_ROW);
 
             // Let the just-finished line linger fully highlighted for a
@@ -727,9 +829,8 @@ pub fn render_cdg_with_settings(
             // finish) - so a long break just shows a blank screen until the
             // countdown appears, instead of sitting there the whole time.
             let blank_at = (line.sing_end + SUNG_LINGER_SECS).min(cd_start);
-            w.advance_to(blank_at);
+            lane.advance(&mut w, blank_at);
             clear_band(&mut w, CURRENT_ROW, PREFERRED_SCALE);
-            clear_row(&mut w, BACKING_ROW);
 
             // Only actually draw the countdown dots if there's a real next
             // line to count into - for the last line of the song, this same
@@ -739,11 +840,16 @@ pub fn render_cdg_with_settings(
             // counting down to a line that doesn't exist.
             if let Some(next) = timed_lines.get(i + 1) {
                 let (_, next_highlight_idx) = palette.singer_colors(next.singer);
-                schedule_countdown_dots(&mut w, cd_start, cd_end, next_highlight_idx);
+                schedule_countdown_dots(&mut w, &mut lane, cd_start, cd_end, next_highlight_idx);
             }
         }
     }
 
+    // Whatever's left of the backing lane after the main track's last
+    // step - but nothing past the end of the song itself, which would only
+    // pad the file with an extra clear after the audio has stopped.
+    let song_end = total_duration.max(w.current_time_secs());
+    lane.emit_until(&mut w, song_end);
     w.pad_until(total_duration.max(w.current_time_secs()));
     w.into_bytes()
 }
@@ -890,7 +996,7 @@ mod tests {
         lines[1].singer = crate::lyrics::Singer::Female;
         let timed = resolve_timing(&lines, Some(6.0));
         assert_eq!(
-            crate::lyrics::singer_legend(&timed).len(),
+            crate::lyrics::singer_legend(&timed, &[]).len(),
             2,
             "a two-voice song should get a legend"
         );
@@ -904,7 +1010,7 @@ mod tests {
         lines[0].start = Some(0.0);
         lines[1].start = Some(3.0);
         let timed = resolve_timing(&lines, Some(6.0));
-        assert!(crate::lyrics::singer_legend(&timed).is_empty());
+        assert!(crate::lyrics::singer_legend(&timed, &[]).is_empty());
         let bytes = render_cdg(&timed, 6.0, &Palette::default(), None, None);
         assert_eq!(bytes.len() % 24, 0);
     }
@@ -935,8 +1041,8 @@ mod tests {
         let high = Palette::default().high_clut();
         assert_eq!(high.len(), 8);
         // Currently: title, artist, screaming_unsung, screaming_highlight,
-        // default_unsung, default_highlight (6 used), leaving exactly 2
-        // zero-padded slots free for later.
+        // default_unsung, default_highlight, backing_unsung,
+        // backing_highlight - all 8 used, nothing left free.
     }
 
     #[test]
@@ -989,6 +1095,7 @@ mod tests {
             ("female", p.female_unsung, p.female_highlight),
             ("duet", p.duet_unsung, p.duet_highlight),
             ("screaming", p.screaming_unsung, p.screaming_highlight),
+            ("backing", p.backing_unsung, p.backing_highlight),
         ];
         for (name, unsung, highlight) in pairs {
             assert!(
@@ -1163,53 +1270,97 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn backing_vocal_renders_without_panicking_and_produces_a_valid_stream() {
-        let mut lines = vec![LyricLine::new("hello world")];
-        lines[0].start = Some(0.0);
-        let mut bv = crate::lyrics::BackingVocal::new("hey");
-        bv.start = Some(1.0);
-        bv.end = Some(3.0);
-        lines[0].backing_vocal = Some(bv);
-        let timed = resolve_timing(&lines, Some(10.0));
-        assert!(timed[0].backing_vocal.is_some());
+    fn render_with_backing(lines: &[LyricLine], total: f64) -> Vec<u8> {
+        let settings = TimingSettings::default();
+        let timed = crate::lyrics::resolve_timing_with_settings(lines, Some(total), &settings);
+        let backing = crate::lyrics::resolve_backing_track(lines, &settings);
+        render_cdg_with_settings(
+            &timed,
+            &backing,
+            total,
+            &Palette::default(),
+            None,
+            None,
+            &settings,
+        )
+    }
 
-        let bytes = render_cdg(&timed, 10.0, &Palette::default(), None, None);
+    fn backing_line(text: &str, start: f64, end: f64) -> LyricLine {
+        let mut l = LyricLine::new(text);
+        l.is_backing = true;
+        l.start = Some(start);
+        l.sing_end_override = Some(end);
+        l.singer = Singer::Backing;
+        l
+    }
+
+    #[test]
+    fn a_backing_line_draws_on_its_own_row() {
+        let mut lines = vec![LyricLine::new("hello world"), backing_line("hey", 1.0, 3.0)];
+        lines[0].start = Some(0.0);
+        let bytes = render_with_backing(&lines, 10.0);
         assert_eq!(bytes.len() % 24, 0);
         assert!(
             non_blank_draws_at_row(&bytes, BACKING_ROW) > 0,
-            "expected the backing vocal to actually draw something on its row"
+            "expected the backing line to actually draw something on its row"
         );
     }
 
     #[test]
-    fn a_line_without_a_backing_vocal_draws_nothing_on_the_backing_row() {
+    fn a_song_without_backing_lines_draws_nothing_on_the_backing_row() {
         let mut lines = vec![LyricLine::new("hello world")];
         lines[0].start = Some(0.0);
-        let timed = resolve_timing(&lines, Some(10.0));
-        let bytes = render_cdg(&timed, 10.0, &Palette::default(), None, None);
+        let bytes = render_with_backing(&lines, 10.0);
         assert_eq!(non_blank_draws_at_row(&bytes, BACKING_ROW), 0);
     }
 
     #[test]
-    fn backing_vocal_uses_its_own_singers_colors_not_the_hosts() {
-        // Duet's highlight color differs from Male's in the default
-        // palette - render the same line/backing pair with each as the
-        // backing vocal's singer and confirm the resulting bytes differ,
-        // i.e. the backing vocal's own `singer` field actually reaches the
-        // renderer rather than silently inheriting the host's.
+    fn a_backing_line_spanning_several_main_lines_renders_validly() {
+        // Starts during main line 1, runs all the way through main line 3 -
+        // impossible with the old host-bounded echo.
+        let mut lines = vec![
+            LyricLine::new("one"),
+            backing_line("a long scream over everything", 0.5, 11.0),
+            LyricLine::new("two"),
+            LyricLine::new("three"),
+        ];
+        lines[0].start = Some(0.0);
+        lines[2].start = Some(4.0);
+        lines[3].start = Some(8.0);
+        let bytes = render_with_backing(&lines, 15.0);
+        assert_eq!(bytes.len() % 24, 0);
+        // Every main line still draws, and so does the backing line.
+        assert!(non_blank_draws_at_row(&bytes, BACKING_ROW) > 0);
+        assert!(non_blank_draws_at_row(&bytes, CURRENT_ROW) > 0);
+    }
+
+    #[test]
+    fn backing_lines_render_even_with_no_main_track_playing() {
+        let lines = vec![backing_line("only me", 2.0, 4.0)];
+        let bytes = render_with_backing(&lines, 6.0);
+        assert!(non_blank_draws_at_row(&bytes, BACKING_ROW) > 0);
+    }
+
+    #[test]
+    fn a_backing_line_uses_its_own_singers_colors() {
         let build = |backing_singer: Singer| {
-            let mut lines = vec![LyricLine::new("hello world")];
+            let mut lines = vec![LyricLine::new("hello world"), backing_line("hey", 1.0, 3.0)];
             lines[0].start = Some(0.0);
             lines[0].singer = Singer::Male;
-            let mut bv = crate::lyrics::BackingVocal::new("hey");
-            bv.start = Some(1.0);
-            bv.end = Some(3.0);
-            bv.singer = backing_singer;
-            lines[0].backing_vocal = Some(bv);
-            let timed = resolve_timing(&lines, Some(10.0));
-            render_cdg(&timed, 10.0, &Palette::default(), None, None)
+            lines[1].singer = backing_singer;
+            render_with_backing(&lines, 10.0)
         };
-        assert_ne!(build(Singer::Duet), build(Singer::Female));
+        assert_ne!(build(Singer::Duet), build(Singer::Backing));
+    }
+
+    #[test]
+    fn the_backing_voice_has_its_own_clut_slots() {
+        let p = Palette::default();
+        assert_eq!(
+            p.singer_colors(Singer::Backing),
+            (BACKING_UNSUNG, BACKING_HIGHLIGHT)
+        );
+        assert_eq!(p.high_clut()[6].r, p.backing_unsung.r);
+        assert_eq!(p.high_clut()[7].b, p.backing_highlight.b);
     }
 }

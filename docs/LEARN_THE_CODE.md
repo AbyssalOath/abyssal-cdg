@@ -290,7 +290,7 @@ this way, but it clusters similarly):
 |---|---|---|
 | Audio & project identity | `audio`, `lyrics_raw`, `lines`, `current_project_path`, `title`, `artist` | `lines: Vec<lyrics::LyricLine>` is the actual song data - everything else is either derived from it or metadata about it |
 | Crash recovery / save state | `pending_recovery`, `last_autosave`, `last_saved_snapshot` | `last_saved_snapshot` is compared against a freshly-built `to_project_file()` every time `has_unsaved_changes()` is asked |
-| Tapping | `next_untimed`, `tap_phase`, `word_tap_line`, `word_tap_mode`, `backing_vocal_edit` | drives the "Tap next line" button/Space key and the per-word fine-tune panel |
+| Tapping | `next_untimed`, `tap_phase`, `word_tap_line`, `word_tap_mode` | drives the "Tap next line" button/Space key and the per-word fine-tune panel |
 | Timing table UI | `start_edit`, `end_edit`, `selected_lines`, `selection_anchor`, `compact_timing_table` | `start_edit`/`end_edit` hold in-progress typed text separately from the committed value - see "Gotchas" below |
 | Colors | `color_bg`, `color_male_unsung`, `color_male_highlight`, ... (one `egui::Color32` pair per `Singer` variant, plus background/preview/title/artist), `color_preset` | `color_preset` is cosmetic only - it remembers which preset button was last clicked, for the dropdown's own display, and doesn't stay "locked in" against manual edits |
 | Video/background/font | `video_resolution`, `video_codec`, `show_credit_line`, `background`, `background_fit`, `background_dim`, `background_preview`, `selected_font_family`, `font_list`, `font_bytes`, `font_load_error`, `installed_egui_font` | `background_preview`'s inner `Option<TextureHandle>` being `None` specifically means "tried and failed," distinct from the outer `Option` being `None` ("nothing selected") |
@@ -616,10 +616,9 @@ is built on.
 | `Singer` | `Default`/`Male`/`Female`/`Duet`/`Screaming` - which voice sings a line. `Default` has its own customizable color pair (not forced to look like `Male`), but starts out rendering identically to it. |
 | `CountdownMode` | `Auto`/`Force`/`Suppress` - per-line override for whether the "get ready" countdown shows before this line. |
 | `TimingSettings` | User-configurable overrides for `SECONDS_PER_WORD`, `MIN_SING_DURATION`, `COUNTDOWN_GAP_THRESHOLD` - `Default` is exactly those three constants, so a project that never opens the Timing panel is byte-identical to before this setting existed. |
-| `LyricLine` | The **raw, user-edited** form: `text`, optional `start`, `singer`, per-word `word_overrides`/`word_end_overrides` (both `Vec<Option<f64>>`, one slot per word), optional `sing_end_override`, `starts_new_block`, optional `backing_vocal`, `countdown_mode`, optional `custom_singer_name`. |
-| `BackingVocal` | A second vocalist's line, embedded on its host `LyricLine` rather than a top-level entry of its own (see Gotchas) - same `word_overrides`/`word_end_overrides` shape as its host, scoped to its own text. |
+| `LyricLine` | The **raw, user-edited** form: `text`, optional `start`, `singer`, per-word `word_overrides`/`word_end_overrides` (both `Vec<Option<f64>>`, one slot per word), optional `sing_end_override`, `starts_new_block`, `is_backing` (backing-track line - see Gotchas), `countdown_mode`, optional `custom_singer_name`. Also a legacy load-only `backing_vocal`, converted away on project load by `migrate_legacy_backing_vocals`. |
+| `BackingVocal` | **Legacy** - the old embedded "Echo" vocal, kept only so older projects still deserialize; `migrate_legacy_backing_vocals` turns each into an `is_backing` line. |
 | `TimedLine` | The **resolved, always-has-a-window** form `LyricLine` turns into for export/preview: adds `start`, `end` (next line's start, or the song's end), and `sing_end` (`<= end`; the word-wipe's own window; any gap after it is a musical break). |
-| `TimedBackingVocal` | `BackingVocal`'s resolved counterpart, same relationship. |
 | `TimedWord` | One word's derived `highlight_at`/`held_until`, from [`word_timings`]. |
 | `ReparseReport` | Tallies what re-parsing changed (unchanged/reworded-same-word-count/reworded-word-count-changed/added/removed) - see `merge_reparsed_lyrics`. |
 
@@ -651,9 +650,10 @@ is built on.
   `slot_fade_alpha`/`rolling_preview_lines` are the video/live-preview-only
   fade/roll-in curves `.cdg` doesn't use (its fixed 16-color canvas has no
   reasonable way to do a smooth fade).
-- **Validation**: `check_start_change`/`check_end_change` (a line's own
-  timing) and `check_backing_vocal_start`/`check_backing_vocal_end` (bounded
-  to the host's window) - all return `Result<(), String>` without applying
+- **Validation**: `check_start_change`/`check_end_change` (a main line's
+  neighbors are the nearest *main* lines, skipping backing lines; a
+  backing line only checks its own start < end) - both return
+  `Result<(), String>` without applying
   anything, so a caller (tap, drag, typed timecode) can reject a change
   *before* committing it.
 - **Timecode text**: `format_timecode`/`parse_timecode` - `MM:SS.CC`,
@@ -680,14 +680,19 @@ nothing else in this crate.
   every word's start first, then derives defaults from that same list, so
   the wipe runs continuously with no gaps unless a manual
   `word_end_overrides` entry opens one deliberately.
-- **`BackingVocal` is embedded on its host line, not a second top-level
-  line.** Two reasons, both load-bearing: it sidesteps needing a stable
-  cross-line reference that would have to survive re-parsing (a host
-  match via `merge_reparsed_lyrics` brings its backing vocal along for
-  free), and it keeps the main `Vec<TimedLine>`'s sequential, non-
-  overlapping shape unchanged - a backing vocal is purely an *extra* thing
-  drawn during its host's own window, bounded to `[host_start, host_end)`,
-  never an independent timeline entry.
+- **Backing lines are ordinary entries in the line list, flagged
+  `is_backing`, but live on a separate *track*.** Keeping them in the same
+  list means re-parsing (`merge_reparsed_lyrics`) handles them like any
+  other line - no cross-line references to keep in sync - while
+  `resolve_timing_indexed` leaves them out, so the main `Vec<TimedLine>`
+  keeps its sequential, non-overlapping shape (each line's `end` is the
+  next *main* line's start). `resolve_backing_track` resolves them on
+  their own, each window independent (`end == sing_end`), free to overlap
+  anything. One subtlety: a backing line can carry the blank-line verse
+  break meant for the main line after it, so `resolve_timing_indexed`
+  hands that `starts_new_block` on rather than losing it. Renderers show
+  one backing line at a time in a dedicated lane - `backing_display_windows`
+  is the shared, non-overlapping schedule for that.
 - **Validation only ever checks explicit neighboring times, never
   automatic estimates.** `check_start_change`/`check_end_change`
   deliberately look at a neighbor's `sing_end_override` (if any), not its
@@ -1465,8 +1470,7 @@ crate - genuinely a leaf module, the lowest layer in the whole project.
 - **`advance_to` silently no-ops if the target is already in the past**
   (`pad_until` only ever adds filler packets, never removes any already
   written) - this is what lets `export.rs` issue draw calls slightly out
-  of strict chronological order (e.g. a backing vocal's and a host
-  line's word events interleaved) without corrupting the stream, as long
+  of strict chronological order without corrupting the stream, as long
   as each call's *own* target time is monotonically non-decreasing
   overall.
 - **Every instruction is one 24-byte packet, always** - `memory_preset`/
@@ -1507,7 +1511,7 @@ docs for the full reasoning.
 ### `export.rs` - the `.cdg` renderer
 
 **Purpose.** Lays out lines, words, the title card, the countdown
-indicator, and an optional backing vocal onto the CDG canvas using
+indicator, and the backing track onto the CDG canvas using
 `cdg.rs` + `font.rs`, driven by `lyrics.rs`'s timing - this is the module
 that actually decides *where on the fixed 300×216 canvas* things go, not
 just *when*.
@@ -1521,9 +1525,8 @@ tall for 2x scale), `BACKING_ROW` (8), `PREVIEW_ROW` (10), `COUNTDOWN_ROW`
 (13). `layout_line_scaled(text, preferred_scale)` - the "shrink if it
 starts clipping" logic: tries `PREFERRED_SCALE` (2x), automatically falls
 back to 1x if the text wouldn't fit the 48-column safe width, and clips
-as an absolute last resort even at 1x. `HighlightEvent` + the merged,
-time-sorted event list that interleaves a backing vocal's word-wipe with
-its host's (see Gotchas). `title_card_end(timed_lines)`,
+as an absolute last resort even at 1x. `BackingLane` - the backing
+track's own pre-computed, time-sorted draw schedule (see Gotchas). `title_card_end(timed_lines)`,
 `paired_audio_path`/`copy_paired_audio` (the "MP3+G" convention - copying
 the loaded audio next to the export under a matching base filename).
 `render_cdg_with_settings` - the actual top-to-bottom renderer.
@@ -1533,20 +1536,18 @@ the loaded audio next to the export under a matching base filename).
 `singer_legend`, `effective_singer_label`, and more).
 
 **Gotchas:**
-- **A backing vocal's and its host line's word-highlight events must be
-  emitted in one merged, time-sorted sequence, not "all of one, then all
-  of the other."** Since `CdgWriter::advance_to` only ever moves forward
-  (see the `cdg.rs` section above), naively emitting the host's full word
-  list followed by the backing vocal's would silently drop every backing-
-  vocal event whose time falls *before* the host's last event - `render_cdg_
-  with_settings` builds one combined `Vec<HighlightEvent>` across both rows
-  and sorts it by time before emitting anything, specifically so the two
-  wipes can run concurrently (the whole point of a backing vocal) without
-  corrupting the stream.
-- **The CDG palette is 16 slots, and this app uses 14 of them, not
-  16** - 8 via the low CLUT (background + 3 voice pairs + preview), 6 via
-  the high CLUT (title + artist + screaming pair + default pair, leaving
-  2 of that half's 8 slots genuinely free for future use). There's no
+- **Every forward step of the main loop goes through `BackingLane::advance`,
+  never `w.advance_to` directly.** Since `CdgWriter::advance_to` only ever
+  moves forward (see the `cdg.rs` section above), and backing lines
+  start/end independently of the main lines, the backing row's draws
+  can't be emitted from inside the main per-line loop - they'd land too
+  early or be silently dropped. Instead the whole backing schedule is
+  computed up front and `advance(w, t)` first emits every backing op at or
+  before `t`, so both rows' wipes interleave in true time order.
+- **The CDG palette is 16 slots, and all 16 are used** - 8 via the low
+  CLUT (background + 3 voice pairs + preview), 8 via the high CLUT
+  (title + artist + screaming, default and backing pairs). There's no room
+  for another voice color pair. There's no
   "Default" voice slot hiding in the low CLUT - it lives in the high one,
   alongside title/artist/screaming.
 - **The "Abyssal" preset's color choices are a deliberate *lightness*
@@ -2025,8 +2026,8 @@ every coordinate it's given.
 actually drives this machinery: it loads both CLUT halves once at the
 very start, draws the title card (if any) and advances to when it
 should disappear, then for each timed line in order - advance to its
-start, clear the relevant rows, draw the line's/preview line's/backing
-vocal's base (unsung) text, then advance through every word's own
+start, clear the relevant rows, draw the line's/preview line's base
+(unsung) text, then advance through every word's own
 highlight time, redrawing just that one character's tile in the
 highlight color via `draw_char_at`. The color-wipe effect you actually
 see on a real player is nothing more than a sequence of single-character
@@ -2247,7 +2248,7 @@ rather than an abstract explanation.
 - **Lifetimes on a struct, not just a function** - `lyrics::TimedWord<'a>`
   borrows `&'a str` for its `text` field rather than owning a `String`,
   since every `TimedWord` is produced fresh from an already-alive
-  `TimedLine`/`BackingVocal` and never outlives it.
+  `TimedLine` and never outlives it.
 - **`'static` string slices as compile-time-embedded data** -
   `codex::Article`'s `title`/`category`/`content` fields, and every
   `include_str!`/`include_bytes!` call in the crate (`codex.rs`'s whole

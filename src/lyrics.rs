@@ -34,6 +34,11 @@ pub enum Singer {
     /// Male/Female/Duet so a song with a screaming section (metal, rap
     /// ad-libs, etc.) can color it differently from the rest.
     Screaming,
+    /// A dedicated color for backing vocals - what a line switched to the
+    /// backing track (see [`LyricLine::is_backing`]) gets by default, so a
+    /// second vocalist singing different lyrics over the lead stands apart
+    /// from every lead voice. Usable on any line like the others, though.
+    Backing,
 }
 
 impl Singer {
@@ -44,6 +49,7 @@ impl Singer {
             Self::Female => "Female",
             Self::Duet => "Duet",
             Self::Screaming => "Screaming",
+            Self::Backing => "Backing",
         }
     }
 
@@ -51,12 +57,13 @@ impl Singer {
     /// color legend (see [`singer_legend`]) and, in `main.rs`, to build the
     /// timing table's bulk "set voice for selection" buttons from the same
     /// single list the per-line dropdown's options come from.
-    pub const ALL: [Singer; 5] = [
+    pub const ALL: [Singer; 6] = [
         Self::Default,
         Self::Male,
         Self::Female,
         Self::Duet,
         Self::Screaming,
+        Self::Backing,
     ];
 }
 
@@ -105,10 +112,13 @@ impl CountdownMode {
 /// entry pairs a line's `singer` (which color to use) with whatever custom
 /// name (if any) was typed for it - two lines with the same `singer` but
 /// different custom names are two separate entries, not merged into one.
-pub fn singer_legend(lines: &[TimedLine]) -> Vec<(Singer, Option<String>)> {
+///
+/// `backing` is the backing track (see [`resolve_backing_track`]) - its
+/// voices count towards the legend exactly like the main track's do.
+pub fn singer_legend(lines: &[TimedLine], backing: &[TimedLine]) -> Vec<(Singer, Option<String>)> {
     let mut used: Vec<(Singer, Option<String>)> = Vec::new();
     for base in Singer::ALL {
-        for line in lines {
+        for line in lines.iter().chain(backing) {
             if line.singer != base {
                 continue;
             }
@@ -350,14 +360,27 @@ pub struct LyricLine {
     /// treating every line as its own block is a safer default than
     /// silently merging unrelated lines together.
     pub starts_new_block: bool,
-    /// A second vocalist echoing/repeating part of this line while it's
-    /// still being sung (typically the last word or phrase) - `None` for
-    /// every line by default; added via the "+ Backing vocal" button.
-    /// Absent from every project saved before this existed, via
-    /// `#[serde(default)]`. See [`BackingVocal`] for why its own timing is
-    /// bounded within this line's own window rather than being a fully
-    /// independent line in its own right.
+    /// True if this line belongs to the *backing track* rather than the
+    /// main one - a second vocalist singing different lyrics over the lead
+    /// (a duet where both singers overlap, a screamed backing part, ...).
+    /// A backing line is still an ordinary entry in the pasted lyrics and
+    /// in this list (so re-parsing keeps it in place like any other line),
+    /// but its timing is fully independent: it's left out of the main
+    /// track's sequential, non-overlapping [`resolve_timing_with_settings`]
+    /// and resolved separately by [`resolve_backing_track`] instead, so it
+    /// can start/end anywhere, overlapping any main line(s). Its end is
+    /// [`Self::sing_end_override`] (or an estimate until that's tapped).
+    /// `false` for every line saved before this existed, via
+    /// `#[serde(default)]`.
     #[serde(default)]
+    pub is_backing: bool,
+    /// **Legacy, load-only.** The old "Echo" feature stored a backing vocal
+    /// embedded on its host line, bounded within the host's own window.
+    /// That's been replaced by [`Self::is_backing`] lines;
+    /// [`migrate_legacy_backing_vocals`] converts any of these found in an
+    /// older project into backing lines right after loading, so this is
+    /// always `None` afterwards (and is never written back out).
+    #[serde(default, skip_serializing)]
     pub backing_vocal: Option<BackingVocal>,
     /// Manual override for whether the "get ready" countdown shows up
     /// before *this* line - see [`CountdownMode`]. `Auto` (the default,
@@ -389,6 +412,7 @@ impl LyricLine {
             sing_end_override: None,
             estimated_sing_duration: None,
             starts_new_block: true,
+            is_backing: false,
             backing_vocal: None,
             countdown_mode: CountdownMode::default(),
             custom_singer_name: None,
@@ -400,41 +424,18 @@ impl LyricLine {
     }
 }
 
-/// A secondary vocalist's line, overlapping part of its host [`LyricLine`]
-/// while the host is still being sung (typically the last word or phrase of
-/// the host line, echoed or answered) - not a full top-level line of its
-/// own, but an attachment on the line it echoes.
-///
-/// Deliberately embedded here rather than represented as a second
-/// independent entry in the main line list, for two reasons: it sidesteps
-/// needing a stable cross-line reference that would have to survive
-/// re-parsing (`merge_reparsed_lyrics` already matches *host* lines by
-/// content; a backing vocal attached to a matched host just comes along for
-/// free, no separate identity/matching scheme needed), and its timing is
-/// constrained to fall entirely within its host's own `[start, end)` window,
-/// which is what keeps `resolve_timing`'s sequential, non-overlapping
-/// `Vec<TimedLine>` unchanged: a backing vocal is purely an extra thing its
-/// host's own rendering step draws during its own window, never a second
-/// independent timeline entry. If a real use case ever needs an echo that
-/// outlasts its host line, that's a deliberate future relaxation, not
-/// something built speculatively now.
-///
-/// Reuses [`Singer`] for its own color rather than a dedicated "backing"
-/// voice category, so it can be colored distinctly from its host (e.g. host
-/// = Male, backing = Female) using exactly the palette slots that already
-/// exist - no new CLUT budget needed in the `.cdg` export.
+/// **Legacy** - the old "Echo" backing vocal, embedded on its host
+/// [`LyricLine`] and bounded within the host's own window. Only still here
+/// so projects saved with one keep loading; see
+/// [`migrate_legacy_backing_vocals`], which turns each into an independent
+/// [`LyricLine::is_backing`] line.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BackingVocal {
     pub text: String,
-    /// Start time in seconds - must fall within the host line's own
-    /// `[start, end)` once resolved (see [`check_backing_vocal_start`]).
-    /// `None` means "not yet tapped"; until it's set, this backing vocal
-    /// doesn't render at all (nothing to time it by), the same way an
-    /// untimed [`LyricLine`] doesn't appear in [`resolve_timing`]'s output.
+    /// Start time in seconds (was bounded within the host line's window).
+    /// `None` means "not yet tapped".
     pub start: Option<f64>,
-    /// End time in seconds. `None` means "use the host line's own end" as a
-    /// placeholder once `start` is set, the same "graceful default, refine
-    /// later" behavior [`LyricLine::sing_end_override`] already has.
+    /// End time in seconds. `None` meant "use the host line's own end".
     pub end: Option<f64>,
     pub singer: Singer,
     /// Same shape/meaning as [`LyricLine::word_overrides`], scoped to this
@@ -445,6 +446,7 @@ pub struct BackingVocal {
 }
 
 impl BackingVocal {
+    #[allow(dead_code)]
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
         let word_count = text.split_whitespace().count();
@@ -651,8 +653,10 @@ fn lcs_matches(old: &[LyricLine], new: &[LyricLine], edited: &[bool]) -> Vec<(us
 /// same local gap (see [`merge_reparsed_lyrics`]) - i.e. treated as an
 /// edited version of the same line, not a brand new one, even though the
 /// text itself differs. Line-level timing (`start`, `sing_end_override`,
-/// `estimated_sing_duration`, `singer`) is always kept - a typo fix or reworded phrase doesn't change
-/// *when* the line is sung. Word-level timing is only kept where it can
+/// `estimated_sing_duration`) and per-line settings (`singer`,
+/// `custom_singer_name`, `countdown_mode`, `is_backing`) are always kept -
+/// a typo fix or reworded phrase doesn't change *when* the line is sung or
+/// who sings it. Word-level timing is only kept where it can
 /// still mean something: if the word count matches, each word slot whose
 /// text is unchanged at that position keeps its override; every other slot
 /// (word count changed, or that specific word changed) resets to the
@@ -666,10 +670,14 @@ fn merge_edited_line(old: &LyricLine, new: &LyricLine) -> (LyricLine, bool) {
     merged.sing_end_override = old.sing_end_override;
     merged.estimated_sing_duration = old.estimated_sing_duration;
     merged.singer = old.singer;
-    // A backing vocal is attached to the host line's *identity*, not to its
-    // exact word count/text - a reworded host line (typo fix, rephrasing)
-    // keeps whatever backing vocal it had, same as it keeps its own timing.
-    merged.backing_vocal = old.backing_vocal.clone();
+    // Main-vs-backing track is part of the line's identity, not its exact
+    // text - a reworded backing line (typo fix, rephrasing) stays on the
+    // backing track, same as it keeps its own timing.
+    merged.is_backing = old.is_backing;
+    // Same for the line's voice label and countdown choice - both are
+    // per-line settings the user made, not something derived from the text.
+    merged.custom_singer_name = old.custom_singer_name.clone();
+    merged.countdown_mode = old.countdown_mode;
 
     let old_words: Vec<&str> = old.text.split_whitespace().collect();
     let new_words: Vec<&str> = new.text.split_whitespace().collect();
@@ -770,7 +778,9 @@ pub fn merge_reparsed_lyrics(
             kept.singer = old[oi].singer;
             kept.word_overrides = old[oi].word_overrides.clone();
             kept.word_end_overrides = old[oi].word_end_overrides.clone();
-            kept.backing_vocal = old[oi].backing_vocal.clone();
+            kept.is_backing = old[oi].is_backing;
+            kept.custom_singer_name = old[oi].custom_singer_name.clone();
+            kept.countdown_mode = old[oi].countdown_mode;
             result.push(kept);
             report.unchanged += 1;
             old_pos = oi + 1;
@@ -822,18 +832,34 @@ pub fn parse_timecode(s: &str) -> Option<f64> {
     Some(mins * 60.0 + secs)
 }
 
+/// The nearest main-track (non-[`LyricLine::is_backing`]) line before
+/// `idx`, if any - a main line's neighbor rules skip over backing lines,
+/// which are free to overlap it.
+fn prev_main_line(lines: &[LyricLine], idx: usize) -> Option<&LyricLine> {
+    lines[..idx].iter().rev().find(|l| !l.is_backing)
+}
+
+/// The nearest main-track line after `idx`, if any - see [`prev_main_line`].
+fn next_main_line(lines: &[LyricLine], idx: usize) -> Option<&LyricLine> {
+    lines.get(idx + 1..)?.iter().find(|l| !l.is_backing)
+}
+
 /// Checks whether setting `lines[idx]`'s `start` to `new_start` is valid -
 /// non-negative, before this line's own explicit end (if any), and not
-/// before the previous line's explicit end (if any) - *without* applying
-/// it. Callers (tapping, dragging, or typing a new start) should only
-/// commit the change once this returns `Ok`, and show the message to the
-/// user otherwise.
+/// before the previous main-track line's explicit end (if any) - *without*
+/// applying it. Callers (tapping, dragging, or typing a new start) should
+/// only commit the change once this returns `Ok`, and show the message to
+/// the user otherwise.
 ///
 /// Deliberately only checks against an explicit [`LyricLine::sing_end_override`]
 /// on either side, not the automatic estimate - the estimate shifts as
 /// timing fills in around it, so treating it as a hard wall would reject
 /// perfectly reasonable taps just because a neighboring line hasn't been
 /// fine-tuned yet.
+///
+/// A backing line ([`LyricLine::is_backing`]) has no neighbor rule at all -
+/// overlapping other lines is the whole point of one - and main lines skip
+/// over backing lines when looking for their own neighbors.
 pub fn check_start_change(lines: &[LyricLine], idx: usize, new_start: f64) -> Result<(), String> {
     if !new_start.is_finite() || new_start < 0.0 {
         return Err("Start time can't be negative.".to_string());
@@ -847,15 +873,16 @@ pub fn check_start_change(lines: &[LyricLine], idx: usize, new_start: f64) -> Re
             ));
         }
     }
-    if idx > 0 {
-        if let Some(prev_end) = lines[idx - 1].sing_end_override {
-            if new_start < prev_end {
-                return Err(format!(
-                    "Start ({}) can't be before the previous line ends ({}).",
-                    format_timecode(new_start),
-                    format_timecode(prev_end)
-                ));
-            }
+    if lines[idx].is_backing {
+        return Ok(());
+    }
+    if let Some(prev_end) = prev_main_line(lines, idx).and_then(|l| l.sing_end_override) {
+        if new_start < prev_end {
+            return Err(format!(
+                "Start ({}) can't be before the previous line ends ({}).",
+                format_timecode(new_start),
+                format_timecode(prev_end)
+            ));
         }
     }
     Ok(())
@@ -863,9 +890,10 @@ pub fn check_start_change(lines: &[LyricLine], idx: usize, new_start: f64) -> Re
 
 /// Checks whether setting `lines[idx]`'s [`LyricLine::sing_end_override`] to
 /// `new_end` is valid - after this line's own start, and not after the
-/// next line's start (if that's already been set) - *without* applying it.
-/// See [`check_start_change`] for why only explicit neighboring times are
-/// checked, not automatic estimates.
+/// next main-track line's start (if that's already been set) - *without*
+/// applying it. See [`check_start_change`] for why only explicit
+/// neighboring times are checked, not automatic estimates, and why backing
+/// lines are exempt from the neighbor rule.
 pub fn check_end_change(lines: &[LyricLine], idx: usize, new_end: f64) -> Result<(), String> {
     let Some(start) = lines[idx].start else {
         return Err("Set this line's start before its end.".to_string());
@@ -877,69 +905,77 @@ pub fn check_end_change(lines: &[LyricLine], idx: usize, new_end: f64) -> Result
             format_timecode(start)
         ));
     }
-    if let Some(next) = lines.get(idx + 1) {
-        if let Some(next_start) = next.start {
-            if new_end > next_start {
-                return Err(format!(
-                    "End ({}) can't be after the next line starts ({}).",
-                    format_timecode(new_end),
-                    format_timecode(next_start)
-                ));
-            }
+    if lines[idx].is_backing {
+        return Ok(());
+    }
+    if let Some(next_start) = next_main_line(lines, idx).and_then(|l| l.start) {
+        if new_end > next_start {
+            return Err(format!(
+                "End ({}) can't be after the next line starts ({}).",
+                format_timecode(new_end),
+                format_timecode(next_start)
+            ));
         }
     }
     Ok(())
 }
 
-/// Checks whether setting a backing vocal's `start` to `new_start` is
-/// valid: must fall within its host line's own resolved
-/// `[host_start, host_end)` window, since a backing vocal's timing is
-/// bounded to its host's (see [`BackingVocal`]) rather than checked against
-/// the main line list's own neighbor rules.
-pub fn check_backing_vocal_start(
-    new_start: f64,
-    host_start: f64,
-    host_end: f64,
-) -> Result<(), String> {
-    if !new_start.is_finite() || new_start < host_start {
-        return Err(format!(
-            "Start ({}) can't be before the main line starts ({}).",
-            format_timecode(new_start),
-            format_timecode(host_start)
-        ));
+/// Converts any legacy embedded "Echo" backing vocals (see [`BackingVocal`])
+/// in `lines` into independent backing-track lines ([`LyricLine::is_backing`]),
+/// each inserted right after its old host line with its timing, voice and
+/// word overrides intact. Also inserts each one's text into `raw` (the
+/// pasted-lyrics text) right after its host's own text line, so the next
+/// re-parse keeps it rather than dropping it as a line that's no longer in
+/// the text - but only when `raw` still parses to exactly `lines`' own
+/// texts (it normally does); otherwise `raw` is left alone rather than
+/// guessing where to put them. Returns how many were converted.
+pub fn migrate_legacy_backing_vocals(lines: &mut Vec<LyricLine>, raw: &mut String) -> usize {
+    if lines.iter().all(|l| l.backing_vocal.is_none()) {
+        return 0;
     }
-    if new_start >= host_end {
-        return Err(format!(
-            "Start ({}) must be before the main line ends ({}).",
-            format_timecode(new_start),
-            format_timecode(host_end)
-        ));
-    }
-    Ok(())
-}
+    let sources = parse_pasted_lyrics_with_sources(raw);
+    let raw_in_sync = sources.len() == lines.len()
+        && sources
+            .iter()
+            .zip(lines.iter())
+            .all(|((p, _), l)| p.text == l.text);
+    let mut raw_lines: Vec<String> = raw.lines().map(str::to_string).collect();
 
-/// Checks whether setting a backing vocal's `end` to `new_end` is valid -
-/// after its own `backing_start`, and not after the host line's own end.
-pub fn check_backing_vocal_end(
-    new_end: f64,
-    backing_start: f64,
-    host_end: f64,
-) -> Result<(), String> {
-    if !new_end.is_finite() || new_end <= backing_start {
-        return Err(format!(
-            "End ({}) must be after the backing vocal's own start ({}).",
-            format_timecode(new_end),
-            format_timecode(backing_start)
-        ));
+    let mut converted = 0;
+    for host_idx in (0..lines.len()).rev() {
+        let Some(bv) = lines[host_idx].backing_vocal.take() else {
+            continue;
+        };
+        let text = bv.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut line = LyricLine::new(text);
+        line.is_backing = true;
+        line.starts_new_block = false;
+        line.start = bv.start;
+        line.sing_end_override = bv.end;
+        line.singer = bv.singer;
+        if bv.word_overrides.len() == line.word_overrides.len() {
+            line.word_overrides = bv.word_overrides;
+        }
+        if bv.word_end_overrides.len() == line.word_end_overrides.len() {
+            line.word_end_overrides = bv.word_end_overrides;
+        }
+        lines.insert(host_idx + 1, line);
+        if raw_in_sync {
+            raw_lines.insert(sources[host_idx].1 + 1, text.to_string());
+        }
+        converted += 1;
     }
-    if new_end > host_end {
-        return Err(format!(
-            "End ({}) can't be after the main line ends ({}).",
-            format_timecode(new_end),
-            format_timecode(host_end)
-        ));
+    if raw_in_sync && converted > 0 {
+        let trailing_newline = raw.ends_with('\n');
+        *raw = raw_lines.join("\n");
+        if trailing_newline {
+            raw.push('\n');
+        }
     }
-    Ok(())
+    converted
 }
 
 /// A line with its resolved [start, end) window, used at export/preview time.
@@ -960,11 +996,6 @@ pub struct TimedLine {
     pub word_end_overrides: Vec<Option<f64>>,
     /// See [`LyricLine::starts_new_block`].
     pub starts_new_block: bool,
-    /// Resolved from [`LyricLine::backing_vocal`] - `None` either because
-    /// the host line has no backing vocal at all, or because it has one but
-    /// its `start` hasn't been tapped yet (nothing to time it by, so it
-    /// doesn't render - see [`BackingVocal::start`]).
-    pub backing_vocal: Option<TimedBackingVocal>,
     /// See [`LyricLine::countdown_mode`].
     pub countdown_mode: CountdownMode,
     /// See [`LyricLine::custom_singer_name`].
@@ -1007,25 +1038,6 @@ impl TimedLine {
                 (start + est).clamp(start, end)
             }
         };
-        let backing_vocal = line.backing_vocal.as_ref().and_then(|bv| {
-            let bv_start = bv.start?.clamp(start, end);
-            // No end tapped yet -> the host's own end is a reasonable
-            // placeholder, the same "graceful default, refine later"
-            // behavior an untapped line end already has.
-            let bv_end = bv
-                .end
-                .unwrap_or(end)
-                .clamp(bv_start, end)
-                .max(bv_start + 0.05);
-            Some(TimedBackingVocal {
-                text: bv.text.clone(),
-                start: bv_start,
-                end: bv_end,
-                singer: bv.singer,
-                word_overrides: bv.word_overrides.clone(),
-                word_end_overrides: bv.word_end_overrides.clone(),
-            })
-        });
         Self {
             text: line.text.clone(),
             start,
@@ -1035,23 +1047,10 @@ impl TimedLine {
             word_overrides: line.word_overrides.clone(),
             word_end_overrides: line.word_end_overrides.clone(),
             starts_new_block: line.starts_new_block,
-            backing_vocal,
             countdown_mode: line.countdown_mode,
             custom_singer_name: line.custom_singer_name.clone(),
         }
     }
-}
-
-/// The resolved (always-timed) counterpart to [`BackingVocal`] - see
-/// [`TimedLine::backing_vocal`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct TimedBackingVocal {
-    pub text: String,
-    pub start: f64,
-    pub end: f64,
-    pub singer: Singer,
-    pub word_overrides: Vec<Option<f64>>,
-    pub word_end_overrides: Vec<Option<f64>>,
 }
 
 /// Same as [`resolve_timing_with_settings`], using [`TimingSettings::default`] -
@@ -1066,37 +1065,183 @@ pub fn resolve_timing(lines: &[LyricLine], total_duration: Option<f64>) -> Vec<T
     resolve_timing_with_settings(lines, total_duration, &TimingSettings::default())
 }
 
-/// Resolve start/end windows for every line. Requires every line to already
-/// have a `start` set (caller should validate this first). Lines are sorted
-/// by start time. The final line's end is `total_duration` (or `start + 4.0`
-/// if `total_duration` is unknown / shorter than that).
+/// Resolve start/end windows for every *main-track* line (backing lines -
+/// see [`LyricLine::is_backing`] - are left out; see
+/// [`resolve_backing_track`] for those). Lines without a `start` are
+/// skipped (caller should validate this first). Lines are sorted by start
+/// time. The final line's end is `total_duration` (or `start + 4.0` if
+/// `total_duration` is unknown / shorter than that).
 pub fn resolve_timing_with_settings(
     lines: &[LyricLine],
     total_duration: Option<f64>,
     settings: &TimingSettings,
 ) -> Vec<TimedLine> {
-    let mut sorted: Vec<(f64, &LyricLine)> = lines
+    resolve_timing_indexed(lines, total_duration, settings).0
+}
+
+/// Same as [`resolve_timing_with_settings`], but also returns each
+/// `TimedLine`'s index into `lines` (needed by anything that edits the
+/// original line a resolved one came from, since the result is sorted by
+/// start time and skips backing/untimed lines).
+pub fn resolve_timing_indexed(
+    lines: &[LyricLine],
+    total_duration: Option<f64>,
+    settings: &TimingSettings,
+) -> (Vec<TimedLine>, Vec<usize>) {
+    // A backing line sitting between two verses can carry the blank-line
+    // verse break that really belongs to the next main line (e.g. a blank
+    // line, then a backing line, then the next verse's first main line) -
+    // hand it on to that main line, so leaving backing lines out of the
+    // main track never merges two on-screen blocks into one.
+    let mut new_block = vec![false; lines.len()];
+    let mut pending_break = false;
+    for (i, l) in lines.iter().enumerate() {
+        if l.is_backing {
+            pending_break |= l.starts_new_block;
+        } else {
+            new_block[i] = l.starts_new_block || pending_break;
+            pending_break = false;
+        }
+    }
+
+    let mut sorted: Vec<(usize, f64)> = lines
         .iter()
-        .filter_map(|l| l.start.map(|s| (s, l)))
+        .enumerate()
+        .filter(|(_, l)| !l.is_backing)
+        .filter_map(|(i, l)| l.start.map(|s| (i, s)))
         .collect();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut out = Vec::with_capacity(sorted.len());
-    for i in 0..sorted.len() {
-        let (start, line) = sorted[i];
-        let end = if i + 1 < sorted.len() {
-            sorted[i + 1].0
+    let mut indices = Vec::with_capacity(sorted.len());
+    for pos in 0..sorted.len() {
+        let (orig_idx, start) = sorted[pos];
+        let end = if pos + 1 < sorted.len() {
+            sorted[pos + 1].1
         } else {
             match total_duration {
                 Some(d) if d > start => d,
                 _ => start + 4.0,
             }
         };
-        out.push(TimedLine::from_line_with_settings(
-            line, start, end, settings,
-        ));
+        let mut timed = TimedLine::from_line_with_settings(&lines[orig_idx], start, end, settings);
+        timed.starts_new_block = new_block[orig_idx];
+        out.push(timed);
+        indices.push(orig_idx);
     }
-    out
+    (out, indices)
+}
+
+/// Resolves the *backing track* - every timed [`LyricLine::is_backing`]
+/// line, sorted by start. Unlike the main track, a backing line's window
+/// doesn't depend on its neighbors at all: it runs from its own `start` to
+/// its own [`LyricLine::sing_end_override`] (or, until that's tapped, the
+/// usual word-count estimate), overlapping whatever main line(s) happen to
+/// be playing. `end` and `sing_end` are always equal here - a backing line
+/// has no "musical break" tail of its own; see [`backing_display_windows`]
+/// for how long it actually stays on screen.
+pub fn resolve_backing_track(lines: &[LyricLine], settings: &TimingSettings) -> Vec<TimedLine> {
+    resolve_backing_track_indexed(lines, settings).0
+}
+
+/// Same as [`resolve_backing_track`], plus each result's index into `lines`.
+pub fn resolve_backing_track_indexed(
+    lines: &[LyricLine],
+    settings: &TimingSettings,
+) -> (Vec<TimedLine>, Vec<usize>) {
+    let mut sorted: Vec<(usize, f64)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.is_backing)
+        .filter_map(|(i, l)| l.start.map(|s| (i, s)))
+        .collect();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut out = Vec::with_capacity(sorted.len());
+    let mut indices = Vec::with_capacity(sorted.len());
+    for (orig_idx, start) in sorted {
+        let line = &lines[orig_idx];
+        let end = match line.sing_end_override {
+            Some(e) if e > start => e,
+            _ => {
+                let est = line
+                    .estimated_sing_duration
+                    .unwrap_or_else(|| estimate_sing_duration(&line.text, f64::INFINITY, settings));
+                start + est.max(0.05)
+            }
+        };
+        let mut timed = TimedLine::from_line_with_settings(line, start, end, settings);
+        timed.starts_new_block = true;
+        out.push(timed);
+        indices.push(orig_idx);
+    }
+    (out, indices)
+}
+
+/// How long before a backing line starts that it appears on screen (in its
+/// unsung color), so the backing singer can read ahead - see
+/// [`backing_display_windows`].
+pub const BACKING_LEAD_SECS: f64 = 1.5;
+/// How long a backing line stays on screen, fully highlighted, after it
+/// finishes - see [`backing_display_windows`].
+pub const BACKING_LINGER_SECS: f64 = 1.0;
+
+/// The `[show, hide)` on-screen window for each line of a resolved backing
+/// track (as returned by [`resolve_backing_track`], i.e. sorted by start).
+/// The backing track gets a single on-screen lane in every renderer
+/// (`.cdg`, video, live preview), so these never overlap each other: each
+/// line normally shows [`BACKING_LEAD_SECS`] early and lingers
+/// [`BACKING_LINGER_SECS`] after it ends, but the lead-in waits for the
+/// previous backing line to finish, and the linger is cut short the moment
+/// the next backing line needs the lane. If two backing lines genuinely
+/// overlap each other, the later one takes the lane over at its own start.
+/// Shared by all three renderers so they agree exactly.
+pub fn backing_display_windows(track: &[TimedLine]) -> Vec<(f64, f64)> {
+    let shows: Vec<f64> = track
+        .iter()
+        .enumerate()
+        .map(|(k, line)| {
+            let earliest = match k {
+                0 => line.start - BACKING_LEAD_SECS,
+                _ => (line.start - BACKING_LEAD_SECS).max(track[k - 1].sing_end),
+            };
+            earliest.min(line.start).max(0.0)
+        })
+        .collect();
+    track
+        .iter()
+        .enumerate()
+        .map(|(k, line)| {
+            let mut hide = line.sing_end + BACKING_LINGER_SECS;
+            if let Some(&next_show) = shows.get(k + 1) {
+                hide = hide.min(next_show);
+            }
+            (shows[k], hide.max(shows[k]))
+        })
+        .collect()
+}
+
+/// Which backing-track line (index into `track`) occupies the backing lane
+/// at time `t`, if any - see [`backing_display_windows`].
+pub fn active_backing_line(windows: &[(f64, f64)], t: f64) -> Option<usize> {
+    windows
+        .iter()
+        .position(|&(show, hide)| t >= show && t < hide)
+}
+
+/// Opacity for the active backing line at `t`, given its display window:
+/// fades in over its lead-in (see [`reveal_fade_alpha`]) and fades back
+/// out over its linger once it's done being sung, so the lane never pops.
+/// Video export/live preview only, same as the main track's own fades.
+pub fn backing_line_alpha(line: &TimedLine, window: (f64, f64), t: f64) -> f32 {
+    if t >= line.sing_end {
+        let span = (window.1 - line.sing_end).max(0.001);
+        (1.0 - (t - line.sing_end) / span).clamp(0.0, 1.0) as f32
+    } else if t < line.start {
+        reveal_fade_alpha(window.0, t).max(0.15)
+    } else {
+        1.0
+    }
 }
 
 /// A word within a line, with its derived highlight start/end times
@@ -1134,19 +1279,7 @@ pub fn word_timings(line: &TimedLine) -> Vec<TimedWord<'_>> {
     )
 }
 
-/// Same as [`word_timings`], for a backing vocal's own (much shorter, and
-/// bounded within its host's window) text/timing instead of a host line's.
-pub fn backing_vocal_word_timings(bv: &TimedBackingVocal) -> Vec<TimedWord<'_>> {
-    resolve_word_timings(
-        &bv.text,
-        bv.start,
-        bv.end,
-        &bv.word_overrides,
-        &bv.word_end_overrides,
-    )
-}
-
-/// The shared math behind [`word_timings`]/[`backing_vocal_word_timings`] -
+/// The shared math behind [`word_timings`] -
 /// spreads `text`'s words across `[start, sing_end)`, proportional to
 /// cumulative character count, except where `word_overrides`/
 /// `word_end_overrides` manually pin a specific word's start and/or end.
@@ -1233,18 +1366,7 @@ pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
     resolve_wipe_fraction(&normalize_text(&line.text), &word_timings(line), t)
 }
 
-/// Same as [`current_line_wipe_fraction`], for a backing vocal's own
-/// (much shorter) text/word timing.
-pub fn backing_vocal_wipe_fraction(bv: &TimedBackingVocal, t: f64) -> f32 {
-    resolve_wipe_fraction(
-        &normalize_text(&bv.text),
-        &backing_vocal_word_timings(bv),
-        t,
-    )
-}
-
-/// The shared math behind [`current_line_wipe_fraction`]/
-/// [`backing_vocal_wipe_fraction`].
+/// The shared math behind [`current_line_wipe_fraction`].
 fn resolve_wipe_fraction(text: &str, words: &[TimedWord], t: f64) -> f32 {
     let char_count = text.chars().count().max(1) as f32;
     let spans = word_char_spans(text);
@@ -1484,12 +1606,12 @@ mod tests {
             TimedLine::new("a".into(), 0.0, 1.0, Singer::Male),
             TimedLine::new("b".into(), 1.0, 2.0, Singer::Male),
         ];
-        assert!(singer_legend(&lines).is_empty());
+        assert!(singer_legend(&lines, &[]).is_empty());
     }
 
     #[test]
     fn singer_legend_is_empty_for_no_lines() {
-        assert!(singer_legend(&[]).is_empty());
+        assert!(singer_legend(&[], &[]).is_empty());
     }
 
     #[test]
@@ -1501,7 +1623,7 @@ mod tests {
             TimedLine::new("a".into(), 0.0, 1.0, Singer::Default),
             TimedLine::new("b".into(), 1.0, 2.0, Singer::Default),
         ];
-        assert!(singer_legend(&lines).is_empty());
+        assert!(singer_legend(&lines, &[]).is_empty());
     }
 
     #[test]
@@ -1515,7 +1637,7 @@ mod tests {
             TimedLine::new("her line".into(), 1.0, 2.0, Singer::Female),
         ];
         assert_eq!(
-            singer_legend(&lines),
+            singer_legend(&lines, &[]),
             vec![(Singer::Default, None), (Singer::Female, None)]
         );
     }
@@ -1531,7 +1653,7 @@ mod tests {
             TimedLine::new("d".into(), 3.0, 4.0, Singer::Screaming),
         ];
         assert_eq!(
-            singer_legend(&lines),
+            singer_legend(&lines, &[]),
             vec![
                 (Singer::Male, None),
                 (Singer::Female, None),
@@ -1552,7 +1674,7 @@ mod tests {
         b.custom_singer_name = Some("Male 2".to_string());
         let lines = vec![a, b];
         assert_eq!(
-            singer_legend(&lines),
+            singer_legend(&lines, &[]),
             vec![
                 (Singer::Male, Some("Male 1".to_string())),
                 (Singer::Male, Some("Male 2".to_string())),
@@ -2036,113 +2158,229 @@ mod tests {
         assert!(check_end_change(&lines, 0, 5.0).is_ok());
     }
 
-    // --- backing vocals ----------------------------------------------------
+    // --- backing track -----------------------------------------------------
 
-    #[test]
-    fn backing_vocal_is_absent_until_its_start_is_tapped() {
-        let mut line = LyricLine::new("main line here");
-        line.start = Some(0.0);
-        line.backing_vocal = Some(BackingVocal::new("echo"));
-        let timed = TimedLine::from_line(&line, 0.0, 10.0);
-        assert!(
-            timed.backing_vocal.is_none(),
-            "no start tapped yet -> nothing to render"
-        );
+    fn backing(text: &str, start: Option<f64>, end: Option<f64>) -> LyricLine {
+        let mut l = LyricLine::new(text);
+        l.is_backing = true;
+        l.start = start;
+        l.sing_end_override = end;
+        l
     }
 
     #[test]
-    fn backing_vocal_start_is_clamped_within_the_host_window() {
-        let mut line = LyricLine::new("main line here");
-        line.start = Some(0.0);
-        let mut bv = BackingVocal::new("echo");
-        bv.start = Some(-5.0); // before the host even starts
-        bv.end = Some(999.0); // way past the host's own end
-        line.backing_vocal = Some(bv);
-        let timed = TimedLine::from_line(&line, 0.0, 10.0);
-        let tbv = timed.backing_vocal.unwrap();
-        assert_eq!(tbv.start, 0.0);
-        assert_eq!(tbv.end, 10.0);
+    fn backing_lines_are_left_out_of_the_main_track() {
+        let mut lines = vec![
+            LyricLine::new("main one"),
+            backing("scream over it", Some(1.0), Some(9.0)),
+            LyricLine::new("main two"),
+        ];
+        lines[0].start = Some(0.0);
+        lines[2].start = Some(5.0);
+        let (timed, indices) =
+            resolve_timing_indexed(&lines, Some(20.0), &TimingSettings::default());
+        assert_eq!(indices, vec![0, 2]);
+        // The main line's end is the next *main* line's start, not the
+        // backing line's start in between.
+        assert_eq!(timed[0].end, 5.0);
     }
 
     #[test]
-    fn backing_vocal_end_defaults_to_the_hosts_own_end_when_untapped() {
-        let mut line = LyricLine::new("main line here");
-        line.start = Some(0.0);
-        let mut bv = BackingVocal::new("echo");
-        bv.start = Some(7.0);
-        // bv.end left None - not tapped yet.
-        line.backing_vocal = Some(bv);
-        let timed = TimedLine::from_line(&line, 0.0, 10.0);
-        let tbv = timed.backing_vocal.unwrap();
-        assert_eq!(tbv.start, 7.0);
-        assert_eq!(tbv.end, 10.0, "should default to the host's own end");
+    fn the_backing_track_overlaps_main_lines_freely() {
+        let mut lines = vec![
+            LyricLine::new("main one"),
+            backing("scream over it", Some(1.0), Some(9.0)),
+            LyricLine::new("main two"),
+        ];
+        lines[0].start = Some(0.0);
+        lines[2].start = Some(5.0);
+        let (track, indices) = resolve_backing_track_indexed(&lines, &TimingSettings::default());
+        assert_eq!(indices, vec![1]);
+        assert_eq!(track[0].start, 1.0);
+        // Spans past main line 1's own end, into main line 2 - the whole point.
+        assert_eq!(track[0].sing_end, 9.0);
+        assert_eq!(track[0].end, 9.0);
     }
 
     #[test]
-    fn check_backing_vocal_start_must_fall_within_the_host_window() {
-        assert!(check_backing_vocal_start(5.0, 0.0, 10.0).is_ok());
-        assert!(check_backing_vocal_start(-1.0, 0.0, 10.0).is_err());
-        assert!(check_backing_vocal_start(10.0, 0.0, 10.0).is_err()); // not < host_end
-        assert!(check_backing_vocal_start(0.0, 0.0, 10.0).is_ok()); // exactly at host_start is fine
+    fn an_untapped_backing_end_falls_back_to_the_word_estimate() {
+        let lines = vec![backing("one two three four", Some(10.0), None)];
+        let track = resolve_backing_track(&lines, &TimingSettings::default());
+        let expected = 4.0 * SECONDS_PER_WORD;
+        assert!((track[0].sing_end - (10.0 + expected)).abs() < 1e-9);
     }
 
     #[test]
-    fn check_backing_vocal_end_must_come_after_its_own_start_and_not_past_the_host() {
-        assert!(check_backing_vocal_end(8.0, 5.0, 10.0).is_ok());
-        assert!(check_backing_vocal_end(5.0, 5.0, 10.0).is_err()); // not strictly after its own start
-        assert!(check_backing_vocal_end(10.0, 5.0, 10.0).is_ok()); // exactly at host_end is fine
-        assert!(check_backing_vocal_end(10.1, 5.0, 10.0).is_err()); // past the host
+    fn an_untimed_backing_line_is_not_resolved_at_all() {
+        let lines = vec![backing("not yet", None, None)];
+        assert!(resolve_backing_track(&lines, &TimingSettings::default()).is_empty());
     }
 
     #[test]
-    fn backing_vocal_word_timings_work_the_same_way_as_the_host_lines() {
-        let mut line = LyricLine::new("main line");
-        line.start = Some(0.0);
-        let mut bv = BackingVocal::new("echo now");
-        bv.start = Some(2.0);
-        bv.end = Some(4.0);
-        line.backing_vocal = Some(bv);
-        let timed = TimedLine::from_line(&line, 0.0, 10.0);
-        let tbv = timed.backing_vocal.unwrap();
-        let words = backing_vocal_word_timings(&tbv);
-        assert_eq!(words.len(), 2);
-        assert_eq!(words[0].highlight_at, 2.0);
-        assert!(words[1].highlight_at >= words[0].highlight_at);
-        assert!(words[1].highlight_at < 4.0 + 1e-9);
+    fn a_backing_lines_verse_break_is_handed_on_to_the_next_main_line() {
+        // "a", blank line, backing "x", then main "b" - "b" itself parsed
+        // with starts_new_block = false (it directly follows "x"), but it
+        // must still start a new block once "x" is out of the main track.
+        let mut lines = parse_pasted_lyrics("a\n\nx\nb");
+        lines[1].is_backing = true;
+        lines[0].start = Some(0.0);
+        lines[1].start = Some(1.0);
+        lines[2].start = Some(2.0);
+        assert!(!lines[2].starts_new_block);
+        let timed = resolve_timing(&lines, Some(10.0));
+        assert_eq!(group_into_blocks(&timed), vec![vec![0], vec![1]]);
     }
 
     #[test]
-    fn a_reparse_carries_the_backing_vocal_through_for_an_unchanged_host_line() {
-        let raw = "main line here";
+    fn main_line_neighbor_checks_skip_over_backing_lines() {
+        let mut lines = vec![
+            LyricLine::new("a"),
+            backing("x", Some(2.0), Some(8.0)),
+            LyricLine::new("b"),
+        ];
+        lines[0].start = Some(0.0);
+        lines[0].sing_end_override = Some(4.0);
+        lines[2].start = Some(5.0);
+        // "b"'s previous *main* line is "a" (ends at 4.0), not "x" (ends 8.0).
+        assert!(check_start_change(&lines, 2, 4.5).is_ok());
+        assert!(check_start_change(&lines, 2, 3.0).is_err());
+        // "a"'s next main line is "b" (starts 5.0), not "x" (starts 2.0).
+        assert!(check_end_change(&lines, 0, 4.9).is_ok());
+        assert!(check_end_change(&lines, 0, 5.1).is_err());
+    }
+
+    #[test]
+    fn backing_lines_have_no_neighbor_rule_only_their_own_start_before_end() {
+        let mut lines = vec![
+            LyricLine::new("a"),
+            backing("x", Some(2.0), Some(8.0)),
+            LyricLine::new("b"),
+        ];
+        lines[0].start = Some(0.0);
+        lines[0].sing_end_override = Some(4.0);
+        lines[2].start = Some(5.0);
+        assert!(check_start_change(&lines, 1, 0.5).is_ok());
+        assert!(check_start_change(&lines, 1, 8.0).is_err()); // not before its own end
+        assert!(check_end_change(&lines, 1, 30.0).is_ok());
+        assert!(check_end_change(&lines, 1, 2.0).is_err()); // not after its own start
+    }
+
+    #[test]
+    fn backing_display_windows_lead_in_linger_and_never_overlap() {
+        let lines = vec![
+            backing("first", Some(10.0), Some(12.0)),
+            backing("second", Some(12.5), Some(14.0)),
+            backing("third", Some(30.0), Some(31.0)),
+        ];
+        let track = resolve_backing_track(&lines, &TimingSettings::default());
+        let w = backing_display_windows(&track);
+        assert_eq!(w[0].0, 10.0 - BACKING_LEAD_SECS);
+        // Second can't show before first is done singing (12.0), so first's
+        // linger is cut short right there.
+        assert_eq!(w[1].0, 12.0);
+        assert_eq!(w[0].1, 12.0);
+        assert_eq!(w[1].1, 14.0 + BACKING_LINGER_SECS);
+        assert_eq!(w[2], (30.0 - BACKING_LEAD_SECS, 31.0 + BACKING_LINGER_SECS));
+        for pair in w.windows(2) {
+            assert!(pair[0].1 <= pair[1].0);
+        }
+        assert_eq!(active_backing_line(&w, 11.0), Some(0));
+        assert_eq!(active_backing_line(&w, 13.0), Some(1));
+        assert_eq!(active_backing_line(&w, 20.0), None);
+    }
+
+    #[test]
+    fn overlapping_backing_lines_hand_the_lane_over_at_the_later_ones_start() {
+        let lines = vec![
+            backing("long one", Some(10.0), Some(20.0)),
+            backing("cuts in", Some(15.0), Some(18.0)),
+        ];
+        let track = resolve_backing_track(&lines, &TimingSettings::default());
+        let w = backing_display_windows(&track);
+        assert_eq!(w[1].0, 15.0);
+        assert_eq!(w[0].1, 15.0);
+    }
+
+    #[test]
+    fn a_reparse_keeps_custom_singer_names_and_countdown_modes() {
+        let raw = "first line\nsecond line";
         let mut lines = parse_pasted_lyrics(raw);
-        lines[0].start = Some(0.0);
-        let mut bv = BackingVocal::new("echo");
-        bv.start = Some(1.0);
-        bv.end = Some(2.0);
-        lines[0].backing_vocal = Some(bv.clone());
+        lines[0].custom_singer_name = Some("Lead".to_string());
+        lines[0].countdown_mode = CountdownMode::Force;
+        lines[1].custom_singer_name = Some("Backup".to_string());
+        lines[1].countdown_mode = CountdownMode::Suppress;
 
-        let (merged, report) = merge_reparsed_lyrics(&lines, raw, None);
-        assert_eq!(report.unchanged, 1);
-        assert_eq!(merged[0].backing_vocal, Some(bv));
+        // Unchanged text (exact-match anchors).
+        let (merged, _) = merge_reparsed_lyrics(&lines, raw, None);
+        assert_eq!(merged[0].custom_singer_name.as_deref(), Some("Lead"));
+        assert_eq!(merged[0].countdown_mode, CountdownMode::Force);
+        assert_eq!(merged[1].custom_singer_name.as_deref(), Some("Backup"));
+        assert_eq!(merged[1].countdown_mode, CountdownMode::Suppress);
+
+        // Reworded line (gap pairing), with a different word count too.
+        let (merged, report) =
+            merge_reparsed_lyrics(&lines, "first line\nsecond line reworded", None);
+        assert_eq!(report.reworded_word_count_changed, 1);
+        assert_eq!(merged[1].custom_singer_name.as_deref(), Some("Backup"));
+        assert_eq!(merged[1].countdown_mode, CountdownMode::Suppress);
     }
 
     #[test]
-    fn a_reparse_carries_the_backing_vocal_through_for_a_reworded_host_line() {
-        let old_raw = "hello world";
-        let mut lines = parse_pasted_lyrics(old_raw);
-        lines[0].start = Some(0.0);
-        let mut bv = BackingVocal::new("echo");
-        bv.start = Some(1.0);
-        bv.end = Some(2.0);
-        lines[0].backing_vocal = Some(bv.clone());
-
-        // Same word count, one word changed - a "reworded" match, not an
-        // exact one, per merge_edited_line - the backing vocal must still
-        // survive, since it's attached to the host line's identity, not to
-        // its exact wording.
-        let (merged, report) = merge_reparsed_lyrics(&lines, "hello there", None);
+    fn a_reparse_keeps_a_line_on_the_backing_track() {
+        let raw = "main line\nbacking line";
+        let mut lines = parse_pasted_lyrics(raw);
+        lines[1].is_backing = true;
+        lines[1].start = Some(1.0);
+        let (merged, _) = merge_reparsed_lyrics(&lines, raw, None);
+        assert!(merged[1].is_backing);
+        // Reworded (same word count) - still backing.
+        let (merged, report) = merge_reparsed_lyrics(&lines, "main line\nbacking words", None);
         assert_eq!(report.reworded_same_word_count, 1);
-        assert_eq!(merged[0].backing_vocal, Some(bv));
+        assert!(merged[1].is_backing);
+        assert_eq!(merged[1].start, Some(1.0));
+        // A newly typed line in between is a plain main line.
+        let (merged, _) = merge_reparsed_lyrics(&lines, "main line\nnew one\nbacking line", None);
+        assert!(!merged[1].is_backing);
+        assert!(merged[2].is_backing);
+    }
+
+    #[test]
+    fn legacy_echo_vocals_migrate_into_backing_lines_and_the_raw_text() {
+        let mut raw = "first line\n\nsecond line\n".to_string();
+        let mut lines = parse_pasted_lyrics(&raw);
+        let mut bv = BackingVocal::new("echo echo");
+        bv.start = Some(2.0);
+        bv.end = Some(3.0);
+        bv.singer = Singer::Female;
+        bv.word_overrides = vec![Some(2.0), Some(2.5)];
+        bv.word_end_overrides = vec![None, None];
+        lines[0].backing_vocal = Some(bv);
+
+        assert_eq!(migrate_legacy_backing_vocals(&mut lines, &mut raw), 1);
+        assert_eq!(raw, "first line\necho echo\n\nsecond line\n");
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.backing_vocal.is_none()));
+        let m = &lines[1];
+        assert!(m.is_backing);
+        assert_eq!(m.text, "echo echo");
+        assert_eq!((m.start, m.sing_end_override), (Some(2.0), Some(3.0)));
+        assert_eq!(m.singer, Singer::Female);
+        assert_eq!(m.word_overrides, vec![Some(2.0), Some(2.5)]);
+        // And the migrated text re-parses back onto the same lines.
+        let (merged, report) = merge_reparsed_lyrics(&lines, &raw, None);
+        assert!(report.is_fully_unchanged(3));
+        assert!(merged[1].is_backing);
+    }
+
+    #[test]
+    fn legacy_backing_vocal_json_still_deserializes() {
+        let json = r#"{"text":"hi","start":1.0,"singer":"Male","word_overrides":[null],
+            "word_end_overrides":[null],"sing_end_override":null,"starts_new_block":true,
+            "backing_vocal":{"text":"echo","start":1.5,"end":null,"singer":"Female",
+            "word_overrides":[null],"word_end_overrides":[null]}}"#;
+        let line: LyricLine = serde_json::from_str(json).unwrap();
+        assert!(!line.is_backing);
+        assert_eq!(line.backing_vocal.unwrap().text, "echo");
     }
 
     // --- merge_reparsed_lyrics -------------------------------------------
