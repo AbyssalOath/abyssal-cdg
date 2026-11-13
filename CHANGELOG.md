@@ -183,6 +183,13 @@ the `.cdg` output is more accurate - lines now appear exactly on time.
   the wrong value (20; the spec's is 38). Nothing used it, so no exported
   file was affected.
 
+### Build
+
+- CI and release builds are pinned to Rust 1.99: Rust 1.100 can't compile
+  `objc2` 0.4.1, a macOS-only dependency of `eframe` 0.28 (see
+  BUILD_TROUBLESHOOTING.md). Building on macOS from source needs 1.99 until
+  `eframe`/`egui` are upgraded.
+
 ### Upgrading from 0.2.4
 
 - **Re-export your `.cdg` files** to get the on-time line timing fix -

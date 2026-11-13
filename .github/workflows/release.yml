@@ -298,9 +298,15 @@ jobs:
           chmod +x "assets/ffmpeg/$out_name" 2>/dev/null || true
           ls -la assets/ffmpeg/
 
-      - name: Install Rust stable
+      - name: Install Rust 1.99
+        # Pinned to 1.99: Rust 1.100 no longer compiles objc2 0.4.1 (macOS-only,
+        # pulled in by eframe 0.28 via winit 0.29/glutin 0.31) - error E0277 in
+        # objc2's ivar_forwarding_impls.rs - and there's no fixed 0.4.x. Drop the
+        # pin once eframe/egui are upgraded past 0.28 (newer winit uses objc2 0.5+).
+        # Keep this in step with ci.yml's pin.
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

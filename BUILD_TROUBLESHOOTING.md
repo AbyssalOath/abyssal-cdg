@@ -1,5 +1,23 @@
 # Build troubleshooting
 
+## macOS: `objc2` fails with "is not an iterator" (Rust 1.100+)
+
+On macOS, **Rust 1.100 and newer can't compile `objc2` 0.4.1**, an old
+macOS-only dependency pulled in by `eframe` 0.28 (via `winit` 0.29 /
+`glutin` 0.31) - the build stops inside `objc2`'s
+`ivar_forwarding_impls.rs` with `error[E0277]: ... is not an iterator`.
+It's not a bug in this project's code, and Linux/Windows builds aren't
+affected. Build with Rust 1.99 until `eframe`/`egui` are upgraded (newer
+`winit` uses `objc2` 0.5+):
+
+```bash
+rustup toolchain install 1.99.0
+cargo +1.99.0 build --release
+```
+
+CI and the release workflow are pinned to 1.99.0 for the same reason (see
+the comment on their "Install Rust" step).
+
 ## "It fails to compile" / dependency resolution errors
 
 This project, as configured (via the committed `Cargo.lock`), **will fail to compile on
