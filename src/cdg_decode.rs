@@ -135,7 +135,7 @@ impl CdgPlayback {
     pub fn new(bytes: Vec<u8>) -> Self {
         let mut decoder = CdgDecoder::default();
         let mut checkpoints = vec![decoder.clone()];
-        for (i, packet) in bytes.chunks_exact(PACKET_SIZE).enumerate() {
+        for (i, packet) in bytes.as_chunks::<PACKET_SIZE>().0.iter().enumerate() {
             decoder.apply(packet);
             if (i + 1) % CHECKPOINT_PACKETS == 0 {
                 checkpoints.push(decoder.clone());
@@ -164,8 +164,9 @@ impl CdgPlayback {
             self.decoder = self.checkpoints[k].clone();
             self.pos = k * CHECKPOINT_PACKETS;
         }
-        for packet in
-            self.bytes[self.pos * PACKET_SIZE..target * PACKET_SIZE].chunks_exact(PACKET_SIZE)
+        for packet in self.bytes[self.pos * PACKET_SIZE..target * PACKET_SIZE]
+            .as_chunks::<PACKET_SIZE>()
+            .0
         {
             self.decoder.apply(packet);
         }
@@ -194,7 +195,7 @@ mod tests {
         tile[0] = 0b10_0000; // leftmost pixel of the top row
         w.tile_block(0, 0, 0, 1, &tile);
         let mut d = CdgDecoder::default();
-        for p in w.into_bytes().chunks_exact(PACKET_SIZE) {
+        for p in w.into_bytes().as_chunks::<PACKET_SIZE>().0 {
             d.apply(p);
         }
         assert_eq!(d.palette[1], [255, 136, 51]);
@@ -388,7 +389,7 @@ mod tests {
         w.memory_preset(2);
         w.border_preset(5);
         let mut d = CdgDecoder::default();
-        for p in w.into_bytes().chunks_exact(PACKET_SIZE) {
+        for p in w.into_bytes().as_chunks::<PACKET_SIZE>().0 {
             d.apply(p);
         }
         assert_eq!(d.pixel(0, 0), 5);
