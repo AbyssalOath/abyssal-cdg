@@ -46,13 +46,17 @@ pub(crate) const CREDIT_TEXT: &str =
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Resolution {
+    Hd720,
     Hd1080,
     Uhd4k,
 }
 
 impl Resolution {
+    /// Landscape (16:9) frame size - see [`VideoStyle::frame_size`] for
+    /// the orientation-aware one actually rendered.
     pub fn dimensions(self) -> (u32, u32) {
         match self {
+            Resolution::Hd720 => (1280, 720),
             Resolution::Hd1080 => (1920, 1080),
             Resolution::Uhd4k => (3840, 2160),
         }
@@ -60,9 +64,75 @@ impl Resolution {
 
     pub fn label(self) -> &'static str {
         match self {
+            Resolution::Hd720 => "720p",
             Resolution::Hd1080 => "1080p",
             Resolution::Uhd4k => "4K",
         }
+    }
+}
+
+/// Frame shape of the video export.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Orientation {
+    /// 16:9 - YouTube, TVs, karaoke screens.
+    #[default]
+    Landscape,
+    /// 9:16 - YouTube Shorts, TikTok, Instagram Reels.
+    Portrait,
+}
+
+/// Lyric size limits for [`VideoStyle::lyric_size_pct`].
+pub const MIN_LYRIC_SIZE_PCT: u32 = 60;
+pub const MAX_LYRIC_SIZE_PCT: u32 = 160;
+
+/// Video-export look options beyond colors/background, saved with the
+/// project. [`VideoStyle::default`] reproduces the video exactly as it
+/// rendered before these options existed.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct VideoStyle {
+    pub orientation: Orientation,
+    /// Lyric text size as a percentage of the normal size (lyric lines and
+    /// the backing lane - not the title card).
+    pub lyric_size_pct: u32,
+    /// A dark outline around all text, for legibility over busy
+    /// image/video backgrounds.
+    pub outline: bool,
+    /// A soft dark drop shadow under all text.
+    pub shadow: bool,
+    /// Fade the audio out over this many seconds at the end of the video
+    /// (0 = no fade).
+    pub fade_out_secs: f32,
+}
+
+impl Default for VideoStyle {
+    fn default() -> Self {
+        Self {
+            orientation: Orientation::Landscape,
+            lyric_size_pct: 100,
+            outline: false,
+            shadow: false,
+            fade_out_secs: 0.0,
+        }
+    }
+}
+
+impl VideoStyle {
+    /// The frame size actually rendered: `resolution`'s 16:9 size, swapped
+    /// to 9:16 for [`Orientation::Portrait`].
+    pub fn frame_size(&self, resolution: Resolution) -> (u32, u32) {
+        let (w, h) = resolution.dimensions();
+        match self.orientation {
+            Orientation::Landscape => (w, h),
+            Orientation::Portrait => (h, w),
+        }
+    }
+
+    /// [`Self::lyric_size_pct`] as a multiplier, clamped to the allowed range.
+    pub fn lyric_scale(&self) -> f32 {
+        self.lyric_size_pct
+            .clamp(MIN_LYRIC_SIZE_PCT, MAX_LYRIC_SIZE_PCT) as f32
+            / 100.0
     }
 }
 
@@ -209,7 +279,7 @@ pub struct VideoPalette {
 }
 
 impl VideoPalette {
-    fn singer_colors(&self, s: Singer) -> (Rgb8, Rgb8) {
+    pub fn singer_colors(&self, s: Singer) -> (Rgb8, Rgb8) {
         match s {
             Singer::Default => (self.default_unsung, self.default_highlight),
             Singer::Male => (self.male_unsung, self.male_highlight),
@@ -226,6 +296,9 @@ struct Canvas {
     w: usize,
     h: usize,
     buf: Vec<u8>,
+    /// Text effects/sizing from [`VideoStyle`] - read by the text drawing
+    /// functions so they don't each need extra parameters.
+    style: VideoStyle,
 }
 
 impl Canvas {
@@ -234,7 +307,22 @@ impl Canvas {
             w,
             h,
             buf: vec![0u8; w * h * 3],
+            style: VideoStyle::default(),
         }
+    }
+
+    /// The size unit all text and spacing scale from: the frame's *short*
+    /// side - the height for 16:9 (so landscape output is unchanged), the
+    /// width for 9:16, where scaling from the height would make every lyric
+    /// line far too wide for the narrow frame.
+    fn unit(&self) -> f32 {
+        self.w.min(self.h) as f32
+    }
+
+    /// A lyric size (`fraction` of [`Self::unit`]) with the user's lyric
+    /// size setting applied.
+    fn lyric_px(&self, fraction: f32) -> f32 {
+        self.unit() * fraction * self.style.lyric_scale()
     }
 
     fn fill(&mut self, color: Rgb8) {
@@ -302,10 +390,26 @@ fn draw_filled_circle(canvas: &mut Canvas, cx: f32, cy: f32, radius: f32, color:
     }
 }
 
+/// `font`'s glyph for `ch`, or - if the font has none (decorative fonts
+/// like the bundled Nosifer/Creepster often lack curly quotes, long dashes
+/// or accented letters) - its glyph for [`crate::font::fallback_char`]'s
+/// plain stand-in, so the character still shows instead of vanishing.
+/// Measuring and drawing both go through this, so widths stay consistent.
+fn glyph_for(font: &FontArc, ch: char) -> ab_glyph::GlyphId {
+    let gid = font.glyph_id(ch);
+    if gid.0 != 0 || ch.is_whitespace() {
+        return gid;
+    }
+    crate::font::fallback_char(ch)
+        .map(|c| font.glyph_id(c))
+        .filter(|g| g.0 != 0)
+        .unwrap_or(gid)
+}
+
 fn measure_width(font: &FontArc, scale: PxScale, text: &str) -> f32 {
     let scaled = font.as_scaled(scale);
     text.chars()
-        .map(|c| scaled.h_advance(font.glyph_id(c)))
+        .map(|c| scaled.h_advance(glyph_for(font, c)))
         .sum()
 }
 
@@ -341,26 +445,107 @@ fn draw_text_line_chars(
         scale = PxScale::from(scale_px);
     }
     let final_w = measure_width(font, scale, text);
-    let scaled = font.as_scaled(scale);
 
     let fallback = colors.last().copied().unwrap_or(Rgb8::new(255, 255, 255));
-    let mut x = center_x - final_w / 2.0;
+    let left_x = center_x - final_w / 2.0;
+    draw_text_effects(canvas, font, scale, left_x, baseline_y, text, opacity);
+    for_each_glyph_pixel(
+        font,
+        scale,
+        left_x,
+        baseline_y,
+        text,
+        |i, px, py, coverage| {
+            let color = colors.get(i).copied().unwrap_or(fallback);
+            canvas.blend_pixel(px, py, color, coverage * opacity);
+        },
+    );
+}
+
+/// Calls `f(char_index, x, y, coverage)` for every anti-aliased pixel of
+/// `text` laid out from `left_x` on `baseline_y` - the one place glyphs are
+/// positioned/rasterized, shared by the fill and effects passes so they
+/// always line up.
+fn for_each_glyph_pixel(
+    font: &FontArc,
+    scale: PxScale,
+    left_x: f32,
+    baseline_y: f32,
+    text: &str,
+    mut f: impl FnMut(usize, i32, i32, f32),
+) {
+    let scaled = font.as_scaled(scale);
+    let mut x = left_x;
     for (i, ch) in text.chars().enumerate() {
-        let gid = font.glyph_id(ch);
+        let gid = glyph_for(font, ch);
         let advance = scaled.h_advance(gid);
         if !ch.is_whitespace() {
-            let color = colors.get(i).copied().unwrap_or(fallback);
             let glyph = gid.with_scale_and_position(scale, ab_glyph::point(x, baseline_y));
             if let Some(outlined) = font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 outlined.draw(|gx, gy, coverage| {
-                    let px = bounds.min.x as i32 + gx as i32;
-                    let py = bounds.min.y as i32 + gy as i32;
-                    canvas.blend_pixel(px, py, color, coverage * opacity);
+                    f(
+                        i,
+                        bounds.min.x as i32 + gx as i32,
+                        bounds.min.y as i32 + gy as i32,
+                        coverage,
+                    );
                 });
             }
         }
         x += advance;
+    }
+}
+
+/// Offsets (unit circle) the outline is stamped at - 16 directions so even
+/// a thick 4K outline has no gaps on diagonals.
+const OUTLINE_DIRECTIONS: usize = 16;
+
+/// Draws the [`VideoStyle`] text effects - drop shadow, then outline - for a
+/// whole line *before* its fill, so one letter's outline never paints over
+/// a neighboring letter. Both are near-black, sized from the font size so
+/// they look the same at 720p and 4K. No-op when both are off.
+fn draw_text_effects(
+    canvas: &mut Canvas,
+    font: &FontArc,
+    scale: PxScale,
+    left_x: f32,
+    baseline_y: f32,
+    text: &str,
+    opacity: f32,
+) {
+    let (outline, shadow) = (canvas.style.outline, canvas.style.shadow);
+    if !outline && !shadow {
+        return;
+    }
+    let dark = Rgb8::new(0, 0, 0);
+    let stamp = |dx: i32, dy: i32, alpha: f32, canvas: &mut Canvas| {
+        for_each_glyph_pixel(
+            font,
+            scale,
+            left_x,
+            baseline_y,
+            text,
+            |_, px, py, coverage| {
+                canvas.blend_pixel(px + dx, py + dy, dark, coverage * alpha * opacity);
+            },
+        );
+    };
+    if shadow {
+        let d = (scale.y * 0.06).round().max(1.0) as i32;
+        stamp(d, d, 0.55, canvas);
+    }
+    if outline {
+        let r = (scale.y * 0.05).max(1.0);
+        for k in 0..OUTLINE_DIRECTIONS {
+            let a = k as f32 / OUTLINE_DIRECTIONS as f32 * std::f32::consts::TAU;
+            stamp(
+                (a.cos() * r).round() as i32,
+                (a.sin() * r).round() as i32,
+                0.9,
+                canvas,
+            );
+        }
     }
 }
 
@@ -396,7 +581,6 @@ fn draw_text_line_wipe(
         scale = PxScale::from(scale_px);
     }
     let final_w = measure_width(font, scale, text);
-    let scaled = font.as_scaled(scale);
 
     let left_x = center_x - final_w / 2.0;
     let wipe_x = left_x + final_w * wipe_fraction.clamp(0.0, 1.0);
@@ -404,26 +588,20 @@ fn draw_text_line_wipe(
     // scales gently with font size so it looks proportionate at 4K too.
     let blend_half_width = (scale_px * 0.035).max(1.5);
 
-    let mut x = left_x;
-    for ch in text.chars() {
-        let gid = font.glyph_id(ch);
-        let advance = scaled.h_advance(gid);
-        if !ch.is_whitespace() {
-            let glyph = gid.with_scale_and_position(scale, ab_glyph::point(x, baseline_y));
-            if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                outlined.draw(|gx, gy, coverage| {
-                    let px = bounds.min.x as i32 + gx as i32;
-                    let py = bounds.min.y as i32 + gy as i32;
-                    let dx = px as f32 - wipe_x;
-                    let blend_t = (dx / blend_half_width * 0.5 + 0.5).clamp(0.0, 1.0);
-                    let color = highlight.lerp(unsung, blend_t);
-                    canvas.blend_pixel(px, py, color, coverage);
-                });
-            }
-        }
-        x += advance;
-    }
+    draw_text_effects(canvas, font, scale, left_x, baseline_y, text, 1.0);
+    for_each_glyph_pixel(
+        font,
+        scale,
+        left_x,
+        baseline_y,
+        text,
+        |_, px, py, coverage| {
+            let dx = px as f32 - wipe_x;
+            let blend_t = (dx / blend_half_width * 0.5 + 0.5).clamp(0.0, 1.0);
+            let color = highlight.lerp(unsung, blend_t);
+            canvas.blend_pixel(px, py, color, coverage);
+        },
+    );
 }
 
 /// Builds the singer-legend's display text (e.g. "Male   Female") plus a
@@ -497,8 +675,8 @@ fn draw_countdown_dots(
     // for the singer to read ahead during the countdown rather than only
     // right as the words become live.
     let cy = h * 0.12;
-    let radius = h * 0.012;
-    let spacing = h * 0.05;
+    let radius = canvas.unit() * 0.012;
+    let spacing = canvas.unit() * 0.05;
     for i in 0..4 {
         let cx = w / 2.0 + (i as f32 - 1.5) * spacing;
         let color = if i < lit { lit_color } else { dim_color };
@@ -529,8 +707,8 @@ fn draw_upcoming_block_preview(
     max_width: f32,
     opacity: f32,
 ) {
-    let line_height = h * 0.11;
-    let font_size = h * 0.055;
+    let line_height = canvas.lyric_px(0.11);
+    let font_size = canvas.lyric_px(0.055);
     let total_height = block.len() as f32 * line_height;
     let start_y = h * 0.5 - total_height / 2.0 + line_height * 0.5;
     for (slot, &idx) in block.iter().enumerate() {
@@ -583,7 +761,7 @@ fn draw_backing_lane(
     let line = &backing_track[k];
     let text = normalize_text(&line.text);
     let (unsung, highlight) = palette.singer_colors(line.singer);
-    let size = h * BACKING_LANE_FONT;
+    let size = canvas.lyric_px(BACKING_LANE_FONT);
     let y = h * BACKING_LANE_Y;
     if t >= line.start && t < line.sing_end {
         let wipe = current_line_wipe_fraction(line, t);
@@ -620,6 +798,67 @@ fn draw_backing_lane(
     }
 }
 
+/// How long the outro card takes to fade in.
+const OUTRO_FADE_SECS: f64 = 0.6;
+
+/// The video outro card: its text lines (the first larger, bold), then -
+/// if it includes them - the title and "by artist", stacked and centered
+/// vertically, fading in over [`OUTRO_FADE_SECS`]. Sizes match the title
+/// card's (see `render_frame`), from the frame's short side.
+#[allow(clippy::too_many_arguments)]
+fn draw_outro(
+    canvas: &mut Canvas,
+    regular: &FontArc,
+    bold: &FontArc,
+    outro: &crate::export::Outro,
+    palette: &VideoPalette,
+    title: Option<&str>,
+    artist: Option<&str>,
+    max_width: f32,
+    t: f64,
+) {
+    let opacity = ((t - outro.start) / OUTRO_FADE_SECS).clamp(0.0, 1.0) as f32;
+    let unit = canvas.unit();
+    // (text, font, size, color)
+    let mut items: Vec<(String, &FontArc, f32, Rgb8)> = Vec::new();
+    for (k, line) in outro.lines.iter().enumerate() {
+        if k == 0 {
+            items.push((line.clone(), bold, unit * 0.08, palette.title));
+        } else {
+            items.push((line.clone(), regular, unit * 0.05, palette.title));
+        }
+    }
+    if outro.show_title {
+        if let Some(ti) = title {
+            items.push((ti.to_string(), bold, unit * 0.06, palette.title));
+        }
+        if let Some(a) = artist {
+            items.push((format!("by {a}"), regular, unit * 0.045, palette.artist));
+        }
+    }
+    let gap = unit * 0.035;
+    let total: f32 = items.iter().map(|(_, _, size, _)| size * 1.25).sum::<f32>()
+        + gap * items.len().saturating_sub(1) as f32;
+    let mut y = canvas.h as f32 * 0.5 - total / 2.0;
+    let cx = canvas.w as f32 / 2.0;
+    for (text, font, size, color) in &items {
+        let line_h = size * 1.25;
+        // Baseline sits ~80% of the way down each line's box.
+        draw_text_line_uniform(
+            canvas,
+            font,
+            *size,
+            cx,
+            y + line_h * 0.8,
+            text,
+            *color,
+            max_width,
+            opacity,
+        );
+        y += line_h + gap;
+    }
+}
+
 /// Draws one frame's lyrics/title-card/countdown content onto `canvas`.
 /// Does *not* touch the background - the caller fills `canvas` first,
 /// either with `palette.background` (the plain solid-color look) or a
@@ -641,6 +880,7 @@ fn render_frame(
     t: f64,
     timing_settings: &TimingSettings,
     show_credit: bool,
+    outro: Option<&crate::export::Outro>,
 ) {
     let w = canvas.w as f32;
     let h = canvas.h as f32;
@@ -652,6 +892,17 @@ fn render_frame(
     // nothing at all, so it's drawn first, on its own schedule.
     draw_backing_lane(canvas, regular, backing_track, palette, w, h, max_width, t);
 
+    // The outro card takes over the whole frame once the last line is done
+    // (see `export::outro_window`).
+    if let Some(outro) = outro {
+        if t >= outro.start {
+            draw_outro(
+                canvas, regular, bold, outro, palette, title, artist, max_width, t,
+            );
+            return;
+        }
+    }
+
     let legend_singers = singer_legend(timed_lines, backing_track);
     let has_title_card = title.is_some() || artist.is_some() || !legend_singers.is_empty();
     if has_title_card && t < card_end {
@@ -659,7 +910,7 @@ fn render_frame(
             draw_text_line_uniform(
                 canvas,
                 bold,
-                h * 0.10,
+                canvas.unit() * 0.10,
                 w / 2.0,
                 h * 0.42,
                 ti,
@@ -673,7 +924,7 @@ fn render_frame(
             draw_text_line_uniform(
                 canvas,
                 regular,
-                h * 0.05,
+                canvas.unit() * 0.05,
                 w / 2.0,
                 h * 0.52,
                 &by,
@@ -687,7 +938,7 @@ fn render_frame(
             draw_text_line_chars(
                 canvas,
                 regular,
-                h * 0.04,
+                canvas.unit() * 0.04,
                 w / 2.0,
                 h * 0.62,
                 &text,
@@ -700,7 +951,7 @@ fn render_frame(
             draw_text_line_uniform(
                 canvas,
                 regular,
-                h * 0.028,
+                canvas.unit() * 0.028,
                 w / 2.0,
                 h * 0.85,
                 CREDIT_TEXT,
@@ -842,8 +1093,8 @@ fn render_frame(
     let revealed_at = cd_window.and_then(|(cd_start, _)| (t >= cd_start).then_some(cd_start));
     let hide_upcoming = hide_upcoming_base && revealed_at.is_none();
 
-    let line_height = h * 0.11;
-    let font_size = h * 0.055;
+    let line_height = canvas.lyric_px(0.11);
+    let font_size = canvas.lyric_px(0.055);
     let total_height = block.len() as f32 * line_height;
     let start_y = h * 0.5 - total_height / 2.0 + line_height * 0.5;
 
@@ -1218,6 +1469,20 @@ pub fn extract_video_background_thumbnail(
     );
 }
 
+/// ffmpeg arguments fading the audio out over the last `fade_secs` of a
+/// `total_duration`-second video (none when `fade_secs` is 0 or the song
+/// length is unknown). The fade is clamped to the song's length.
+fn audio_fade_args(fade_secs: f32, total_duration: f64) -> Vec<String> {
+    let fade = (fade_secs as f64).min(total_duration);
+    if fade <= 0.0 || !fade.is_finite() || total_duration <= 0.0 {
+        return Vec::new();
+    }
+    vec![
+        "-af".to_string(),
+        format!("afade=t=out:st={:.3}:d={:.3}", total_duration - fade, fade),
+    ]
+}
+
 /// Renders the full karaoke video to `output_path`, muxed with the audio
 /// at `audio_path`. Calls `on_progress(0.0..=1.0)` periodically so the UI
 /// can show a progress bar - this can take anywhere from several seconds to
@@ -1250,6 +1515,8 @@ pub fn render_video(
     output_path: &Path,
     timing_settings: &TimingSettings,
     show_credit: bool,
+    style: &VideoStyle,
+    outro: Option<&crate::export::Outro>,
     mut on_progress: impl FnMut(f32),
 ) -> Result<()> {
     check_ffmpeg_available()?;
@@ -1267,7 +1534,7 @@ pub fn render_video(
         ),
     };
 
-    let (w, h) = resolution.dimensions();
+    let (w, h) = style.frame_size(resolution);
     let card_end = crate::export::title_card_end(timed_lines);
     let blocks = group_into_blocks(timed_lines);
     let total_frames = ((total_duration * fps as f64).ceil() as u64).max(1);
@@ -1382,7 +1649,8 @@ pub fn render_video(
             // `VideoCodec`'s own docs.
             let video_bitrate = match (w, h) {
                 _ if w * h > 1920 * 1080 => "14M", // 4K
-                _ => "5M",                         // 1080p (or anything smaller)
+                _ if w * h > 1280 * 720 => "5M",   // 1080p (either orientation)
+                _ => "3M",                         // 720p
             };
             vec![
                 "-c:v".to_string(),
@@ -1412,6 +1680,7 @@ pub fn render_video(
         .arg(audio_path)
         .args(["-map", "0:v", "-map", "1:a"])
         .args(&codec_args)
+        .args(audio_fade_args(style.fade_out_secs, total_duration))
         .args([
             "-pix_fmt",
             "yuv420p",
@@ -1433,6 +1702,7 @@ pub fn render_video(
         .take()
         .ok_or_else(|| anyhow!("failed to open ffmpeg stdin"))?;
     let mut canvas = Canvas::new(w as usize, h as usize);
+    canvas.style = *style;
 
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 / fps as f64;
@@ -1486,6 +1756,7 @@ pub fn render_video(
             t,
             timing_settings,
             show_credit,
+            outro,
         );
         if stdin.write_all(&canvas.buf).is_err() {
             break;
@@ -1520,7 +1791,143 @@ pub fn render_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_style_keeps_landscape_sizes_and_portrait_swaps_dimensions() {
+        let style = VideoStyle::default();
+        assert_eq!(style.frame_size(Resolution::Hd1080), (1920, 1080));
+        assert_eq!(style.frame_size(Resolution::Hd720), (1280, 720));
+        let portrait = VideoStyle {
+            orientation: Orientation::Portrait,
+            ..style
+        };
+        assert_eq!(portrait.frame_size(Resolution::Hd1080), (1080, 1920));
+        // Sizes come from the short side, so 1080p text is the same size
+        // either way up.
+        let land = Canvas::new(1920, 1080);
+        let mut port = Canvas::new(1080, 1920);
+        port.style = portrait;
+        assert_eq!(land.lyric_px(0.055), port.lyric_px(0.055));
+    }
+
+    #[test]
+    fn lyric_size_setting_scales_and_clamps() {
+        let mut c = Canvas::new(1920, 1080);
+        c.style.lyric_size_pct = 150;
+        assert!((c.lyric_px(0.1) - 162.0).abs() < 0.01);
+        c.style.lyric_size_pct = 5;
+        assert!((c.lyric_px(0.1) - 108.0 * 0.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_effects_draw_dark_pixels_around_the_text() {
+        let font = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let render = |outline: bool, shadow: bool| {
+            let mut c = Canvas::new(200, 80);
+            c.fill(Rgb8::new(128, 128, 128));
+            c.style.outline = outline;
+            c.style.shadow = shadow;
+            draw_text_line_uniform(
+                &mut c,
+                &font,
+                40.0,
+                100.0,
+                55.0,
+                "Hi",
+                Rgb8::new(255, 255, 255),
+                190.0,
+                1.0,
+            );
+            let dark = c.buf.chunks(3).filter(|p| p[0] < 60).count();
+            let white = c.buf.chunks(3).filter(|p| p[0] > 250).count();
+            (dark, white)
+        };
+        let (plain_dark, plain_white) = render(false, false);
+        assert_eq!(plain_dark, 0);
+        let (outline_dark, outline_white) = render(true, false);
+        let (shadow_dark, _) = render(false, true);
+        assert!(outline_dark > 50, "outline drew {outline_dark} dark px");
+        assert!(shadow_dark > 20, "shadow drew {shadow_dark} dark px");
+        // The fill is drawn on top, so the letters themselves stay intact.
+        assert!(outline_white as f32 > plain_white as f32 * 0.8);
+    }
+
+    #[test]
+    fn outro_card_replaces_the_lyrics_once_its_window_starts() {
+        let regular = FontArc::try_from_slice(DEJAVU_REGULAR).unwrap();
+        let bold = FontArc::try_from_slice(DEJAVU_BOLD).unwrap();
+        let mut line = TimedLine::new("Last line".to_string(), 1.0, 4.0, Singer::Default);
+        line.sing_end = 3.0;
+        let timed = vec![line];
+        let blocks = group_into_blocks(&timed);
+        let outro = crate::export::Outro {
+            start: 4.5,
+            end: 10.0,
+            lines: vec!["Thanks for singing!".to_string()],
+            show_title: true,
+        };
+        let render = |t: f64, outro: Option<&crate::export::Outro>| {
+            let mut c = Canvas::new(320, 180);
+            c.fill(Rgb8::new(0, 0, 0));
+            render_frame(
+                &mut c,
+                &regular,
+                &bold,
+                &timed,
+                &[],
+                &blocks,
+                &test_palette(),
+                Some("Song"),
+                Some("Band"),
+                0.5,
+                t,
+                &TimingSettings::default(),
+                false,
+                outro,
+            );
+            c.buf
+        };
+        // Before the window: identical to having no outro at all.
+        assert_eq!(render(4.0, Some(&outro)), render(4.0, None));
+        // Fully faded in: something is drawn, and it's not the lyrics frame.
+        let with = render(6.0, Some(&outro));
+        assert!(with.iter().any(|&b| b > 0));
+        assert_ne!(with, render(6.0, None));
+        // Fading in: dimmer than fully in.
+        let sum = |b: &[u8]| b.iter().map(|&x| x as u64).sum::<u64>();
+        let fading = render(4.5 + OUTRO_FADE_SECS / 2.0, Some(&outro));
+        assert!(sum(&fading) < sum(&with) && sum(&fading) > 0);
+    }
+
+    #[test]
+    fn audio_fade_args_cover_the_last_seconds() {
+        assert!(audio_fade_args(0.0, 200.0).is_empty());
+        assert_eq!(
+            audio_fade_args(3.0, 200.0),
+            vec!["-af", "afade=t=out:st=197.000:d=3.000"]
+        );
+        // Never longer than the song itself.
+        assert_eq!(
+            audio_fade_args(10.0, 4.0),
+            vec!["-af", "afade=t=out:st=0.000:d=4.000"]
+        );
+    }
     use crate::lyrics::{resolve_timing, word_timings, LyricLine, Singer};
+
+    #[test]
+    fn missing_glyphs_fall_back_to_a_plain_stand_in() {
+        let nosifer = FontArc::try_from_slice(include_bytes!(
+            "../assets/fonts/nosifer/Nosifer-Regular.ttf"
+        ))
+        .unwrap();
+        // Whatever the font does or doesn't have, a curly apostrophe/dash
+        // must resolve to *some* real glyph rather than .notdef.
+        for ch in ['\u{2019}', '\u{201C}', '\u{2014}', 'ő'] {
+            assert_ne!(glyph_for(&nosifer, ch).0, 0, "{ch} resolved to .notdef");
+        }
+        // A glyph the font does have is used as-is.
+        assert_eq!(glyph_for(&nosifer, 'A'), nosifer.glyph_id('A'));
+    }
 
     #[test]
     fn background_from_path_recognizes_image_extensions_case_insensitively() {
@@ -1686,6 +2093,7 @@ mod tests {
                 1.0, // within the title card (card_end = 5.0)
                 &TimingSettings::default(),
                 show_credit,
+                None,
             );
             canvas
         };
@@ -1881,6 +2289,7 @@ mod tests {
                 t,
                 &TimingSettings::default(),
                 false,
+                None,
             );
             t += 0.37;
         }
@@ -1991,6 +2400,7 @@ mod tests {
                 t,
                 &settings,
                 false,
+                None,
             );
             canvas
         };
@@ -2059,6 +2469,7 @@ mod tests {
             28.0,
             &TimingSettings::default(),
             false,
+            None,
         );
 
         assert!(
@@ -2097,6 +2508,7 @@ mod tests {
             18.0,
             &TimingSettings::default(),
             false,
+            None,
         );
 
         assert!(
@@ -2157,6 +2569,7 @@ mod tests {
                 t,
                 &TimingSettings::default(),
                 false,
+                None,
             );
             canvas
         };
@@ -2222,6 +2635,7 @@ mod tests {
                 t,
                 &TimingSettings::default(),
                 false,
+                None,
             );
             canvas
         };
@@ -2285,6 +2699,7 @@ mod tests {
                 t,
                 &TimingSettings::default(),
                 false,
+                None,
             );
             canvas
         };
@@ -2386,6 +2801,7 @@ mod tests {
                 t,
                 &TimingSettings::default(),
                 false,
+                None,
             );
             canvas
         };
@@ -2451,6 +2867,7 @@ mod tests {
                 t,
                 &TimingSettings::default(),
                 false,
+                None,
             );
             canvas
         };

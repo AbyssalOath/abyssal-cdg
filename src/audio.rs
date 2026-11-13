@@ -57,6 +57,11 @@ struct PlaybackClock {
     /// Wall-clock instant the clock last started running, if currently
     /// playing (`None` means paused/stopped).
     running_since: Option<Instant>,
+    /// Song seconds per wall-clock second - the playback speed (1.0 =
+    /// normal, 0.5 = half speed). Without this the clock would run at
+    /// wall-clock rate while the audio plays slower, so every tap at a
+    /// reduced speed would land at the wrong song time.
+    rate: f64,
 }
 
 impl PlaybackClock {
@@ -64,6 +69,7 @@ impl PlaybackClock {
         Self {
             base_position: 0.0,
             running_since: None,
+            rate: 1.0,
         }
     }
 
@@ -72,7 +78,18 @@ impl PlaybackClock {
             .running_since
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0);
-        self.base_position + elapsed
+        self.base_position + elapsed * self.rate
+    }
+
+    /// Change the playback rate without a jump in position: everything
+    /// played so far is banked at the old rate, and the clock carries on
+    /// from there at the new one.
+    fn set_rate(&mut self, rate: f64) {
+        if self.running_since.is_some() {
+            self.base_position = self.position();
+            self.running_since = Some(Instant::now());
+        }
+        self.rate = rate;
     }
 
     fn is_running(&self) -> bool {
@@ -125,7 +142,14 @@ pub struct AudioPlayer {
     path: Option<PathBuf>,
     duration: Option<f64>,
     clock: PlaybackClock,
+    /// Playback speed (see [`AudioPlayer::set_speed`]), applied to every
+    /// new sink since `seek`/`play_from_start` rebuild the pipeline.
+    speed: f32,
 }
+
+/// Slowest/fastest playback speed [`AudioPlayer::set_speed`] accepts.
+pub const MIN_SPEED: f32 = 0.25;
+pub const MAX_SPEED: f32 = 2.0;
 
 impl AudioPlayer {
     pub fn new() -> Result<Self> {
@@ -137,6 +161,7 @@ impl AudioPlayer {
             path: None,
             duration: None,
             clock: PlaybackClock::new(),
+            speed: 1.0,
         })
     }
 
@@ -169,6 +194,30 @@ impl AudioPlayer {
         self.path.is_some()
     }
 
+    /// Current playback speed (1.0 = normal).
+    pub fn speed(&self) -> f32 {
+        self.speed
+    }
+
+    /// Play slower (or faster) for timing fast passages - e.g. 0.5 = half
+    /// speed. Uses rodio's resampling speed control, so pitch drops along
+    /// with tempo (fine for timing; nothing here is exported). Takes effect
+    /// immediately mid-playback without a jump in position, and sticks
+    /// across seeks/restarts/new songs until changed. Clamped to
+    /// [`MIN_SPEED`]..=[`MAX_SPEED`].
+    pub fn set_speed(&mut self, speed: f32) {
+        let speed = if speed.is_finite() {
+            speed.clamp(MIN_SPEED, MAX_SPEED)
+        } else {
+            1.0
+        };
+        self.speed = speed;
+        self.clock.set_rate(speed as f64);
+        if let Some(sink) = &self.sink {
+            sink.set_speed(speed);
+        }
+    }
+
     pub fn is_playing(&self) -> bool {
         self.clock.is_running()
     }
@@ -194,6 +243,7 @@ impl AudioPlayer {
         let file = BufReader::new(File::open(&path)?);
         let source = Decoder::new(file)?;
         let sink = Sink::try_new(&self.stream_handle)?;
+        sink.set_speed(self.speed);
         sink.append(source);
         self.sink = Some(sink);
         self.clock.play_from(0.0);
@@ -233,6 +283,7 @@ impl AudioPlayer {
         let file = BufReader::new(File::open(&path)?);
         let source = Decoder::new(file)?.skip_duration(Duration::from_secs_f64(pos));
         let sink = Sink::try_new(&self.stream_handle)?;
+        sink.set_speed(self.speed);
         sink.append(source);
         if !was_running {
             // Avoid audibly starting playback if we were paused (or never started).
@@ -377,6 +428,55 @@ mod tests {
         clock.stop();
         assert!(!clock.is_running());
         assert_eq!(clock.position(), 0.0);
+    }
+
+    #[test]
+    fn half_rate_advances_at_half_speed() {
+        let mut clock = PlaybackClock::new();
+        clock.set_rate(0.5);
+        clock.play_from(10.0);
+        sleep(Duration::from_millis(600));
+        let pos = clock.position();
+        assert!((pos - 10.3).abs() < TOL, "expected ~10.3, got {pos}");
+    }
+
+    #[test]
+    fn changing_rate_mid_play_keeps_position_continuous() {
+        let mut clock = PlaybackClock::new();
+        clock.play_from(5.0);
+        // Run for a full second first: if `set_rate` didn't bank the time
+        // played so far, switching to half speed would jump the position
+        // back by ~0.5s - well clear of the scheduling-jitter tolerance
+        // (`TOL`) the other clock tests use for slow CI runners.
+        sleep(Duration::from_millis(1000));
+        let before = clock.position();
+        clock.set_rate(0.5);
+        let after = clock.position();
+        assert!(
+            (after - before).abs() < TOL,
+            "jumped from {before} to {after}"
+        );
+        assert!(clock.is_running());
+    }
+
+    #[test]
+    fn rate_change_while_paused_stays_frozen() {
+        let mut clock = PlaybackClock::new();
+        clock.play_from(3.0);
+        clock.pause();
+        let frozen = clock.position();
+        clock.set_rate(0.75);
+        sleep(Duration::from_millis(50));
+        assert_eq!(clock.position(), frozen);
+        // And the new rate applies once resumed.
+        clock.resume();
+        sleep(Duration::from_millis(400));
+        let pos = clock.position();
+        assert!(
+            (pos - (frozen + 0.3)).abs() < TOL,
+            "expected ~{}, got {pos}",
+            frozen + 0.3
+        );
     }
 
     #[test]

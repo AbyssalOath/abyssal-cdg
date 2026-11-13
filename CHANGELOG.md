@@ -7,6 +7,192 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-13
+
+A big usability release: the app now walks you through each song, timing
+is faster (slow-down, looping, chorus copy, syllables), there are new
+export formats (MP3+G zip, subtitles, vertical video, batch export), and
+the `.cdg` output is more accurate - lines now appear exactly on time.
+
+### Added
+
+#### Getting started and finding your way around
+
+- **Step bar**: Audio › Lyrics › Tap › Fine-tune › Export across the top,
+  ticking off each step and always showing what to do next, with a
+  one-click button for it (Load audio, Parse lyrics, Start tapping -
+  resuming just before your last tap - Export, Auto-align).
+- **Tips toggle**: untick **💡 Tips** to shrink the ~25 always-on help
+  paragraphs to one-line summaries, with the full text on each ⓘ. Saved
+  per computer; on for a fresh install.
+- **Visible feedback**: color-coded status (✔ success, ⚠ warning, ✖
+  error), a fading toast for anything other than routine progress, and
+  **📂 Open folder** after an export.
+- **More keyboard shortcuts + cheat sheet**: `,` / `.` nudge the current
+  line's start (Shift: shift the selected lines), Enter re-taps it, Delete
+  clears its timing, Home jumps to the start, Ctrl+E opens Export; F1, `?`
+  or the new **⌨ Shortcuts** button lists every shortcut.
+- **Calmer timing table**: a status dot per row (amber untimed, grey
+  estimated words, green fine-tuned), a progress bar with counts above the
+  table, and each row's action buttons shown only on the hovered / active
+  rows.
+- **UI size**: **− 100% +** in the top panel (and Ctrl+= / Ctrl+- /
+  Ctrl+0) scales the whole interface, remembered across restarts; the
+  accent purple now marks the main actions (Play, Tap, Export) and
+  selections app-wide.
+- **Export folder remembered** across restarts (if it still exists), and
+  **Choose folder…** opens in it.
+
+#### Timing
+
+- **Playback speed (0.5× / 0.75× / 1×)**: slow the song down for tapping
+  fast lines or fine-tuning words. Taps record real song time, and tap
+  latency compensation scales with the speed. Pitch drops with the speed
+  (playback only - exports are unaffected).
+- **Loop a line / A-B loop**: "🔁 Loop this line" in the fine-tune panel
+  (also **Loop line** next to Speed, or the **L** key) repeats a line with a
+  second of lead-in while you click its words, following its timing as it
+  changes. **A**/**B** set a free loop anywhere in the song. The loop
+  region is shaded on the timeline.
+- **One-tap line hand-off (Shift+Space)**: for lines sung straight into
+  each other, Shift+Space (or the new "End this line + start the next"
+  button) sets the current line's end and the next line's start at the
+  same instant, instead of two taps a split second apart.
+- **Tap latency compensation**: a "Tap latency (ms)" setting under the
+  tap button, subtracted from every live tap (tap-along, re-tap, backing
+  lines, fine-tune word/line-end taps) to cancel out reaction time and
+  audio output delay. Saved per computer, not per project.
+- **Shift selected lines**: "Shift selection ◀ Earlier / Later ▶" above
+  the timing table moves the selected lines' start, end and word timing
+  together by a set amount - e.g. to fix a song tapped consistently late.
+  All-or-nothing: refused if it would overlap an unselected line or go
+  before 0:00.
+- **Copy chorus timing**: tick a timed chorus, **📋 Copy timing to…**,
+  and its line and word timing is copied onto the repeat (found
+  automatically) - starting where that repeat's first line is already
+  tapped, or tapped live with **⏱ It starts now**. Lines with different
+  words get their start/end only.
+- **Syllable timing**: mark syllables with `|` (`beau|ti|ful`) to time
+  each one separately - its own fine-tune button, timeline bubble and
+  wipe timing - while it still displays as one word. Carried through
+  LRC2, UltraStar and `.ass` export; auto-align splits each word's time
+  across its syllables.
+- **Timing table follows the current line**: while the song plays, the
+  "Review / fine-tune" table scrolls itself to keep the line being timed
+  (the next tap-along line, or the line the fine-tune panel is following)
+  in view, instead of tapping running off the bottom of the visible rows.
+  A new **Follow current line** checkbox (on by default) turns it off.
+
+#### Preview and checks
+
+- **Exact `.cdg` preview**: a **Video / .cdg (exact)** switch above the
+  live preview. The `.cdg` mode decodes the real bytes the exporter would
+  write and plays them back in sync - 300x216, 16 colors, real text
+  sizing and clipping - re-rendered in the background a moment after any
+  change to timing, colors or text.
+- **Pre-export checklist**: the export dialog lists warnings and notes
+  for what you're about to export - lines too long for a `.cdg` row (with
+  a one-click **Split line** that keeps timing and updates the lyrics
+  box), characters the `.cdg` font can't draw, lines starting after the
+  song ends, lines sung for under 0.3s (likely double-taps), words
+  highlighted for under 60ms, and lines still on estimated word timing.
+  Each has a **Show** button that jumps to the line. Never blocks export.
+- **Color readability checks**: the Colors section warns (⚠ count on its
+  header, details inside, and notes in the export checklist) when a
+  voice's upcoming/sung colors are too close to see the wipe - including
+  colors that round to the same shade in the `.cdg`'s 16-level palette -
+  when text is too faint on the background, or when two voices sing in
+  nearly the same color. Only voices the song uses are checked.
+
+#### Exports
+
+- **MP3+G `.zip` export**: an option under `.cdg` in the export dialog
+  packages `Song.cdg` + `Song.mp3` into `Song.zip`, the format karaoke
+  hosts and KJ software import. The `.mp3` can be the original song
+  (converted to MP3 if needed) or the instrumental (vocals removed).
+- **Subtitle export (.ass / .srt)**: karaoke `.ass` subtitles with a
+  word-by-word color wipe (`\kf` tags) in your voice colors, a
+  separate style for backing lines and the title card; and plain `.srt`
+  (one cue per line) for YouTube captions and any player.
+- **Video options**: 720p, a vertical **9:16** shape for Shorts/TikTok/
+  Reels (the live preview follows), a **lyric size** slider (60-160%),
+  **text outline** and **drop shadow** for legibility over busy
+  backgrounds, and an **audio fade-out** at the end. Saved with the
+  project; the defaults reproduce the existing video exactly.
+- **Outro card**: an optional closing card after the last line until
+  the song ends - your own text plus the title and artist - in the video,
+  live preview, `.cdg` and subtitles. Saved with the project.
+- **Batch export**: export several saved projects at once from the export
+  dialog, with the same format choices, each song using its own saved
+  colors, video settings, font, background and audio. Name clashes get
+  " (2)"; songs that aren't fully timed or are missing audio are skipped
+  with the reason.
+
+### Changed
+
+- **Simpler play controls**: one ▶ Play / ⏸ Pause button (replacing
+  Play from start / Pause / Resume / Stop) plus ⏮ back to the start, on
+  the same row as the seek bar; click the time readout to type a time to
+  jump to; Speed and Loop share one row.
+- **More readable, color-blind-friendlier default colors** (new projects
+  and the presets; saved projects keep their own colors): Duet now sings
+  in sky blue instead of orange (orange vs Male's yellow is hard to tell
+  apart with red-green color blindness), and Screaming's upcoming text is
+  a pale pink/blue instead of a dark red that was hard to read on the
+  background (Classic, High Contrast, Sunset, Ocean).
+- **Abyssal preset is easier to read**: every upcoming color is brightened
+  (same hue) to about 3:1 contrast on its black background - blood red,
+  violet, teal, brick and olive all still dark and moody, but readable on
+  a TV across a room - with the next-line preview and Female's sung
+  magenta nudged up to match.
+
+### Fixed
+
+- **`.cdg` lines appeared ~0.65s late** (and their first word lit ~0.85s
+  late): at each line's start the exporter cleared three full rows (192
+  packets = 0.64s of stream time) before drawing. Lines are now written
+  over the old ones changing only the tiles that differ, redundant tile
+  writes are skipped entirely, and the drawing starts early enough to be
+  finished exactly at the line's start; the dim next-line preview is drawn
+  just after the first word lights. Every `.cdg` export (and the exact
+  `.cdg` preview) benefits - re-export older songs to get the fix.
+- **Curly quotes, dashes and accented letters were blank in `.cdg`
+  exports**: lyrics pasted from lyrics sites (`don’t`, `“...”`, `—`) and
+  accented letters (é, ñ, ü, ç, ...) now draw. Latin-1 letters use real
+  accented glyphs, punctuation draws as its plain equivalent, and other
+  accented Latin letters as their base letter. The lyric text itself is
+  never changed. The video export uses the same stand-ins when the chosen
+  lyric font lacks one of these glyphs.
+- **Wide letters were clipped in `.cdg` exports**: M, W, m, w, B, D, 0, 4
+  and other 7-pixel-wide glyphs lost their rightmost column; they're now
+  narrowed to fit the 6-pixel CDG tile instead of being cut off.
+- **Tap-along could drop a tap after seeking back**: a start tap landing
+  before the previous line's tapped end (or an end tap after the next
+  line's start, when re-tapping between timed lines) was rejected, losing
+  the moment. The tap is now kept and the neighboring boundary adjusted
+  to meet it. Typing or dragging a time still rejects overlaps as before.
+- The timing table's **-0.1s / +0.1s** nudge buttons could push a line's
+  start past the previous line's end (or its own end); nudges are now
+  checked the same way as typing a time.
+- **UltraStar import kept only whole-word timing**: each syllable note now
+  keeps its own time (as `|`-marked syllables), and `~` hold notes extend
+  the previous syllable instead of appearing as a literal "~".
+- **LRC2 import dropped word timing for lines with tags inside a word**
+  (`<..>beau<..>ti<..>ful`): those tags now become syllables.
+- The (unused) CD+G "tile block XOR" instruction constant in `cdg.rs` had
+  the wrong value (20; the spec's is 38). Nothing used it, so no exported
+  file was affected.
+
+### Upgrading from 0.2.4
+
+- **Re-export your `.cdg` files** to get the on-time line timing fix -
+  older exports show each line ~0.65s late.
+- Projects open unchanged: every new setting (video shape/size/effects,
+  outro card) defaults to the old behavior, and saved colors are kept -
+  only new projects and freshly picked presets get the new default colors.
+- `|` inside a word now marks a syllable break (`beau|ti|ful`). Lyrics
+  that use `|` for anything else will display without it.
+
 ## [0.2.4] - 2026-11-02
 
 ### Added

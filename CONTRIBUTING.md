@@ -7,8 +7,8 @@ anything heavyweight.
 
 ## Getting set up
 
-See the README's [Building](README.md#building) section for toolchain/OS package
-requirements. Short version:
+See [docs/BUILDING.md](docs/BUILDING.md) for toolchain/OS package requirements.
+Short version:
 
 ```bash
 cargo build --release
@@ -23,24 +23,28 @@ an old Rust toolchain, not a bug in this project.
 ## Before opening a PR
 
 - `cargo test` passes.
-- `cargo clippy --all-targets` doesn't introduce *new* warnings (some pre-existing ones,
-  like `too_many_arguments` on the video-frame drawing helpers, are known and accepted -
-  no need to go fix unrelated ones as part of your change).
-- If you touched `cdg.rs`, `lyrics.rs`, `font.rs`, `export.rs`, `formats.rs`,
-  `video.rs`, `timeline.rs`, `project.rs`, `recent.rs`, `waveform.rs`, or
+- `cargo fmt --all -- --check` and `cargo clippy --all-targets` are clean (CI runs
+  both - the codebase currently has no clippy warnings, so please keep it that way).
+- If you touched `cdg.rs`, `cdg_decode.rs`, `lyrics.rs`, `font.rs`, `export.rs`,
+  `formats.rs`, `checks.rs`, `video.rs`, `timeline.rs`, `project.rs`, `prefs.rs`,
+  `recent.rs`, `zipfile.rs`, `waveform.rs`, or
   `stft.rs`/`mdx.rs`/`ctc.rs`/`align.rs`/`vocals.rs`/`model_assets.rs`/`onnxrt.rs`/
   `ffmpeg_path.rs`, add or update a unit test alongside the change - these modules
-  are pure logic with no GUI dependency, so there's no excuse not to. `main.rs` (GUI
-  wiring, including the timeline widget's
-  painting/interaction code and the undo/redo frame-diffing) has no automated tests;
-  changes there are verified by running the app. `ffmpeg`'s subprocess invocation, and
-  `mdx.rs`'s/`align.rs`'s actual ONNX inference against the real (not committed) model
-  files, aren't exercised in the default test suite either - each has an `#[ignore]`d
-  integration test against the real thing for exactly this: `real_model_smoke_test` in
-  `vocals.rs`/`align.rs`, `command_produces_a_working_ffmpeg` in `ffmpeg_path.rs`.
+  are pure logic with no GUI dependency, so there's no excuse not to. In `main.rs`,
+  the widget/painting code (the timeline, the timing table, dialogs) and the
+  undo/redo frame-diffing are verified by running the app, but its pure helpers are
+  tested like any other module (`workflow_status`, `classify_status`,
+  `color_warnings`, `line_statuses`, `run_batch_export`, ...) - when you add logic
+  there, prefer a small pure function you can test over burying it in UI code.
+  `ffmpeg`'s subprocess invocation, and `mdx.rs`'s/`align.rs`'s actual ONNX inference
+  against the real (not committed) model files, aren't exercised in the default test
+  suite - each has an `#[ignore]`d integration test against the real thing for exactly
+  this: `real_model_smoke_test` in `vocals.rs`/`align.rs`,
+  `command_produces_a_working_ffmpeg` in `ffmpeg_path.rs`.
 - If your change affects `export.rs` (`.cdg`), `video.rs` (`.mp4`), `formats.rs`'s
-  LRC/UltraStar export, the live preview, or the fine-tuning timeline in `main.rs`,
-  make sure they still agree - see
+  LRC/UltraStar/`.ass`/`.srt` export, the live preview (both its Video mode and its
+  exact `.cdg` mode, which decodes `export.rs`'s real output via `cdg_decode.rs`), or
+  the fine-tuning timeline in `main.rs`, make sure they still agree - see
   [ARCHITECTURE.md](ARCHITECTURE.md#data-flow) for why that matters and which shared
   functions in `lyrics.rs` are supposed to be the single source of truth for timing
   decisions. The timeline in particular is also a *writer*, not just a display - a

@@ -238,6 +238,18 @@ fn parse_lrc2_inline_tags(content: &str) -> (String, Vec<f64>) {
         let tag = &rest[..gt];
         rest = &rest[gt + 1..];
         if let Some(t) = parse_lrc_time_tag(tag) {
+            // A tag between two letters (`<..>beau<..>ti<..>ful`) is a
+            // syllable break inside one word - mark it so that word gets one
+            // timing unit per syllable instead of the extra tags making the
+            // whole line's word timing unusable.
+            let mid_word = plain.chars().last().is_some_and(|c| !c.is_whitespace())
+                && rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_whitespace() && c != '<');
+            if mid_word {
+                plain.push(crate::lyrics::SYLLABLE_MARK);
+            }
             word_times.push(t);
         }
     }
@@ -349,15 +361,355 @@ pub fn export_lrc(
         if enhanced {
             for w in crate::lyrics::word_timings(line) {
                 let (wm, ws) = split_mmss(w.highlight_at);
-                out.push_str(&format!("<{wm:02}:{ws:05.2}>{} ", w.text));
+                // A syllable (`beau|ti|ful`) gets its own tag mid-word, with
+                // no space until its word ends - LRC2's own syllable form.
+                let sep = if w.ends_word { " " } else { "" };
+                out.push_str(&format!("<{wm:02}:{ws:05.2}>{}{sep}", w.text));
             }
             out.push('\n');
         } else {
-            out.push_str(&line.text);
+            out.push_str(&crate::lyrics::normalize_text(&line.text));
             out.push('\n');
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------
+// Subtitles: SRT / ASS
+// ---------------------------------------------------------------------
+
+/// How long before a line starts its `.ass` dialogue appears (unsung), so
+/// the singer can read ahead - the same idea as the video's dim upcoming
+/// lines. Shortened for a line right after another so they don't stack up.
+const ASS_LEAD_IN_SECS: f64 = 1.0;
+/// How long a sung line stays up after it finishes, in both formats.
+const SUBTITLE_TAIL_SECS: f64 = 0.5;
+/// A subtitle cue is never shorter than this, so a very short (mis-tapped)
+/// line still flashes up readably.
+const MIN_CUE_SECS: f64 = 0.5;
+
+/// `HH:MM:SS,mmm` (SRT).
+fn srt_time(secs: f64) -> String {
+    let ms = (secs.max(0.0) * 1000.0).round() as u64;
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
+/// `H:MM:SS.cc` (ASS - centiseconds).
+fn ass_time(secs: f64) -> String {
+    let cs = (secs.max(0.0) * 100.0).round() as u64;
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        cs / 360_000,
+        cs / 6000 % 60,
+        cs / 100 % 60,
+        cs % 100
+    )
+}
+
+/// The title/artist card text, if there's anything to show.
+fn title_card_text(title: Option<&str>, artist: Option<&str>) -> Option<(String, Option<String>)> {
+    match (title, artist) {
+        (None, None) => None,
+        (t, a) => Some((
+            t.unwrap_or_default().to_string(),
+            a.map(|a| format!("by {a}")),
+        )),
+    }
+}
+
+/// Exports SubRip (`.srt`) subtitles: one cue per lyric line (`timed`
+/// should be the main and backing tracks merged and sorted by start, the
+/// same input as [`export_lrc`]), shown from the line's start until just
+/// after it's sung, plus a title/artist cue up to `card_end`. Plain text -
+/// SRT has no word timing, so for a karaoke-style word wipe use
+/// [`export_ass`] instead.
+pub fn export_srt(
+    timed: &[TimedLine],
+    title: Option<&str>,
+    artist: Option<&str>,
+    card_end: f64,
+) -> String {
+    let mut cues: Vec<(f64, f64, String)> = Vec::new();
+    if let Some((t, a)) = title_card_text(title, artist) {
+        let text = [Some(t), a]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first_start = timed.first().map(|l| l.start).unwrap_or(card_end);
+        let end = card_end.min(first_start);
+        if end > 0.0 && !text.is_empty() {
+            cues.push((0.0, end, text));
+        }
+    }
+    for line in timed {
+        let end = (line.sing_end + SUBTITLE_TAIL_SECS).max(line.start + MIN_CUE_SECS);
+        cues.push((line.start, end, crate::lyrics::normalize_text(&line.text)));
+    }
+    let mut out = String::new();
+    for (n, (start, end, text)) in cues.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            n + 1,
+            srt_time(*start),
+            srt_time(*end),
+            text
+        ));
+    }
+    out
+}
+
+/// `&HAABBGGRR` (ASS color: alpha then BGR, alpha 00 = opaque).
+fn ass_color(c: crate::video::Rgb8) -> String {
+    format!("&H00{:02X}{:02X}{:02X}", c.b, c.g, c.r)
+}
+
+/// Makes lyric text safe inside an ASS dialogue line: `{`/`}` would start
+/// an override block and `\` an escape, so they're swapped for look-alikes.
+fn ass_escape(text: &str) -> String {
+    text.replace('\\', "/").replace('{', "(").replace('}', ")")
+}
+
+/// The ASS style name used for a voice - one per base [`Singer`] (custom
+/// singer names share their base voice's color, same as everywhere else).
+fn ass_style_name(singer: Singer, backing: bool) -> String {
+    if backing && singer == Singer::Backing {
+        "Backing lane".to_string()
+    } else if backing {
+        format!("{} backing lane", singer.label())
+    } else {
+        singer.label().to_string()
+    }
+}
+
+/// One `Dialogue:` line with `\kf` karaoke tags: shown from `show_from`
+/// (unsung), then each word fills left to right over its own highlight
+/// window, with a plain `\k` pause wherever a word's highlight ends before
+/// the next one starts (a manually set word end), held until `show_until`.
+fn ass_dialogue(line: &TimedLine, style: &str, show_from: f64, show_until: f64) -> String {
+    let cs = |t: f64| ((t - show_from) * 100.0).round().max(0.0) as i64;
+    let mut text = String::new();
+    let words = crate::lyrics::word_timings(line);
+    let mut cursor = 0i64;
+    for (i, w) in words.iter().enumerate() {
+        let start = cs(w.highlight_at).max(cursor);
+        if start > cursor {
+            text.push_str(&format!("{{\\k{}}}", start - cursor));
+        }
+        let held = cs(w.held_until).max(start);
+        let sep = if w.ends_word && i + 1 < words.len() {
+            " "
+        } else {
+            ""
+        };
+        text.push_str(&format!(
+            "{{\\kf{}}}{}{sep}",
+            held - start,
+            ass_escape(w.text)
+        ));
+        cursor = held;
+    }
+    format!(
+        "Dialogue: 0,{},{},{style},,0,0,0,karaoke,{text}\n",
+        ass_time(show_from),
+        ass_time(show_until)
+    )
+}
+
+/// Exports Advanced SubStation Alpha (`.ass`) subtitles with karaoke
+/// timing - players and editors that support ASS (VLC, mpv, Aegisub,
+/// most video editors, YouTube via conversion) sweep each word from its
+/// unsung to its sung color as it's sung, using `\kf` tags from the same
+/// word timing the `.cdg`/video wipe uses. One style per voice in use, in
+/// the video palette's colors; backing lines get their own smaller styles
+/// so they read as secondary. `font_name` is the lyric font family (a
+/// player without it falls back to its default).
+pub fn export_ass(
+    main: &[TimedLine],
+    backing: &[TimedLine],
+    palette: &crate::video::VideoPalette,
+    font_name: &str,
+    title: Option<&str>,
+    artist: Option<&str>,
+    card_end: f64,
+) -> String {
+    let font = font_name.replace(',', " ");
+    let mut out = String::new();
+    out.push_str("[Script Info]\n");
+    out.push_str("; Generated by Abyssal CDG Creator\n");
+    if let Some(t) = title {
+        out.push_str(&format!("Title: {}\n", t.replace(['\n', '\r'], " ")));
+    }
+    out.push_str(
+        "ScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n\
+         ScaledBorderAndShadow: yes\n\n",
+    );
+
+    out.push_str("[V4+ Styles]\n");
+    out.push_str(
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+         BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+         BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n",
+    );
+    // PrimaryColour = sung (what \k fills to), SecondaryColour = unsung.
+    let style = |name: &str,
+                 size: u32,
+                 sung: crate::video::Rgb8,
+                 unsung: crate::video::Rgb8,
+                 align: u8,
+                 margin_v: u32| {
+        format!(
+            "Style: {name},{font},{size},{},{},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,{align},60,60,{margin_v},1\n",
+            ass_color(sung),
+            ass_color(unsung)
+        )
+    };
+    let mut styles_used: Vec<(Singer, bool)> = main
+        .iter()
+        .map(|l| (l.singer, false))
+        .chain(backing.iter().map(|l| (l.singer, true)))
+        .collect();
+    styles_used.sort_by_key(|(s, b)| (*b, Singer::ALL.iter().position(|x| x == s)));
+    styles_used.dedup();
+    for &(singer, is_backing) in &styles_used {
+        let (unsung, sung) = palette.singer_colors(singer);
+        let name = ass_style_name(singer, is_backing);
+        out.push_str(&if is_backing {
+            style(&name, 54, sung, unsung, 2, 40)
+        } else {
+            style(&name, 72, sung, unsung, 2, 140)
+        });
+    }
+    out.push_str(&style("Title", 96, palette.title, palette.title, 5, 0));
+    out.push_str(&style("Artist", 60, palette.artist, palette.artist, 5, 0));
+
+    out.push_str("\n[Events]\n");
+    out.push_str(
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+    );
+    if let Some((t, a)) = title_card_text(title, artist) {
+        let first_start = main.first().map(|l| l.start).unwrap_or(card_end);
+        let end = card_end.min(first_start);
+        if end > 0.0 {
+            if !t.is_empty() {
+                out.push_str(&format!(
+                    "Dialogue: 0,{},{},Title,,0,0,0,,{{\\pos(960,480)}}{}\n",
+                    ass_time(0.0),
+                    ass_time(end),
+                    ass_escape(&t)
+                ));
+            }
+            if let Some(a) = a {
+                out.push_str(&format!(
+                    "Dialogue: 0,{},{},Artist,,0,0,0,,{{\\pos(960,600)}}{}\n",
+                    ass_time(0.0),
+                    ass_time(end),
+                    ass_escape(&a)
+                ));
+            }
+        }
+    }
+    for (track, is_backing) in [(main, false), (backing, true)] {
+        let mut prev_end = card_end.min(track.first().map(|l| l.start).unwrap_or(0.0));
+        for line in track {
+            // Lead in, but not back past where the previous line on this
+            // track finished (no stacking two lines of the same track).
+            let floor = if is_backing { 0.0 } else { prev_end };
+            let show_from = (line.start - ASS_LEAD_IN_SECS)
+                .max(floor)
+                .max(0.0)
+                .min(line.start);
+            let show_until = (line.sing_end + SUBTITLE_TAIL_SECS).max(line.start + MIN_CUE_SECS);
+            out.push_str(&ass_dialogue(
+                line,
+                &ass_style_name(line.singer, is_backing),
+                show_from,
+                show_until,
+            ));
+            prev_end = line.sing_end;
+        }
+    }
+    out
+}
+
+/// The outro card's text, top to bottom: its own lines, then (if it
+/// includes them) the title and "by artist".
+fn outro_text_lines(
+    outro: &crate::export::Outro,
+    title: Option<&str>,
+    artist: Option<&str>,
+) -> Vec<(String, bool)> {
+    // (text, is_title_or_artist)
+    let mut out: Vec<(String, bool)> = outro.lines.iter().map(|l| (l.clone(), false)).collect();
+    if outro.show_title {
+        if let Some(t) = title {
+            out.push((t.to_string(), true));
+        }
+        if let Some(a) = artist {
+            out.push((format!("by {a}"), true));
+        }
+    }
+    out
+}
+
+/// Appends the outro card to an [`export_srt`] result as one more cue
+/// (numbered after the existing ones), over the card's own window.
+pub fn append_srt_outro(
+    srt: &mut String,
+    outro: &crate::export::Outro,
+    title: Option<&str>,
+    artist: Option<&str>,
+) {
+    let text: Vec<String> = outro_text_lines(outro, title, artist)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    if text.is_empty() {
+        return;
+    }
+    let n = srt.matches(" --> ").count() + 1;
+    srt.push_str(&format!(
+        "{n}\n{} --> {}\n{}\n\n",
+        srt_time(outro.start),
+        srt_time(outro.end),
+        text.join("\n")
+    ));
+}
+
+/// Appends the outro card to an [`export_ass`] result (whose `[Events]`
+/// section is last) as centered dialogue lines in the Title/Artist
+/// styles, stacked like the title card, fading in.
+pub fn append_ass_outro(
+    ass: &mut String,
+    outro: &crate::export::Outro,
+    title: Option<&str>,
+    artist: Option<&str>,
+) {
+    let lines = outro_text_lines(outro, title, artist);
+    let step = 110.0;
+    let top = 540.0 - step * (lines.len().saturating_sub(1)) as f64 / 2.0;
+    for (k, (text, is_meta)) in lines.iter().enumerate() {
+        let style = if *is_meta && text.starts_with("by ") {
+            "Artist"
+        } else {
+            "Title"
+        };
+        ass.push_str(&format!(
+            "Dialogue: 0,{},{},{style},,0,0,0,,{{\\pos(960,{:.0})\\fad(600,0)}}{}\n",
+            ass_time(outro.start),
+            ass_time(outro.end),
+            top + step * k as f64,
+            ass_escape(text)
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -515,13 +867,27 @@ pub fn import_ultrastar(text: &str) -> Result<Vec<LyricLine>, String> {
                 });
             }
             Some(p) => {
-                if p.at_word_start {
-                    p.word_times.push(start_secs);
-                }
                 p.end = match (p.end, note_end) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
+                // A bare `~` note just holds the previous syllable's vowel
+                // on a new pitch - extend it rather than adding a unit.
+                if syllable.trim() == "~" {
+                    if syllable.ends_with(' ') && !p.text.ends_with(' ') {
+                        // ...and if it ends the word, keep the word break.
+                        p.text.push(' ');
+                        p.at_word_start = true;
+                    }
+                    continue;
+                }
+                let new_word = p.at_word_start || syllable.starts_with(' ');
+                if !new_word {
+                    // Another syllable of the same word: its own timing
+                    // unit (`beau|ti|ful`), not merged into one word.
+                    p.text.push(crate::lyrics::SYLLABLE_MARK);
+                }
+                p.word_times.push(start_secs);
                 p.text.push_str(&syllable);
                 p.at_word_start = syllable.ends_with(' ') || p.text.ends_with(' ');
             }
@@ -634,7 +1000,11 @@ pub fn export_ultrastar(
             // A trailing space on every syllable but a line's last is how
             // UltraStar marks "a word boundary follows" when syllables are
             // concatenated - see `import_ultrastar`'s own `at_word_start`.
-            let suffix = if w == last_word { "" } else { " " };
+            let suffix = if word.ends_word && w != last_word {
+                " "
+            } else {
+                ""
+            };
             out.push_str(&format!(
                 ": {start_beat} {length_beats} 0 {}{suffix}\n",
                 word.text
@@ -761,6 +1131,157 @@ pub fn import_plain_text(text: &str) -> Vec<LyricLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_palette() -> crate::video::VideoPalette {
+        let c = crate::video::Rgb8::new(200, 200, 200);
+        crate::video::VideoPalette {
+            background: c,
+            default_unsung: c,
+            default_highlight: c,
+            male_unsung: c,
+            male_highlight: c,
+            female_unsung: c,
+            female_highlight: c,
+            duet_unsung: c,
+            duet_highlight: c,
+            preview: c,
+            title: c,
+            artist: c,
+            screaming_unsung: c,
+            screaming_highlight: c,
+            backing_unsung: c,
+            backing_highlight: c,
+        }
+    }
+
+    fn subtitle_line(text: &str, start: f64, sing_end: f64, singer: Singer) -> TimedLine {
+        let mut l = TimedLine::new(text.to_string(), start, sing_end + 2.0, singer);
+        l.sing_end = sing_end;
+        l
+    }
+
+    #[test]
+    fn srt_has_numbered_cues_with_millisecond_times() {
+        let lines = vec![
+            subtitle_line("Hello  world", 5.25, 7.0, Singer::Default),
+            subtitle_line("Again", 3725.5, 3727.0, Singer::Default),
+        ];
+        let srt = export_srt(&lines, Some("Song"), Some("Band"), 4.0);
+        assert!(
+            srt.starts_with("1\n00:00:00,000 --> 00:00:04,000\nSong\nby Band\n\n"),
+            "{srt}"
+        );
+        assert!(
+            srt.contains("2\n00:00:05,250 --> 00:00:07,500\nHello world\n\n"),
+            "{srt}"
+        );
+        assert!(
+            srt.contains("3\n01:02:05,500 --> 01:02:07,500\nAgain\n\n"),
+            "{srt}"
+        );
+    }
+
+    #[test]
+    fn srt_without_title_starts_with_the_first_line() {
+        let srt = export_srt(
+            &[subtitle_line("Hi", 1.0, 2.0, Singer::Default)],
+            None,
+            None,
+            4.0,
+        );
+        assert!(
+            srt.starts_with("1\n00:00:01,000 --> 00:00:02,500\nHi\n"),
+            "{srt}"
+        );
+    }
+
+    #[test]
+    fn ass_karaoke_tags_follow_word_timing() {
+        let mut line = subtitle_line("one two three", 10.0, 13.0, Singer::Female);
+        line.word_overrides = vec![Some(10.0), Some(11.0), Some(12.0)];
+        // "two" stops filling at 11.5 - a pause before "three".
+        line.word_end_overrides = vec![None, Some(11.5), None];
+        let ass = export_ass(&[line], &[], &test_palette(), "Arial", None, None, 0.0);
+        // Shown from 9.0 (1s lead-in): a 100cs unsung wait, then the words.
+        assert!(
+            ass.contains(
+                "Dialogue: 0,0:00:09.00,0:00:13.50,Female,,0,0,0,karaoke,\
+                 {\\k100}{\\kf100}one {\\kf50}two {\\k50}{\\kf100}three\n"
+            ),
+            "{ass}"
+        );
+        assert!(ass.contains("Style: Female,Arial,72,"));
+        assert!(
+            !ass.contains("Style: Male,"),
+            "only voices in use get a style"
+        );
+    }
+
+    #[test]
+    fn ass_lead_in_never_overlaps_the_previous_main_line() {
+        let a = subtitle_line("a", 1.0, 4.6, Singer::Default);
+        let b = subtitle_line("b", 5.0, 6.0, Singer::Default);
+        let ass = export_ass(&[a, b], &[], &test_palette(), "Arial", None, None, 0.0);
+        assert!(ass.contains("Dialogue: 0,0:00:04.60,"), "{ass}");
+    }
+
+    #[test]
+    fn ass_backing_lines_get_their_own_style_and_text_is_escaped() {
+        let main = subtitle_line("lead", 1.0, 3.0, Singer::Male);
+        let back = subtitle_line("{echo} \\o/", 2.0, 4.0, Singer::Backing);
+        let ass = export_ass(
+            &[main],
+            &[back],
+            &test_palette(),
+            "My, Font",
+            Some("T"),
+            Some("A"),
+            0.9,
+        );
+        assert!(ass.contains("Style: Backing lane,My  Font,54,"), "{ass}");
+        assert!(ass.contains(",Backing lane,,0,0,0,karaoke,"));
+        assert!(ass.contains("(echo) {\\kf67}/o/"), "{ass}");
+        assert!(ass.contains("Dialogue: 0,0:00:00.00,0:00:00.90,Title,,0,0,0,,{\\pos(960,480)}T\n"));
+        assert!(ass.contains(",Artist,,0,0,0,,{\\pos(960,600)}by A\n"));
+    }
+
+    #[test]
+    fn outro_is_appended_to_srt_and_ass() {
+        let outro = crate::export::Outro {
+            start: 200.0,
+            end: 210.0,
+            lines: vec!["Thanks!".to_string()],
+            show_title: true,
+        };
+        let mut srt = export_srt(
+            &[subtitle_line("Hi", 1.0, 2.0, Singer::Default)],
+            None,
+            None,
+            0.5,
+        );
+        append_srt_outro(&mut srt, &outro, Some("Song"), Some("Band"));
+        assert!(
+            srt.ends_with("2\n00:03:20,000 --> 00:03:30,000\nThanks!\nSong\nby Band\n\n"),
+            "{srt}"
+        );
+        let mut ass = export_ass(&[], &[], &test_palette(), "Arial", None, None, 0.0);
+        append_ass_outro(&mut ass, &outro, Some("Song"), None);
+        assert!(ass.contains("Dialogue: 0,0:03:20.00,0:03:30.00,Title,,0,0,0,,{\\pos(960,485)\\fad(600,0)}Thanks!\n"), "{ass}");
+        assert!(
+            ass.contains(",Title,,0,0,0,,{\\pos(960,595)\\fad(600,0)}Song\n"),
+            "{ass}"
+        );
+    }
+
+    #[test]
+    fn ass_colors_are_bgr_with_opaque_alpha() {
+        assert_eq!(
+            ass_color(crate::video::Rgb8::new(0x11, 0x22, 0x33)),
+            "&H00332211"
+        );
+        assert_eq!(ass_time(3725.456), "1:02:05.46");
+        assert_eq!(srt_time(3725.4567), "01:02:05,457");
+    }
 
     #[test]
     fn detects_lrc() {
@@ -987,13 +1508,74 @@ mod tests {
                      E";
         let lines = import_ultrastar(text).unwrap();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].text, "Hello world");
-        assert_eq!(lines[1].text, "Second line");
+        // Each UltraStar syllable keeps its own note time as a timing unit
+        // (`Hel|lo`), displayed as one word.
+        assert_eq!(lines[0].text, "Hel|lo world");
+        assert_eq!(lines[1].text, "Sec|ond line");
+        assert_eq!(crate::lyrics::normalize_text(&lines[0].text), "Hello world");
         // beat 0 at 200bpm/gap0 -> 0.0s
         assert_eq!(lines[0].start, Some(0.0));
-        // "Hello" (Hel+lo ) and "world" -> 2 words
-        assert_eq!(lines[0].word_overrides.len(), 2);
-        assert!(lines[0].word_overrides[0].is_some());
+        assert_eq!(
+            lines[0].word_overrides,
+            vec![Some(0.0), Some(0.3), Some(0.6)]
+        );
+    }
+
+    #[test]
+    fn import_ultrastar_tilde_holds_extend_the_previous_syllable() {
+        let text = "#BPM:200\n#GAP:0\n: 0 4 0 Oh\n: 4 4 0 ~\n: 8 4 0 ~ \n: 12 4 0 yeah\nE";
+        let lines = import_ultrastar(text).unwrap();
+        assert_eq!(lines[0].text, "Oh yeah");
+        assert_eq!(lines[0].word_overrides, vec![Some(0.0), Some(0.9)]);
+        // The held notes still count toward the line's real end.
+        assert!((lines[0].sing_end_override.unwrap() - 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lrc2_tags_inside_a_word_become_syllables_and_round_trip() {
+        let lines = import_lrc(
+            "[00:01.00]<00:01.00>beau<00:01.50>ti<00:02.00>ful <00:03.00>day<00:04.00>\n",
+        );
+        assert_eq!(lines[0].text, "beau|ti|ful day");
+        assert_eq!(
+            lines[0].word_overrides,
+            vec![Some(1.0), Some(1.5), Some(2.0), Some(3.0)]
+        );
+        // Exported back as LRC2: syllable tags mid-word, space only after
+        // the word ends.
+        let tl = TimedLine::from_line(&lines[0], 1.0, 5.0);
+        let out = export_lrc(&[tl], true, None, None);
+        assert!(
+            out.contains("<00:01.00>beau<00:01.50>ti<00:02.00>ful <00:03.00>day "),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ultrastar_export_joins_syllables_and_round_trips() {
+        let mut line = LyricLine::new("beau|ti|ful day");
+        line.start = Some(1.0);
+        line.word_overrides = vec![Some(1.0), Some(1.5), Some(2.0), Some(3.0)];
+        let tl = TimedLine::from_line(&line, 1.0, 4.0);
+        let out = export_ultrastar(&[tl], None, None, None);
+        let back = import_ultrastar(&out).unwrap();
+        assert_eq!(back[0].text, "beau|ti|ful day");
+        for (a, b) in back[0].word_overrides.iter().zip(&line.word_overrides) {
+            assert!((a.unwrap() - b.unwrap()).abs() < 0.04, "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn ass_karaoke_tags_split_syllables_without_spaces() {
+        let mut line = LyricLine::new("beau|ti|ful day");
+        line.word_overrides = vec![Some(10.0), Some(10.5), Some(11.0), Some(12.0)];
+        let mut tl = TimedLine::from_line(&line, 10.0, 14.0);
+        tl.sing_end = 13.0;
+        let ass = export_ass(&[tl], &[], &test_palette(), "Arial", None, None, 0.0);
+        assert!(
+            ass.contains("{\\kf50}beau{\\kf50}ti{\\kf100}ful {\\kf100}day\n"),
+            "{ass}"
+        );
     }
 
     #[test]

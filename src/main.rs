@@ -8,6 +8,8 @@
 mod align;
 mod audio;
 mod cdg;
+mod cdg_decode;
+mod checks;
 mod codex;
 mod ctc;
 mod export;
@@ -20,6 +22,7 @@ mod mdx;
 mod model_assets;
 mod onboarding;
 mod onnxrt;
+mod prefs;
 mod project;
 mod recent;
 mod stft;
@@ -27,6 +30,7 @@ mod timeline;
 mod video;
 mod vocals;
 mod waveform;
+mod zipfile;
 
 use audio::AudioPlayer;
 use eframe::egui;
@@ -215,6 +219,104 @@ fn faded_color(color: egui::Color32, alpha: f32) -> egui::Color32 {
     )
 }
 
+/// The export file name a song gets by default: its audio file's name
+/// (extension stripped), else its title, else "karaoke" - sanitized (see
+/// [`sanitize_export_base_name`]).
+fn default_export_base_name(audio_path: Option<&Path>, title: &str) -> String {
+    audio_path
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let t = title.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        })
+        .map(|s| sanitize_export_base_name(&s))
+        .unwrap_or_else(|| "karaoke".to_string())
+}
+
+/// `base`, or `base (2)`, `base (3)`, ... - whichever isn't in `used` yet
+/// (case-insensitively, since Windows/macOS file names are) - and records
+/// it as used. Keeps two songs in one batch export that would share a file
+/// name from overwriting each other.
+fn unique_base_name(base: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let mut candidate = base.to_string();
+    let mut n = 2;
+    while !used.insert(candidate.to_lowercase()) {
+        candidate = format!("{base} ({n})");
+        n += 1;
+    }
+    candidate
+}
+
+/// Batch export: every project in `projects`, one after another, with the
+/// same export choices (`opts`) into `folder` - each song with its own
+/// colors, video settings, font, background and audio from its project
+/// file. A song that can't be exported (unreadable file, untimed lines,
+/// missing audio an output needs) is skipped with the reason, and the rest
+/// carry on. Overall progress (0.0-1.0) goes to `progress`.
+fn run_batch_export(
+    projects: &[PathBuf],
+    opts: &ExportOptions,
+    folder: &Path,
+    progress: &dyn Fn(f32),
+) -> Vec<ExportOutcome> {
+    let mut outcomes = Vec::new();
+    let mut used_names = std::collections::HashSet::new();
+    let n = projects.len().max(1) as f32;
+    for (i, path) in projects.iter().enumerate() {
+        progress(i as f32 / n);
+        let file_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        let skip = |outcomes: &mut Vec<ExportOutcome>, reason: String| {
+            outcomes.push(ExportOutcome {
+                label: file_name.clone().into(),
+                result: Err(format!("skipped - {reason}")),
+            });
+        };
+        let project = match project::ProjectFile::load_from_file(path) {
+            Ok(p) => p,
+            Err(e) => {
+                skip(&mut outcomes, format!("couldn't open it: {e}"));
+                continue;
+            }
+        };
+        let inputs = ExportInputs::from_project(project);
+        if opts.any_timed() {
+            if let Some(reason) = missing_timing(&inputs.lines) {
+                skip(&mut outcomes, reason);
+                continue;
+            }
+        }
+        if opts.needs_audio() && inputs.audio_path.is_none() {
+            skip(
+                &mut outcomes,
+                "its audio file wasn't found (video/instrumental/vocals/zip need it)".to_string(),
+            );
+            continue;
+        }
+        let base = unique_base_name(
+            &default_export_base_name(inputs.audio_path.as_deref(), &inputs.title),
+            &mut used_names,
+        );
+        let song = run_export(&inputs, opts, folder, &base, &|p| {
+            progress((i as f32 + p.clamp(0.0, 1.0)) / n)
+        });
+        for o in song {
+            outcomes.push(ExportOutcome {
+                label: format!("{file_name} - {}", o.label).into(),
+                result: o.result,
+            });
+        }
+    }
+    progress(1.0);
+    outcomes
+}
+
 /// Reduces `base` to a plain filename with no path components, for safe
 /// use as the shared base name every export output path is built from
 /// (`{base}.cdg`, `{base}.mp4`, ...) - security-relevant, not just
@@ -238,6 +340,564 @@ fn sanitize_export_base_name(base: &str) -> String {
         .unwrap_or("karaoke")
         .to_string()
 }
+
+/// The song time a live tap at playback position `pos` should record:
+/// `pos` minus the user's tap latency compensation (see `prefs.rs`), so a
+/// tap that lands a consistent ~150ms after what was actually heard is
+/// recorded where the sound really was. The latency is a wall-clock delay
+/// (reaction time, audio output delay), so at a reduced playback `speed`
+/// it covers proportionally less song time - 150ms at half speed is 75ms
+/// of song. Never negative.
+fn compensate_tap(pos: f64, latency_ms: f64, speed: f32) -> f64 {
+    (pos - latency_ms / 1000.0 * speed as f64).max(0.0)
+}
+
+/// Which renderer the live preview panel shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum PreviewMode {
+    /// The video-style preview (multi-line verse blocks, smooth wipe).
+    #[default]
+    Video,
+    /// The real `.cdg` output, decoded (see `cdg_decode.rs`).
+    Cdg,
+}
+
+/// State behind the preview's ".cdg" mode: the decoded stream for the
+/// project as it was at `key` (a hash of everything the `.cdg` depends
+/// on), its on-screen texture, and any background re-render in flight.
+#[derive(Default)]
+struct CdgPreviewState {
+    current: Option<(u64, cdg_decode::CdgPlayback)>,
+    texture: Option<egui::TextureHandle>,
+    /// Packet position last uploaded to `texture`, to skip re-uploading an
+    /// unchanged frame.
+    shown_pos: Option<usize>,
+    job: Option<(u64, std::sync::mpsc::Receiver<cdg_decode::CdgPlayback>)>,
+    /// Last time the inputs were hashed - throttled, since a timeline drag
+    /// changes them every frame.
+    last_check: Option<std::time::Instant>,
+    wanted_key: u64,
+}
+
+/// How often the `.cdg` preview re-checks whether the project changed.
+const CDG_PREVIEW_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The steps of making a karaoke song, as shown in the step bar across the
+/// top of the window (see [`KaraokeApp::draw_step_bar`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkflowStep {
+    Audio,
+    Lyrics,
+    Tap,
+    FineTune,
+    Export,
+}
+
+impl WorkflowStep {
+    const ALL: [WorkflowStep; 5] = [
+        WorkflowStep::Audio,
+        WorkflowStep::Lyrics,
+        WorkflowStep::Tap,
+        WorkflowStep::FineTune,
+        WorkflowStep::Export,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            WorkflowStep::Audio => "Audio",
+            WorkflowStep::Lyrics => "Lyrics",
+            WorkflowStep::Tap => "Tap",
+            WorkflowStep::FineTune => "Fine-tune",
+            WorkflowStep::Export => "Export",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            WorkflowStep::Audio => "Load the song's audio file.",
+            WorkflowStep::Lyrics => "Paste or load the lyrics, then Parse lyrics.",
+            WorkflowStep::Tap => "Play the song and tap Space at each line's start and end.",
+            WorkflowStep::FineTune => {
+                "Optional: time individual words (click them as they're sung, or Auto-align)."
+            }
+            WorkflowStep::Export => "Export your .cdg, video, lyrics or subtitles.",
+        }
+    }
+}
+
+/// How far along a step is, for the step bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepStatus {
+    Done,
+    /// The step the "Next" action points at.
+    Current,
+    /// Not done, but not required either (fine-tuning words).
+    Optional,
+    Todo,
+}
+
+/// What the step bar needs to know about the project - a plain snapshot so
+/// [`workflow_status`] can be tested without the app.
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkflowSnapshot {
+    has_audio: bool,
+    /// Lyrics typed/pasted into the box (parsed or not).
+    has_lyrics_text: bool,
+    lines: usize,
+    /// Lines with a start time.
+    timed: usize,
+    /// Timed lines whose word timing is still the estimate.
+    estimated: usize,
+    exported: bool,
+}
+
+/// Each step's status, and which step "Next" points at. Audio, Lyrics and
+/// Tap are required, in order; Fine-tune is optional (never blocks
+/// Export - it shows as Optional until every line's words are timed);
+/// Export is next once everything's timed, and Done after an export.
+fn workflow_status(s: &WorkflowSnapshot) -> ([StepStatus; 5], WorkflowStep) {
+    let audio = s.has_audio;
+    let lyrics = s.lines > 0;
+    let tapped = lyrics && s.timed == s.lines;
+    let fine_tuned = tapped && s.estimated == 0;
+    let next = if !audio {
+        WorkflowStep::Audio
+    } else if !lyrics {
+        WorkflowStep::Lyrics
+    } else if !tapped {
+        WorkflowStep::Tap
+    } else {
+        WorkflowStep::Export
+    };
+    let status = |step: WorkflowStep, done: bool| {
+        if done {
+            StepStatus::Done
+        } else if step == next {
+            StepStatus::Current
+        } else if step == WorkflowStep::FineTune {
+            StepStatus::Optional
+        } else {
+            StepStatus::Todo
+        }
+    };
+    (
+        [
+            status(WorkflowStep::Audio, audio),
+            status(WorkflowStep::Lyrics, lyrics),
+            status(WorkflowStep::Tap, tapped),
+            status(WorkflowStep::FineTune, fine_tuned),
+            status(WorkflowStep::Export, s.exported),
+        ],
+        next,
+    )
+}
+
+/// How a status message should look - see [`classify_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusKind {
+    /// Routine progress (each tap, loop on/off...) - status line only.
+    Info,
+    Success,
+    /// Something to do first, or a partial success.
+    Warning,
+    Error,
+}
+
+impl StatusKind {
+    fn icon(self) -> &'static str {
+        match self {
+            StatusKind::Info => "",
+            StatusKind::Success => "✔ ",
+            StatusKind::Warning => "⚠ ",
+            StatusKind::Error => "✖ ",
+        }
+    }
+
+    fn color(self, visuals: &egui::Visuals) -> egui::Color32 {
+        match self {
+            StatusKind::Info => visuals.text_color(),
+            StatusKind::Success => egui::Color32::from_rgb(90, 190, 110),
+            StatusKind::Warning => egui::Color32::from_rgb(230, 160, 40),
+            StatusKind::Error => egui::Color32::from_rgb(235, 85, 85),
+        }
+    }
+
+    /// How long a toast for this kind stays up (none for Info).
+    fn toast_secs(self) -> Option<f32> {
+        match self {
+            StatusKind::Info => None,
+            StatusKind::Success => Some(4.0),
+            StatusKind::Warning => Some(6.0),
+            StatusKind::Error => Some(8.0),
+        }
+    }
+}
+
+/// Classifies a status message by its wording (judged on its first line),
+/// so the ~100 places that set `status` don't each need to say how it
+/// should look. Warnings are checked first: "finished with some errors" is
+/// a partial success, and "... first" messages are requests, not failures.
+fn classify_status(status: &str) -> StatusKind {
+    let first = status.lines().next().unwrap_or("").to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| first.contains(w));
+    if has(&[
+        "some errors",
+        "wasn't found",
+        "skipped",
+        " first",
+        "nothing to",
+        "already",
+        "no line to",
+        "found no",
+    ]) {
+        StatusKind::Warning
+    } else if has(&[
+        "failed",
+        "error",
+        "couldn't",
+        "can't",
+        "cannot",
+        "must ",
+        "isn't a supported",
+        "no longer exists",
+    ]) {
+        StatusKind::Error
+    } else if has(&[
+        "export complete",
+        "saved project",
+        "audio loaded",
+        "loaded project",
+        "recovered",
+        "auto-aligned",
+        "split line",
+        "shifted",
+    ]) {
+        StatusKind::Success
+    } else {
+        StatusKind::Info
+    }
+}
+
+/// A color as the `.cdg` will actually show it: reduced to CDG's 16 levels
+/// per channel (see `cdg_from_color32`), then back to 8-bit.
+fn as_cdg_rgb(c: egui::Color32) -> [f32; 3] {
+    let q = cdg_from_color32(c);
+    [q.r as f32 * 17.0, q.g as f32 * 17.0, q.b as f32 * 17.0]
+}
+
+/// WCAG relative luminance of an 8-bit RGB color.
+fn relative_luminance(rgb: [f32; 3]) -> f32 {
+    let lin = |v: f32| {
+        let c = v / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+}
+
+/// WCAG contrast ratio between two colors (1.0 = identical, 21.0 = black
+/// on white). 3:1 is the usual minimum for large text like lyrics.
+fn contrast_ratio(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// Minimum contrast for lyric/title text against the background.
+const MIN_TEXT_CONTRAST: f32 = 3.0;
+/// The dim next-line preview is meant to be faint, but still legible.
+const MIN_PREVIEW_CONTRAST: f32 = 1.8;
+/// Upcoming vs sung closer than this (RGB distance, as the `.cdg` shows
+/// them) and the wipe is hard to see.
+const MIN_WIPE_DISTANCE: f32 = 60.0;
+
+/// Readability problems with `colors` for the voices in `voices` - judged
+/// on the colors as the `.cdg` will show them (16 levels per channel, so
+/// two picked colors can end up identical), which also covers the video.
+/// Checks each voice's upcoming vs sung colors (is the wipe visible?), all
+/// text against the background (WCAG contrast), and voices whose sung
+/// colors look the same (can singers tell whose line it is?).
+fn color_warnings(colors: &ExportColors, voices: &[Singer]) -> Vec<String> {
+    let bg = as_cdg_rgb(colors.bg);
+    let mut out = Vec::new();
+    let dist = |a: [f32; 3], b: [f32; 3]| {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+    let check_text = |out: &mut Vec<String>, what: &str, c: egui::Color32, min: f32| {
+        let ratio = contrast_ratio(as_cdg_rgb(c), bg);
+        if ratio < min {
+            out.push(format!(
+                "{what} is hard to read on the background (contrast {ratio:.1}:1 - aim for \
+                 {min:.0}:1 or more). Try a lighter color, or a darker background."
+            ));
+        }
+    };
+    for &v in voices {
+        let (unsung, sung) = colors.singer_pair(v);
+        let (u, h) = (as_cdg_rgb(unsung), as_cdg_rgb(sung));
+        if u == h {
+            out.push(format!(
+                "{}: the upcoming and sung colors come out identical in the .cdg (it only has \
+                 16 shades per color channel) - the wipe won't show.",
+                v.label()
+            ));
+        } else if dist(u, h) < MIN_WIPE_DISTANCE {
+            out.push(format!(
+                "{}: the upcoming and sung colors are very close - the wipe will be hard to see.",
+                v.label()
+            ));
+        }
+        check_text(
+            &mut out,
+            &format!("{} upcoming text", v.label()),
+            unsung,
+            MIN_TEXT_CONTRAST,
+        );
+        check_text(
+            &mut out,
+            &format!("{} sung text", v.label()),
+            sung,
+            MIN_TEXT_CONTRAST,
+        );
+    }
+    check_text(&mut out, "The title", colors.title, MIN_TEXT_CONTRAST);
+    check_text(&mut out, "The artist", colors.artist, MIN_TEXT_CONTRAST);
+    check_text(
+        &mut out,
+        "The next-line preview",
+        colors.preview,
+        MIN_PREVIEW_CONTRAST,
+    );
+    // Default is the "not assigned yet" voice and deliberately starts out
+    // looking like Male, so it's left out of the "same color" comparison.
+    let named: Vec<Singer> = voices
+        .iter()
+        .copied()
+        .filter(|v| *v != Singer::Default)
+        .collect();
+    for (k, &a) in named.iter().enumerate() {
+        for &b in &named[k + 1..] {
+            if dist(
+                as_cdg_rgb(colors.singer_pair(a).1),
+                as_cdg_rgb(colors.singer_pair(b).1),
+            ) < MIN_WIPE_DISTANCE
+            {
+                out.push(format!(
+                    "{} and {} sing in nearly the same color - singers may not tell whose line \
+                     is whose.",
+                    a.label(),
+                    b.label()
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The "Copy timing" dialog's state (see [`KaraokeApp::draw_copy_timing_dialog`]).
+struct CopyTimingDialog {
+    /// The lines whose timing is copied (sorted).
+    sources: Vec<usize>,
+    /// First line of the repeat being timed.
+    first_target: usize,
+}
+
+/// A timing-table row's status dot (see [`line_status`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineStatus {
+    /// No start time yet.
+    Untimed,
+    /// Timed, but its word timing is still the even estimate.
+    Estimated,
+    /// Timed, and its words are set (by hand, auto-align or an import) -
+    /// or it's a one-word line with nothing more to fine-tune.
+    FineTuned,
+}
+
+impl LineStatus {
+    fn color(self, visuals: &egui::Visuals) -> egui::Color32 {
+        match self {
+            LineStatus::Untimed => egui::Color32::from_rgb(230, 160, 40),
+            LineStatus::Estimated => visuals.weak_text_color(),
+            LineStatus::FineTuned => STEP_DONE,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            LineStatus::Untimed => "Not timed yet - tap it, or type its start.",
+            LineStatus::Estimated => {
+                "Timed - word timing is still estimated (click its words as they're sung, \
+                 or Auto-align)."
+            }
+            LineStatus::FineTuned => "Timed and fine-tuned.",
+        }
+    }
+}
+
+/// Each line's status, in order (see [`LineStatus`]).
+fn line_statuses(lines: &[LyricLine]) -> Vec<LineStatus> {
+    let estimated: std::collections::HashSet<usize> = checks::lines_on_estimated_timing(lines)
+        .into_iter()
+        .collect();
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if l.start.is_none() {
+                LineStatus::Untimed
+            } else if estimated.contains(&i) {
+                LineStatus::Estimated
+            } else {
+                LineStatus::FineTuned
+            }
+        })
+        .collect()
+}
+
+/// Every keyboard shortcut, grouped, for the F1 / ? cheat sheet (see
+/// [`KaraokeApp::draw_shortcuts_window`]). Keep in step with
+/// `handle_keyboard_shortcuts`. "Current line" = the line open in the
+/// fine-tune panel, else the line most recently tapped.
+const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Tapping",
+        &[
+            (
+                "Space",
+                "Tap the next line's start / end (pause/play once all timed)",
+            ),
+            ("Shift+Space", "End this line and start the next in one tap"),
+            ("Enter", "Re-tap the current line's start"),
+            (
+                "M / F / D / S / B",
+                "Voice: Male / Female / Duet / Screaming / Backing",
+            ),
+        ],
+    ),
+    (
+        "Fixing timing",
+        &[
+            (
+                ", / .",
+                "Nudge the current line's start 0.1s earlier / later",
+            ),
+            (
+                "Shift+, / Shift+.",
+                "Shift the selected lines 0.1s earlier / later",
+            ),
+            ("Delete", "Clear the current line's timing"),
+            ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo (Ctrl+Y redoes too)"),
+        ],
+    ),
+    (
+        "Playback",
+        &[
+            ("← / →", "Skip back / forward 2 seconds"),
+            ("Home", "Back to the start"),
+            ("L", "Loop the current line on / off"),
+        ],
+    ),
+    (
+        "Files",
+        &[
+            ("Ctrl+S", "Save project"),
+            ("Ctrl+Shift+S", "Save project as…"),
+            ("Ctrl+E", "Export…"),
+            ("Ctrl+= / Ctrl+-", "Bigger / smaller UI (saved)"),
+            ("Ctrl+0", "UI back to 100%"),
+            ("F1 or ?", "Show / hide this list"),
+        ],
+    ),
+];
+
+/// A time typed into the transport's time readout: `MM:SS(.ss)` (as the
+/// timing table accepts), `H:MM:SS`, or plain seconds. `None` if it's not
+/// a time, or negative.
+fn parse_jump_time(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let parts: Vec<&str> = text.split(':').collect();
+    let secs = match parts.as_slice() {
+        [s] => s.parse::<f64>().ok()?,
+        [m, s] => m.parse::<f64>().ok()? * 60.0 + s.parse::<f64>().ok()?,
+        [h, m, s] => {
+            h.parse::<f64>().ok()? * 3600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + s.parse::<f64>().ok()?
+        }
+        _ => return None,
+    };
+    (secs.is_finite() && secs >= 0.0).then_some(secs)
+}
+
+/// Opens `dir` in the system file manager (Explorer, Finder, or whatever
+/// `xdg-open` picks). Fire-and-forget: the file manager's own exit status
+/// isn't meaningful (Explorer returns 1 on success).
+fn open_in_file_manager(dir: &Path) -> std::io::Result<()> {
+    let program = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+}
+
+/// An explanation shown under a control. With tips on (see the "Tips"
+/// toggle), the full `detail` as small grey text, as always; with tips off,
+/// just the one-line `summary` plus an ⓘ that shows `detail` on hover -
+/// nothing is lost, it's just out of the way. An empty `summary` hides the
+/// text entirely when tips are off (used for pure tips).
+fn help_text(ui: &mut egui::Ui, show_tips: bool, summary: &str, detail: impl Into<String>) {
+    let detail: String = detail.into();
+    if show_tips {
+        ui.label(egui::RichText::new(detail).small().weak());
+    } else if !summary.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(summary).small().weak());
+            ui.label(egui::RichText::new("ⓘ").small().weak())
+                .on_hover_text(detail);
+        });
+    }
+}
+
+/// The app's accent color (the "Abyssal" purple) - primary actions and the
+/// current step.
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(140, 82, 220);
+const STEP_DONE: egui::Color32 = egui::Color32::from_rgb(70, 160, 95);
+
+/// An active playback loop (see [`KaraokeApp::apply_loop`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LoopMode {
+    /// Repeat one lyric line (index into `lines`), with a little lead-in
+    /// and tail - its bounds are re-read every frame, so retiming the
+    /// line's words or dragging its bubble moves the loop along with it.
+    Line(usize),
+    /// A free loop between two hand-set points. `b` is `None` between
+    /// pressing A and pressing B; nothing loops until both are set.
+    Ab { a: f64, b: Option<f64> },
+}
+
+/// Whether playback moving from `prev` (last frame's position) to `pos`
+/// crossed the loop end `to` - only a forward crossing from inside counts,
+/// so seeking past the loop by hand isn't yanked back, and the very first
+/// frame of playback (`prev` = `None`) never wraps.
+fn loop_should_wrap(prev: Option<f64>, pos: f64, to: f64) -> bool {
+    prev.is_some_and(|p| p < to) && pos >= to
+}
+
+/// How much audio a line loop plays before the line starts / after it
+/// ends - enough to hear the lead-in and catch the first/last word.
+const LOOP_PRE_ROLL_SECS: f64 = 1.0;
+const LOOP_POST_ROLL_SECS: f64 = 0.5;
+/// Shortest allowed A-B loop.
+const MIN_AB_LOOP_SECS: f64 = 0.25;
 
 /// Which timestamp clicking a word in the fine-tune panel sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -372,11 +1032,38 @@ struct KaraokeApp {
     /// there's less to horizontally scroll through to reach the Singer/
     /// Countdown/action columns.
     compact_timing_table: bool,
+    /// Whether the timing table scrolls itself to keep the line currently
+    /// being timed (the next tap-along line, or the line the fine-tune
+    /// panel is following once tapping's done) in view while the song
+    /// plays. Session-only, on by default.
+    follow_timing_table: bool,
+    /// The row the timing table last auto-scrolled to, so it only scrolls
+    /// when the followed line *changes* - leaving the user free to scroll
+    /// the table by hand in between without it snapping straight back.
+    timing_table_scrolled_to: Option<usize>,
+    /// One-shot request (e.g. the export checklist's "Show") to scroll the
+    /// timing table to this row next frame, regardless of playback.
+    timing_table_scroll_request: Option<usize>,
+    /// Per-machine preferences (see `prefs.rs`) - currently the tap
+    /// latency compensation applied by [`compensate_tap`].
+    prefs: prefs::Prefs,
+    /// How far the "Shift selection" buttons move the selected lines, in
+    /// seconds. Session-only.
+    shift_amount_secs: f64,
+    /// The active playback loop, if any. Session-only.
+    loop_mode: Option<LoopMode>,
+    /// Playback position as of the previous frame, so [`Self::apply_loop`]
+    /// only jumps back when playback *crosses* the loop's end - seeking
+    /// past it by hand is left alone.
+    loop_last_pos: Option<f64>,
     /// Whether the live preview is shown in its own separate, resizable
     /// window (see [`KaraokeApp::show_preview_window`]) instead of the
     /// right panel. Session-only like `compact_timing_table` - not saved,
     /// so the app never opens with an extra window you didn't just ask for.
     preview_popped_out: bool,
+    /// Video-style or exact-`.cdg` live preview. Session-only.
+    preview_mode: PreviewMode,
+    cdg_preview: CdgPreviewState,
     /// Line index + in-progress text while a start-time field in the
     /// timing table is focused - `None` the rest of the time, so the
     /// displayed text otherwise always mirrors the line's live value.
@@ -440,6 +1127,11 @@ struct KaraokeApp {
     /// is the default and H.264 is kept as a selectable, disclosed-as-
     /// larger fallback.
     video_codec: VideoCodec,
+    /// Video orientation/lyric size/outline/shadow/fade (saved with the
+    /// project, like `video_codec`).
+    video_style: video::VideoStyle,
+    /// The outro card settings (saved with the project).
+    outro: lyrics::OutroSettings,
     /// Whether the video export/preview shows a small credit line under
     /// the title card (see `video.rs`'s `CREDIT_TEXT`) - on by default,
     /// but never forced: this is the user's own toggle, not a watermark
@@ -539,6 +1231,10 @@ struct KaraokeApp {
     export_cdg: bool,
     export_lrc: bool,
     export_ultrastar: bool,
+    /// Karaoke subtitles (`.ass`, with a `\kf` word wipe) / plain
+    /// subtitles (`.srt`). Session-only, like the other export picks.
+    export_ass: bool,
+    export_srt: bool,
     export_video: bool,
     export_instrumental: bool,
     /// Vocals-only stem, from the same separation pass as
@@ -546,6 +1242,44 @@ struct KaraokeApp {
     /// `start_combined_export`) - never a second, independently expensive
     /// model run.
     export_vocals: bool,
+    /// Also package the `.cdg` with an `.mp3` into an MP3+G `.zip` (only
+    /// when `.cdg` export is on). Session-only, like the other export picks.
+    export_cdg_zip: bool,
+    /// The status text as of last frame, its kind, and when it changed -
+    /// see [`KaraokeApp::track_status`].
+    status_seen: String,
+    status_kind: StatusKind,
+    /// Each timing-table row's on-screen vertical span and the table's
+    /// visible area, as of last frame - for working out which row the
+    /// mouse is over (whose action buttons then show).
+    table_row_spans: Vec<egui::Rangef>,
+    table_clip: egui::Rect,
+    /// Frames since the saved UI size and the accent style were applied to
+    /// the egui context (done on the first frame after `new()`, which has
+    /// no context to apply them to). `None` = not applied yet.
+    ui_style_frames: Option<u8>,
+    /// The open "Copy timing" dialog, if any.
+    copy_dialog: Option<CopyTimingDialog>,
+    /// Whether the keyboard-shortcut cheat sheet (F1 / ?) is open.
+    show_shortcuts: bool,
+    /// In-progress text while the time readout is being edited to jump.
+    time_jump_edit: Option<String>,
+    /// While set, a toast for the current status shows until then.
+    toast_until: Option<std::time::Instant>,
+    /// Folder of the last export that wrote something - "Open folder".
+    last_export_folder: Option<PathBuf>,
+    /// Whether an export of the open project has succeeded since it was
+    /// opened - the step bar's "Export" step.
+    exported_this_project: bool,
+    /// The running export (if any) is a batch export of other projects -
+    /// so finishing it doesn't tick off the open project's Export step.
+    batch_running: bool,
+    /// Project files picked for a batch export in the export dialog.
+    /// Session-only.
+    batch_projects: Vec<PathBuf>,
+    /// Whether the zip's `.mp3` is the instrumental (vocals removed) rather
+    /// than the original song.
+    zip_instrumental: bool,
     /// Whether an LRC export writes LRC2 word-level tags (from
     /// [`lyrics::word_timings`]) or plain line-level LRC1 - word-level is
     /// more precise but some older/simpler LRC readers only handle LRC1.
@@ -712,11 +1446,682 @@ const ALL_COLOR_PRESETS: [ColorPreset; 5] = [
     ColorPreset::Ocean,
 ];
 
+/// Every user-pickable color, as one value - so an export can be built
+/// from either the app's live colors or a saved project file's (batch
+/// export) through the same conversions.
+#[derive(Clone, Copy, Debug)]
+struct ExportColors {
+    bg: egui::Color32,
+    default_unsung: egui::Color32,
+    default_highlight: egui::Color32,
+    male_unsung: egui::Color32,
+    male_highlight: egui::Color32,
+    female_unsung: egui::Color32,
+    female_highlight: egui::Color32,
+    duet_unsung: egui::Color32,
+    duet_highlight: egui::Color32,
+    preview: egui::Color32,
+    title: egui::Color32,
+    artist: egui::Color32,
+    screaming_unsung: egui::Color32,
+    screaming_highlight: egui::Color32,
+    backing_unsung: egui::Color32,
+    backing_highlight: egui::Color32,
+}
+
+impl ExportColors {
+    /// A project file's colors, with the same fallbacks loading a project
+    /// has always applied for files saved before a color existed.
+    fn from_project(c: &project::ProjectColors) -> Self {
+        let default_palette = Palette::default();
+        Self {
+            bg: color32_from_rgb_color(c.background),
+            // A project saved before `Default` had its own color falls back
+            // to `Male`'s - exactly how `Default` used to always render, so
+            // an old project's look doesn't change just from being reopened.
+            default_unsung: color32_from_rgb_color(c.default_unsung.unwrap_or(c.male_unsung)),
+            default_highlight: color32_from_rgb_color(
+                c.default_highlight.unwrap_or(c.male_highlight),
+            ),
+            male_unsung: color32_from_rgb_color(c.male_unsung),
+            male_highlight: color32_from_rgb_color(c.male_highlight),
+            female_unsung: color32_from_rgb_color(c.female_unsung),
+            female_highlight: color32_from_rgb_color(c.female_highlight),
+            duet_unsung: color32_from_rgb_color(c.duet_unsung),
+            duet_highlight: color32_from_rgb_color(c.duet_highlight),
+            preview: color32_from_rgb_color(c.preview),
+            title: color32_from_rgb_color(c.title),
+            artist: color32_from_rgb_color(c.artist),
+            screaming_unsung: color32_from_rgb_color(c.screaming_unsung),
+            screaming_highlight: color32_from_rgb_color(c.screaming_highlight),
+            // A project saved before the Backing voice existed gets the
+            // default palette's own backing colors.
+            backing_unsung: c
+                .backing_unsung
+                .map(color32_from_rgb_color)
+                .unwrap_or_else(|| color32_from_cdg(default_palette.backing_unsung)),
+            backing_highlight: c
+                .backing_highlight
+                .map(color32_from_rgb_color)
+                .unwrap_or_else(|| color32_from_cdg(default_palette.backing_highlight)),
+        }
+    }
+
+    /// A voice's (upcoming, sung) colors.
+    fn singer_pair(&self, s: Singer) -> (egui::Color32, egui::Color32) {
+        match s {
+            Singer::Default => (self.default_unsung, self.default_highlight),
+            Singer::Male => (self.male_unsung, self.male_highlight),
+            Singer::Female => (self.female_unsung, self.female_highlight),
+            Singer::Duet => (self.duet_unsung, self.duet_highlight),
+            Singer::Screaming => (self.screaming_unsung, self.screaming_highlight),
+            Singer::Backing => (self.backing_unsung, self.backing_highlight),
+        }
+    }
+
+    fn palette(&self) -> Palette {
+        Palette {
+            background: cdg_from_color32(self.bg),
+            default_unsung: cdg_from_color32(self.default_unsung),
+            default_highlight: cdg_from_color32(self.default_highlight),
+            male_unsung: cdg_from_color32(self.male_unsung),
+            male_highlight: cdg_from_color32(self.male_highlight),
+            female_unsung: cdg_from_color32(self.female_unsung),
+            female_highlight: cdg_from_color32(self.female_highlight),
+            duet_unsung: cdg_from_color32(self.duet_unsung),
+            duet_highlight: cdg_from_color32(self.duet_highlight),
+            preview: cdg_from_color32(self.preview),
+            title: cdg_from_color32(self.title),
+            artist: cdg_from_color32(self.artist),
+            screaming_unsung: cdg_from_color32(self.screaming_unsung),
+            screaming_highlight: cdg_from_color32(self.screaming_highlight),
+            backing_unsung: cdg_from_color32(self.backing_unsung),
+            backing_highlight: cdg_from_color32(self.backing_highlight),
+        }
+    }
+
+    fn video_palette(&self) -> VideoPalette {
+        let c = |c: egui::Color32| video::Rgb8::new(c.r(), c.g(), c.b());
+        VideoPalette {
+            background: c(self.bg),
+            default_unsung: c(self.default_unsung),
+            default_highlight: c(self.default_highlight),
+            male_unsung: c(self.male_unsung),
+            male_highlight: c(self.male_highlight),
+            female_unsung: c(self.female_unsung),
+            female_highlight: c(self.female_highlight),
+            duet_unsung: c(self.duet_unsung),
+            duet_highlight: c(self.duet_highlight),
+            preview: c(self.preview),
+            title: c(self.title),
+            artist: c(self.artist),
+            screaming_unsung: c(self.screaming_unsung),
+            screaming_highlight: c(self.screaming_highlight),
+            backing_unsung: c(self.backing_unsung),
+            backing_highlight: c(self.backing_highlight),
+        }
+    }
+}
+
+/// Which outputs to export and how - the export dialog's checkboxes,
+/// shared by a normal export and every song in a batch export.
+#[derive(Clone, Copy, Debug)]
+struct ExportOptions {
+    cdg: bool,
+    lrc: bool,
+    ultrastar: bool,
+    ass: bool,
+    srt: bool,
+    video: bool,
+    instrumental: bool,
+    vocals: bool,
+    /// MP3+G zip - only applies along with `cdg`.
+    zip: bool,
+    zip_instrumental: bool,
+    lrc_enhanced: bool,
+    remove_vocals_for_video: bool,
+    instrumental_ext: &'static str,
+}
+
+impl ExportOptions {
+    fn any(&self) -> bool {
+        self.any_timed() || self.instrumental || self.vocals
+    }
+
+    /// Any output that uses lyric timing (as opposed to audio stems only).
+    fn any_timed(&self) -> bool {
+        self.cdg || self.video || self.lrc || self.ultrastar || self.ass || self.srt
+    }
+
+    /// Any output that needs the song's audio file.
+    fn needs_audio(&self) -> bool {
+        self.video || self.instrumental || self.vocals || (self.cdg && self.zip)
+    }
+}
+
+/// Everything about one song an export needs - built from the open project
+/// (`KaraokeApp::export_inputs`) or straight from a saved `.abyzl` file
+/// ([`ExportInputs::from_project`], for batch export) without loading it
+/// into the app.
+struct ExportInputs {
+    lines: Vec<LyricLine>,
+    title: String,
+    artist: String,
+    colors: ExportColors,
+    timing_settings: lyrics::TimingSettings,
+    video_resolution: Resolution,
+    video_codec: VideoCodec,
+    video_style: video::VideoStyle,
+    outro: lyrics::OutroSettings,
+    show_credit_line: bool,
+    background: Option<video::Background>,
+    background_fit: video::BackgroundFit,
+    background_dim: f32,
+    font_family: Option<String>,
+    font_bytes: Option<Vec<u8>>,
+    /// The song's audio file, if it exists.
+    audio_path: Option<PathBuf>,
+    audio_duration: Option<f64>,
+}
+
+impl ExportInputs {
+    /// A saved project's export inputs. Does file I/O (probing the audio
+    /// file's length, loading the lyric font), so call it off the UI
+    /// thread. Applies the same legacy migration loading a project does.
+    fn from_project(mut p: project::ProjectFile) -> Self {
+        lyrics::migrate_legacy_backing_vocals(&mut p.lines, &mut p.lyrics_raw);
+        let audio_path = p.audio_path.filter(|a| a.is_file());
+        let audio_duration = audio_path
+            .as_deref()
+            .and_then(|a| audio::probe_duration_secs(a).ok().flatten());
+        let font_bytes = p
+            .lyric_font_family
+            .as_deref()
+            .and_then(|f| fonts::load_family_bytes(f).ok());
+        Self {
+            colors: ExportColors::from_project(&p.colors),
+            lines: p.lines,
+            title: p.title,
+            artist: p.artist,
+            timing_settings: p.timing_settings,
+            video_resolution: p.video_resolution,
+            video_codec: p.video_codec,
+            video_style: p.video_style,
+            outro: p.outro,
+            show_credit_line: p.show_credit_line,
+            background: p.background,
+            background_fit: p.background_fit,
+            background_dim: p.background_dim,
+            font_family: p.lyric_font_family,
+            font_bytes,
+            audio_path,
+            audio_duration,
+        }
+    }
+
+    /// Same as `KaraokeApp::resolved`: the main track, and the song's total
+    /// length (audio length, or the last line's end if that's later).
+    fn resolved(&self) -> (Vec<TimedLine>, f64) {
+        let timed = lyrics::resolve_timing_with_settings(
+            &self.lines,
+            self.audio_duration,
+            &self.timing_settings,
+        );
+        let backing_end = self
+            .resolved_backing()
+            .iter()
+            .map(|b| b.sing_end)
+            .fold(0.0, f64::max);
+        let total = self
+            .audio_duration
+            .unwrap_or(0.0)
+            .max(timed.last().map(|t| t.end).unwrap_or(0.0))
+            .max(backing_end);
+        (timed, total)
+    }
+
+    fn resolved_backing(&self) -> Vec<TimedLine> {
+        lyrics::resolve_backing_track(&self.lines, &self.timing_settings)
+    }
+}
+
+/// Why `lines` can't be exported yet, if every line isn't timed - a line
+/// without a start would be silently left out of every timed output.
+fn missing_timing(lines: &[LyricLine]) -> Option<String> {
+    let total = lines.len();
+    let timed_count = lines.iter().filter(|l| l.start.is_some()).count();
+    if timed_count == 0 {
+        Some("No lines are timed yet - tap along with the song first.".to_string())
+    } else if timed_count < total {
+        Some(format!(
+            "{} of {total} line(s) don't have a timestamp yet - they'd be silently left \
+             out of the output(s) otherwise. Tap along (or set times manually) for every \
+             line before exporting.",
+            total - timed_count
+        ))
+    } else {
+        None
+    }
+}
+
+/// Runs one song's export - every output `opts` selects, written to
+/// `folder` as `base.<ext>` - reporting overall progress (0.0-1.0) through
+/// `progress`. Blocking (vocal separation and video rendering can take
+/// minutes), so run it on a background thread. The caller checks timing
+/// and audio availability first.
+fn run_export(
+    inputs: &ExportInputs,
+    opts: &ExportOptions,
+    folder: &Path,
+    base: &str,
+    progress: &dyn Fn(f32),
+) -> Vec<ExportOutcome> {
+    let do_cdg = opts.cdg;
+    let do_lrc = opts.lrc;
+    let do_ultrastar = opts.ultrastar;
+    let do_ass = opts.ass;
+    let do_srt = opts.srt;
+    let do_video = opts.video;
+    let do_instrumental = opts.instrumental;
+    let do_vocals = opts.vocals;
+    let do_zip = do_cdg && opts.zip;
+    let zip_instrumental = opts.zip_instrumental;
+    let audio_path = inputs.audio_path.clone();
+
+    let (timed, total_duration) = inputs.resolved();
+    let backing = inputs.resolved_backing();
+    // LRC has no notion of a second track, but it doesn't need one:
+    // players just show whatever line's timestamp was reached most
+    // recently, so backing lines are interleaved by start time.
+    let mut lrc_lines: Vec<TimedLine> = timed.iter().chain(backing.iter()).cloned().collect();
+    lrc_lines.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let timing_settings = inputs.timing_settings;
+    let cdg_palette = inputs.colors.palette();
+    let video_palette = inputs.colors.video_palette();
+    let title = (!inputs.title.trim().is_empty()).then(|| inputs.title.trim().to_string());
+    let artist = (!inputs.artist.trim().is_empty()).then(|| inputs.artist.trim().to_string());
+    let resolution = inputs.video_resolution;
+    let video_codec = inputs.video_codec;
+    let video_style = inputs.video_style;
+    let show_credit_line = inputs.show_credit_line;
+    let background = inputs.background.clone();
+    let background_fit = inputs.background_fit;
+    let background_dim = inputs.background_dim;
+    let custom_font_bytes = inputs.font_bytes.clone();
+    let remove_vocals_for_video = opts.remove_vocals_for_video;
+    let instrumental_ext = opts.instrumental_ext;
+    let lrc_enhanced = opts.lrc_enhanced;
+    let outro = export::resolve_outro(
+        &inputs.outro,
+        &timed,
+        &backing,
+        total_duration,
+        title.is_some() || artist.is_some(),
+    );
+
+    let cdg_path = folder.join(format!("{base}.cdg"));
+    let lrc_path = folder.join(format!("{base}.lrc"));
+    let ultrastar_path = folder.join(format!("{base}.txt"));
+    let ass_path = folder.join(format!("{base}.ass"));
+    let srt_path = folder.join(format!("{base}.srt"));
+    let subtitle_font = inputs
+        .font_family
+        .clone()
+        .unwrap_or_else(|| "Arial".to_string());
+    let video_path = folder.join(format!("{base}.mp4"));
+    let instrumental_path = folder.join(format!("{base}-instrumental.{instrumental_ext}"));
+    let vocals_path = folder.join(format!("{base}-vocals.{instrumental_ext}"));
+    let zip_path = folder.join(format!("{base}.zip"));
+    let zip_cdg_name = format!("{base}.cdg");
+    let zip_mp3_name = format!("{base}.mp3");
+
+    let mut outcomes = Vec::new();
+
+    // Equal-weighted phases across whatever was selected - video
+    // reports its own fine-grained sub-progress within its slice
+    // (usually the slowest step by far), the others just jump from
+    // 0% to 100% of their slice on completion.
+    let phase_count = do_cdg as u32
+        + do_lrc as u32
+        + do_ultrastar as u32
+        + do_ass as u32
+        + do_srt as u32
+        + do_video as u32
+        + do_instrumental as u32
+        + do_vocals as u32
+        + do_zip as u32;
+    let phase_count = phase_count.max(1);
+    let mut phase_index = 0u32;
+    let set_progress = |idx: u32, frac_within: f32| {
+        let overall = (idx as f32 + frac_within.clamp(0.0, 1.0)) / phase_count as f32;
+        progress(overall);
+    };
+
+    // Auto-pair the loaded audio next to whichever of .cdg/.lrc/
+    // UltraStar's .txt actually gets written (same base filename,
+    // in the same folder) so it's ready for pickup by a karaoke
+    // player/game without a manual copy or rename - all of these
+    // resolve to the *same* paired-audio destination for a given
+    // base name/folder, so this only needs to run once even if
+    // several of them are selected together.
+    let mut paired_audio_sibling: Option<PathBuf> = None;
+    // Kept for the MP3+G zip, which packages the exact same bytes.
+    let mut cdg_bytes: Option<Vec<u8>> = None;
+
+    if do_cdg {
+        let bytes = export::render_cdg_with_settings(
+            &timed,
+            &backing,
+            total_duration,
+            &cdg_palette,
+            title.as_deref(),
+            artist.as_deref(),
+            &timing_settings,
+            outro.as_ref(),
+        );
+        let r = std::fs::write(&cdg_path, &bytes)
+            .map(|()| cdg_path.clone())
+            .map_err(|e| e.to_string());
+        if do_zip {
+            cdg_bytes = Some(bytes);
+        }
+        if r.is_ok() {
+            paired_audio_sibling.get_or_insert_with(|| cdg_path.clone());
+        }
+        outcomes.push(ExportOutcome {
+            label: "CDG file".into(),
+            result: r,
+        });
+
+        phase_index += 1;
+        set_progress(phase_index, 0.0);
+    }
+
+    if do_lrc {
+        let text = formats::export_lrc(
+            &lrc_lines,
+            lrc_enhanced,
+            title.as_deref(),
+            artist.as_deref(),
+        );
+        let r = std::fs::write(&lrc_path, text)
+            .map(|()| lrc_path.clone())
+            .map_err(|e| e.to_string());
+        if r.is_ok() {
+            paired_audio_sibling.get_or_insert_with(|| lrc_path.clone());
+        }
+        outcomes.push(ExportOutcome {
+            label: "LRC lyrics".into(),
+            result: r,
+        });
+
+        phase_index += 1;
+        set_progress(phase_index, 0.0);
+    }
+
+    if do_ultrastar {
+        // UltraStar's `#MP3:` header is a bare filename relative to
+        // the note file's own folder, not a path - it needs to
+        // match whatever the paired-audio copy below actually ends
+        // up named as.
+        let mp3_filename = audio_path.as_ref().and_then(|a| {
+            export::paired_audio_path(a, &ultrastar_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        });
+        let text = formats::export_ultrastar(
+            &timed,
+            title.as_deref(),
+            artist.as_deref(),
+            mp3_filename.as_deref(),
+        );
+        let r = std::fs::write(&ultrastar_path, text)
+            .map(|()| ultrastar_path.clone())
+            .map_err(|e| e.to_string());
+        if r.is_ok() {
+            paired_audio_sibling.get_or_insert_with(|| ultrastar_path.clone());
+        }
+        outcomes.push(ExportOutcome {
+            label: "UltraStar lyrics".into(),
+            result: r,
+        });
+
+        phase_index += 1;
+        set_progress(phase_index, 0.0);
+    }
+
+    if do_ass || do_srt {
+        let card_end = export::title_card_end(&timed);
+        if do_ass {
+            let text = formats::export_ass(
+                &timed,
+                &backing,
+                &video_palette,
+                &subtitle_font,
+                title.as_deref(),
+                artist.as_deref(),
+                card_end,
+            );
+            let mut text = text;
+            if let Some(o) = &outro {
+                formats::append_ass_outro(&mut text, o, title.as_deref(), artist.as_deref());
+            }
+            outcomes.push(ExportOutcome {
+                label: "Karaoke subtitles (.ass)".into(),
+                result: std::fs::write(&ass_path, text)
+                    .map(|()| ass_path.clone())
+                    .map_err(|e| e.to_string()),
+            });
+            phase_index += 1;
+            set_progress(phase_index, 0.0);
+        }
+        if do_srt {
+            let text =
+                formats::export_srt(&lrc_lines, title.as_deref(), artist.as_deref(), card_end);
+            let mut text = text;
+            if let Some(o) = &outro {
+                formats::append_srt_outro(&mut text, o, title.as_deref(), artist.as_deref());
+            }
+            outcomes.push(ExportOutcome {
+                label: "Subtitles (.srt)".into(),
+                result: std::fs::write(&srt_path, text)
+                    .map(|()| srt_path.clone())
+                    .map_err(|e| e.to_string()),
+            });
+            phase_index += 1;
+            set_progress(phase_index, 0.0);
+        }
+    }
+
+    if let Some(sibling) = &paired_audio_sibling {
+        if let Some(audio_path) = &audio_path {
+            let paired = export::copy_paired_audio(audio_path, sibling).map_err(|e| e.to_string());
+            outcomes.push(ExportOutcome {
+                label: "Paired audio".into(),
+                result: paired,
+            });
+        }
+    }
+
+    // Vocal separation is shared: if the instrumental export, the
+    // vocals export, and/or the video's "remove vocals" are all
+    // requested together, run the (slow) separation model exactly
+    // once - both stems come out of that single pass (see
+    // `vocals.rs`), so there's never a reason to separate the same
+    // song twice, no matter how many of these are picked.
+    let need_separation =
+        do_instrumental || do_vocals || remove_vocals_for_video || (do_zip && zip_instrumental);
+    let shared_separation: Option<Result<vocals::Separation, String>> = if need_separation {
+        audio_path.as_ref().map(|audio_path| {
+            vocals::load_separator()
+                .and_then(|mut sep| vocals::separate(&mut sep, audio_path, |_| {}))
+                .map_err(|e| e.to_string())
+        })
+    } else {
+        None
+    };
+
+    if do_instrumental {
+        let r = match &shared_separation {
+            Some(Ok(sep)) => {
+                vocals::write_stem_to_file(&sep.instrumental, sep.sample_rate, &instrumental_path)
+                    .map(|()| instrumental_path.clone())
+                    .map_err(|e| e.to_string())
+            }
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no audio loaded".to_string()),
+        };
+        outcomes.push(ExportOutcome {
+            label: "Instrumental audio".into(),
+            result: r,
+        });
+        phase_index += 1;
+        set_progress(phase_index, 0.0);
+    }
+
+    if do_vocals {
+        let r = match &shared_separation {
+            Some(Ok(sep)) => vocals::write_stem_to_file(&sep.vocals, sep.sample_rate, &vocals_path)
+                .map(|()| vocals_path.clone())
+                .map_err(|e| e.to_string()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no audio loaded".to_string()),
+        };
+        outcomes.push(ExportOutcome {
+            label: "Vocals audio".into(),
+            result: r,
+        });
+        phase_index += 1;
+        set_progress(phase_index, 0.0);
+    }
+
+    if do_zip {
+        let zip_result: Result<PathBuf, String> = (|| {
+            let cdg = cdg_bytes
+                .as_ref()
+                .ok_or_else(|| "the .cdg wasn't generated".to_string())?;
+            let audio_path = audio_path
+                .as_ref()
+                .ok_or_else(|| "no audio loaded".to_string())?;
+            let is_mp3 = audio_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("mp3"));
+            let tmp =
+                std::env::temp_dir().join(format!("abyssal-cdg-zip-{}.mp3", std::process::id()));
+            let mp3 = if zip_instrumental {
+                match &shared_separation {
+                    Some(Ok(sep)) => {
+                        vocals::write_stem_to_file(&sep.instrumental, sep.sample_rate, &tmp)
+                            .map_err(|e| format!("Vocal removal failed: {e}"))?;
+                    }
+                    Some(Err(e)) => return Err(format!("Vocal removal failed: {e}")),
+                    None => return Err("no audio loaded".to_string()),
+                }
+                std::fs::read(&tmp).map_err(|e| e.to_string())
+            } else if is_mp3 {
+                std::fs::read(audio_path).map_err(|e| e.to_string())
+            } else {
+                vocals::encode_via_ffmpeg(audio_path, &tmp, "mp3")
+                    .map_err(|e| format!("Converting the song to MP3 failed: {e}"))?;
+                std::fs::read(&tmp).map_err(|e| e.to_string())
+            };
+            let _ = std::fs::remove_file(&tmp);
+            let mp3 = mp3?;
+            zipfile::write_zip(
+                &zip_path,
+                &[(zip_cdg_name.as_str(), cdg), (zip_mp3_name.as_str(), &mp3)],
+            )
+            .map(|()| zip_path.clone())
+            .map_err(|e| e.to_string())
+        })();
+        outcomes.push(ExportOutcome {
+            label: "MP3+G zip".into(),
+            result: zip_result,
+        });
+        phase_index += 1;
+        set_progress(phase_index, 0.0);
+    }
+
+    if do_video {
+        let video_result: Result<PathBuf, String> = (|| {
+            let audio_path = audio_path
+                .as_ref()
+                .ok_or_else(|| "no audio loaded".to_string())?;
+
+            let mut own_temp: Option<PathBuf> = None;
+            let render_audio_path: PathBuf = if remove_vocals_for_video {
+                let tmp = std::env::temp_dir().join(format!(
+                    "abyssal-cdg-instrumental-{}.wav",
+                    std::process::id()
+                ));
+                match &shared_separation {
+                    Some(Ok(sep)) => {
+                        vocals::write_stem_to_file(&sep.instrumental, sep.sample_rate, &tmp)
+                            .map_err(|e| format!("Vocal removal failed: {e}"))?;
+                    }
+                    Some(Err(e)) => return Err(format!("Vocal removal failed: {e}")),
+                    None => return Err("Vocal removal failed: no audio loaded".to_string()),
+                }
+                own_temp = Some(tmp.clone());
+                tmp
+            } else {
+                audio_path.clone()
+            };
+
+            let video_phase = phase_index;
+            let r = video::render_video(
+                &timed,
+                &backing,
+                total_duration,
+                &video_palette,
+                title.as_deref(),
+                artist.as_deref(),
+                resolution,
+                video_codec,
+                30,
+                &render_audio_path,
+                background.as_ref(),
+                background_fit,
+                background_dim,
+                custom_font_bytes,
+                &video_path,
+                &timing_settings,
+                show_credit_line,
+                &video_style,
+                outro.as_ref(),
+                |p| set_progress(video_phase, p),
+            );
+
+            if let Some(tmp) = &own_temp {
+                let _ = std::fs::remove_file(tmp);
+            }
+
+            r.map(|()| video_path.clone()).map_err(|e| e.to_string())
+        })();
+
+        outcomes.push(ExportOutcome {
+            label: "Video".into(),
+            result: video_result,
+        });
+        phase_index += 1;
+        set_progress(phase_index, 0.0);
+    }
+
+    outcomes
+}
+
 /// One output's result from a combined export - a combined export can
 /// partially succeed (e.g. ffmpeg missing but vocal separation working
 /// fine), so each requested output is tracked and reported independently.
 struct ExportOutcome {
-    label: &'static str,
+    /// What was exported ("CDG file", ...) - prefixed with the song's name
+    /// in a batch export.
+    label: std::borrow::Cow<'static, str>,
     result: Result<PathBuf, String>,
 }
 
@@ -726,6 +2131,8 @@ struct ExportOutcome {
 struct CombinedExportHandle {
     progress: Arc<AtomicU32>, // 0..=1000 (tenths of a percent), across all selected outputs
     result: Arc<Mutex<Option<Vec<ExportOutcome>>>>,
+    /// Where the outputs are being written - offered as "Open folder" once done.
+    folder: PathBuf,
 }
 
 /// A point-in-time copy of everything Ctrl+Z/Ctrl+Shift+Z can undo/redo -
@@ -837,7 +2244,16 @@ impl KaraokeApp {
             word_tap_mode: WordTapMode::default(),
             auto_follow_words: true,
             compact_timing_table: false,
+            follow_timing_table: true,
+            timing_table_scrolled_to: None,
+            timing_table_scroll_request: None,
+            prefs: prefs::load(APP_ID),
+            shift_amount_secs: 0.1,
+            loop_mode: None,
+            loop_last_pos: None,
             preview_popped_out: false,
+            preview_mode: PreviewMode::default(),
+            cdg_preview: CdgPreviewState::default(),
             start_edit: None,
             end_edit: None,
             selected_lines: std::collections::BTreeSet::new(),
@@ -866,6 +2282,8 @@ impl KaraokeApp {
             seek_drag_value: None,
             video_resolution: Resolution::Hd1080,
             video_codec: VideoCodec::default(),
+            video_style: video::VideoStyle::default(),
+            outro: lyrics::OutroSettings::default(),
             show_credit_line: true,
             background: None,
             background_fit: video::BackgroundFit::default(),
@@ -889,9 +2307,26 @@ impl KaraokeApp {
             export_cdg: true,
             export_lrc: false,
             export_ultrastar: false,
+            export_ass: false,
+            export_srt: false,
             export_video: false,
             export_instrumental: false,
             export_vocals: false,
+            export_cdg_zip: false,
+            batch_projects: Vec::new(),
+            exported_this_project: false,
+            status_seen: String::new(),
+            status_kind: StatusKind::Info,
+            toast_until: None,
+            time_jump_edit: None,
+            show_shortcuts: false,
+            copy_dialog: None,
+            ui_style_frames: None,
+            table_row_spans: Vec::new(),
+            table_clip: egui::Rect::NOTHING,
+            last_export_folder: None,
+            batch_running: false,
+            zip_instrumental: false,
             lrc_enhanced_words: true,
             export_folder: None,
             export_base_name: String::new(),
@@ -915,51 +2350,50 @@ impl KaraokeApp {
             undo_pending_baseline: None,
         };
         app.undo_last_observed = app.undo_snapshot();
+        // The last export folder you chose, if it still exists.
+        app.export_folder = app.prefs.export_folder.clone().filter(|d| d.is_dir());
         app.start_font_list_job();
         app
     }
 
-    fn palette(&self) -> Palette {
-        Palette {
-            background: cdg_from_color32(self.color_bg),
-            default_unsung: cdg_from_color32(self.color_default_unsung),
-            default_highlight: cdg_from_color32(self.color_default_highlight),
-            male_unsung: cdg_from_color32(self.color_male_unsung),
-            male_highlight: cdg_from_color32(self.color_male_highlight),
-            female_unsung: cdg_from_color32(self.color_female_unsung),
-            female_highlight: cdg_from_color32(self.color_female_highlight),
-            duet_unsung: cdg_from_color32(self.color_duet_unsung),
-            duet_highlight: cdg_from_color32(self.color_duet_highlight),
-            preview: cdg_from_color32(self.color_preview),
-            title: cdg_from_color32(self.color_title),
-            artist: cdg_from_color32(self.color_artist),
-            screaming_unsung: cdg_from_color32(self.color_screaming_unsung),
-            screaming_highlight: cdg_from_color32(self.color_screaming_highlight),
-            backing_unsung: cdg_from_color32(self.color_backing_unsung),
-            backing_highlight: cdg_from_color32(self.color_backing_highlight),
+    /// The voices the song actually uses (in the usual order) - just
+    /// Default before any lines exist - so color checks skip unused ones.
+    fn voices_in_use(&self) -> Vec<Singer> {
+        let used: Vec<Singer> = Singer::ALL
+            .into_iter()
+            .filter(|s| self.lines.iter().any(|l| l.singer == *s))
+            .collect();
+        if used.is_empty() {
+            vec![Singer::Default]
+        } else {
+            used
         }
     }
 
-    fn video_palette(&self) -> VideoPalette {
-        let c = |c: egui::Color32| video::Rgb8::new(c.r(), c.g(), c.b());
-        VideoPalette {
-            background: c(self.color_bg),
-            default_unsung: c(self.color_default_unsung),
-            default_highlight: c(self.color_default_highlight),
-            male_unsung: c(self.color_male_unsung),
-            male_highlight: c(self.color_male_highlight),
-            female_unsung: c(self.color_female_unsung),
-            female_highlight: c(self.color_female_highlight),
-            duet_unsung: c(self.color_duet_unsung),
-            duet_highlight: c(self.color_duet_highlight),
-            preview: c(self.color_preview),
-            title: c(self.color_title),
-            artist: c(self.color_artist),
-            screaming_unsung: c(self.color_screaming_unsung),
-            screaming_highlight: c(self.color_screaming_highlight),
-            backing_unsung: c(self.color_backing_unsung),
-            backing_highlight: c(self.color_backing_highlight),
+    /// The current colors, as one value (see [`ExportColors`]).
+    fn export_colors(&self) -> ExportColors {
+        ExportColors {
+            bg: self.color_bg,
+            default_unsung: self.color_default_unsung,
+            default_highlight: self.color_default_highlight,
+            male_unsung: self.color_male_unsung,
+            male_highlight: self.color_male_highlight,
+            female_unsung: self.color_female_unsung,
+            female_highlight: self.color_female_highlight,
+            duet_unsung: self.color_duet_unsung,
+            duet_highlight: self.color_duet_highlight,
+            preview: self.color_preview,
+            title: self.color_title,
+            artist: self.color_artist,
+            screaming_unsung: self.color_screaming_unsung,
+            screaming_highlight: self.color_screaming_highlight,
+            backing_unsung: self.color_backing_unsung,
+            backing_highlight: self.color_backing_highlight,
         }
+    }
+
+    fn palette(&self) -> Palette {
+        self.export_colors().palette()
     }
 
     fn singer_colors(&self, s: Singer) -> (egui::Color32, egui::Color32) {
@@ -1092,6 +2526,8 @@ impl KaraokeApp {
             },
             video_resolution: self.video_resolution,
             video_codec: self.video_codec,
+            video_style: self.video_style,
+            outro: self.outro.clone(),
             show_credit_line: self.show_credit_line,
             background: self.background.clone(),
             background_fit: self.background_fit,
@@ -1229,6 +2665,8 @@ impl KaraokeApp {
         self.artist = project.artist;
         self.video_resolution = project.video_resolution;
         self.video_codec = project.video_codec;
+        self.video_style = project.video_style;
+        self.outro = project.outro;
         self.show_credit_line = project.show_credit_line;
         self.background = project.background;
         self.background_fit = project.background_fit;
@@ -1243,37 +2681,23 @@ impl KaraokeApp {
         self.font_load_error = None;
         self.timing_settings = project.timing_settings;
 
-        let c = project.colors;
-        self.color_bg = color32_from_rgb_color(c.background);
-        // A project saved before `Default` had its own color falls back to
-        // `Male`'s - exactly how `Default` used to always render, so an old
-        // project's look doesn't change just from being reopened.
-        self.color_default_unsung =
-            color32_from_rgb_color(c.default_unsung.unwrap_or(c.male_unsung));
-        self.color_default_highlight =
-            color32_from_rgb_color(c.default_highlight.unwrap_or(c.male_highlight));
-        self.color_male_unsung = color32_from_rgb_color(c.male_unsung);
-        self.color_male_highlight = color32_from_rgb_color(c.male_highlight);
-        self.color_female_unsung = color32_from_rgb_color(c.female_unsung);
-        self.color_female_highlight = color32_from_rgb_color(c.female_highlight);
-        self.color_duet_unsung = color32_from_rgb_color(c.duet_unsung);
-        self.color_duet_highlight = color32_from_rgb_color(c.duet_highlight);
-        self.color_preview = color32_from_rgb_color(c.preview);
-        self.color_title = color32_from_rgb_color(c.title);
-        self.color_artist = color32_from_rgb_color(c.artist);
-        self.color_screaming_unsung = color32_from_rgb_color(c.screaming_unsung);
-        self.color_screaming_highlight = color32_from_rgb_color(c.screaming_highlight);
-        // A project saved before the Backing voice existed gets the
-        // default palette's own backing colors.
-        let default_palette = Palette::default();
-        self.color_backing_unsung = c
-            .backing_unsung
-            .map(color32_from_rgb_color)
-            .unwrap_or_else(|| color32_from_cdg(default_palette.backing_unsung));
-        self.color_backing_highlight = c
-            .backing_highlight
-            .map(color32_from_rgb_color)
-            .unwrap_or_else(|| color32_from_cdg(default_palette.backing_highlight));
+        let c = ExportColors::from_project(&project.colors);
+        self.color_bg = c.bg;
+        self.color_default_unsung = c.default_unsung;
+        self.color_default_highlight = c.default_highlight;
+        self.color_male_unsung = c.male_unsung;
+        self.color_male_highlight = c.male_highlight;
+        self.color_female_unsung = c.female_unsung;
+        self.color_female_highlight = c.female_highlight;
+        self.color_duet_unsung = c.duet_unsung;
+        self.color_duet_highlight = c.duet_highlight;
+        self.color_preview = c.preview;
+        self.color_title = c.title;
+        self.color_artist = c.artist;
+        self.color_screaming_unsung = c.screaming_unsung;
+        self.color_screaming_highlight = c.screaming_highlight;
+        self.color_backing_unsung = c.backing_unsung;
+        self.color_backing_highlight = c.backing_highlight;
         // A loaded project's colors may or may not match any preset - reset
         // to the neutral default label rather than keep showing whatever
         // preset happened to be selected before.
@@ -1314,9 +2738,15 @@ impl KaraokeApp {
         self.export_cdg = true;
         self.export_lrc = false;
         self.export_ultrastar = false;
+        self.export_ass = false;
+        self.export_srt = false;
         self.export_video = false;
         self.export_instrumental = false;
         self.export_vocals = false;
+        self.export_cdg_zip = false;
+        self.zip_instrumental = false;
+        self.exported_this_project = false;
+        self.last_export_folder = None;
         self.lrc_enhanced_words = true;
         self.remove_vocals_for_video = false;
         self.instrumental_format = InstrumentalFormat::default();
@@ -2006,9 +3436,12 @@ impl KaraokeApp {
         let mut requests: Vec<(usize, Vec<String>, f64, f64)> = Vec::new();
         for (i, timed_line) in timed.iter().enumerate() {
             let orig_idx = indices[i];
-            let words: Vec<String> = self.lines[orig_idx]
-                .words()
-                .into_iter()
+            // Whole words, syllable marks removed - the speech model aligns
+            // words; each word's time is spread over its syllables after
+            // (see `lyrics::spread_word_timing` in `poll_align_job`).
+            let words: Vec<String> = lyrics::normalize_text(&self.lines[orig_idx].text)
+                .split(' ')
+                .filter(|w| !w.is_empty())
                 .map(|w| w.to_string())
                 .collect();
             if words.len() < 2 {
@@ -2130,12 +3563,16 @@ impl KaraokeApp {
                     match o.result {
                         Ok(words) => {
                             if let Some(line) = self.lines.get_mut(o.line_idx) {
-                                for (i, w) in words.iter().enumerate() {
+                                let word_times: Vec<(f64, f64)> =
+                                    words.iter().map(|w| (w.start, w.end)).collect();
+                                let unit_times =
+                                    lyrics::spread_word_timing(&line.text, &word_times);
+                                for (i, &(start, end)) in unit_times.iter().enumerate() {
                                     if let Some(slot) = line.word_overrides.get_mut(i) {
-                                        *slot = Some(w.start);
+                                        *slot = Some(start);
                                     }
                                     if let Some(slot) = line.word_end_overrides.get_mut(i) {
-                                        *slot = Some(w.end);
+                                        *slot = Some(end);
                                     }
                                 }
                                 // Keep the line's own start/sing_end in
@@ -2371,37 +3808,104 @@ impl KaraokeApp {
     /// line's start - so both boundaries come from tapping in real time
     /// rather than only the start, with the end left to an estimate.
     fn tap_next(&mut self) {
-        let Some(audio) = &self.audio else { return };
+        if let Some(pos) = self.live_tap_position() {
+            self.tap_at(pos);
+        }
+    }
+
+    /// The playback position to record a tap at, or `None` (with the
+    /// reason in the status bar) if tapping isn't possible right now.
+    fn live_tap_position(&mut self) -> Option<f64> {
+        let Some(audio) = &self.audio else {
+            return None;
+        };
         if !audio.is_playing() {
             self.status = "Press Play first, then tap along with the song.".to_string();
-            return;
+            return None;
         }
         if self.next_untimed >= self.lines.len() {
             self.status = "All lines are already timed.".to_string();
+            return None;
+        }
+        Some(compensate_tap(
+            audio.position(),
+            self.prefs.tap_latency_ms,
+            audio.speed(),
+        ))
+    }
+
+    /// Shift+Space: for lines sung back-to-back with no gap, one tap sets
+    /// the current line's end *and* the next line's start at the same
+    /// instant - two taps a split second apart are hard to land and leave a
+    /// tiny false gap. Only meaningful while waiting for an end tap; at a
+    /// start tap it's just a normal tap.
+    fn tap_end_and_start_next(&mut self) {
+        let Some(pos) = self.live_tap_position() else {
+            return;
+        };
+        if self.tap_phase != TapPhase::End {
+            self.tap_at(pos);
             return;
         }
-        let pos = audio.position();
+        let ended = self.next_untimed;
+        self.tap_at(pos);
+        // Only chain on if the end tap actually landed and moved us on to
+        // the next line's start (it stops on errors, or at the last line).
+        if self.tap_phase == TapPhase::Start
+            && self.next_untimed > ended
+            && self.next_untimed < self.lines.len()
+        {
+            let end_status = self.status.clone();
+            self.tap_at(pos);
+            if self.tap_phase == TapPhase::End {
+                self.status = format!(
+                    "Line {} ended and line {} started at {} - tap again for its end.",
+                    ended + 1,
+                    self.next_untimed + 1,
+                    lyrics::format_timecode(pos)
+                );
+            } else {
+                self.status = format!("{end_status} {}", self.status);
+            }
+        }
+    }
+
+    /// Records one tap-along press at `pos` - see [`Self::tap_next`].
+    fn tap_at(&mut self, pos: f64) {
         let idx = self.next_untimed;
         match self.tap_phase {
             TapPhase::Start => {
-                if let Err(e) = lyrics::check_start_change(&self.lines, idx, pos) {
-                    self.status = e;
-                    return;
-                }
-                self.lines[idx].start = Some(pos);
+                let trimmed = match lyrics::apply_tap_start(&mut self.lines, idx, pos) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.status = e;
+                        return;
+                    }
+                };
                 self.tap_phase = TapPhase::End;
-                self.status = format!(
-                    "Line {} started at {} - tap again for its end.",
-                    idx + 1,
-                    lyrics::format_timecode(pos)
-                );
+                self.status = match trimmed {
+                    Some(p) => format!(
+                        "Line {} started at {} (line {}'s end moved back to meet it) - tap \
+                         again for its end.",
+                        idx + 1,
+                        lyrics::format_timecode(pos),
+                        p + 1
+                    ),
+                    None => format!(
+                        "Line {} started at {} - tap again for its end.",
+                        idx + 1,
+                        lyrics::format_timecode(pos)
+                    ),
+                };
             }
             TapPhase::End => {
-                if let Err(e) = lyrics::check_end_change(&self.lines, idx, pos) {
-                    self.status = e;
-                    return;
-                }
-                self.lines[idx].sing_end_override = Some(pos);
+                let (pos, clamped) = match lyrics::apply_tap_end(&mut self.lines, idx, pos) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.status = e;
+                        return;
+                    }
+                };
                 self.tap_phase = TapPhase::Start;
                 // On to the next *main* line - backing lines are skipped
                 // (see `tap_backing_line`).
@@ -2422,6 +3926,12 @@ impl KaraokeApp {
                                    them - it'll follow the song automatically. Space now \
                                    pauses/resumes playback instead of tapping."
                         .to_string();
+                } else if clamped {
+                    self.status = format!(
+                        "Line {} ended at {} (where the next line already starts).",
+                        idx + 1,
+                        lyrics::format_timecode(pos)
+                    );
                 } else {
                     self.status = format!(
                         "Line {} ended at {}.",
@@ -2435,8 +3945,8 @@ impl KaraokeApp {
 
     /// Space-bar behavior once there's nothing left to tap along (see the
     /// key handler in `update()`): play from the start if nothing's loaded
-    /// yet, resume if paused, otherwise pause - the same three actions as
-    /// the Play/Pause/Resume buttons, just combined into whichever one
+    /// yet, resume if paused, otherwise pause - the same as the transport's
+    /// ▶ Play / ⏸ Pause toggle button, just combined into whichever one
     /// applies, so Space can drive playback hands-free while fine-tuning
     /// once every line is timed.
     fn toggle_play_pause(&mut self) {
@@ -2507,6 +4017,11 @@ impl KaraokeApp {
         if !self.auto_follow_words || self.word_tap_line.is_none() {
             return;
         }
+        // A line loop's lead-in plays the end of the previous line - don't
+        // let that drag the panel off the line being looped.
+        if matches!(self.loop_mode, Some(LoopMode::Line(_))) {
+            return;
+        }
         let Some(audio) = &self.audio else { return };
         if !audio.is_playing() {
             return;
@@ -2519,6 +4034,159 @@ impl KaraokeApp {
                 break;
             }
         }
+    }
+
+    /// `(start, sing_end)` of line `idx` as currently resolved (explicit or
+    /// estimated end), from the main or backing track - `None` if it isn't
+    /// timed yet.
+    fn line_bounds(&self, idx: usize) -> Option<(f64, f64)> {
+        self.resolved_timed_line(idx).map(|t| (t.start, t.sing_end))
+    }
+
+    /// Line `idx` as currently resolved (main or backing track), or `None`
+    /// if it isn't timed yet.
+    fn resolved_timed_line(&self, idx: usize) -> Option<TimedLine> {
+        let (timed, indices) = self.resolved_with_indices();
+        if let Some(k) = indices.iter().position(|&i| i == idx) {
+            return timed.into_iter().nth(k);
+        }
+        let (timed, indices) =
+            lyrics::resolve_backing_track_indexed(&self.lines, &self.timing_settings);
+        let k = indices.iter().position(|&i| i == idx)?;
+        timed.into_iter().nth(k)
+    }
+
+    /// The `[from, to)` song-time range the active loop repeats, if it's
+    /// complete (an A-B loop needs both points).
+    fn loop_region(&self) -> Option<(f64, f64)> {
+        let duration = self.audio.as_ref().and_then(|a| a.duration());
+        let (from, to) = match self.loop_mode? {
+            LoopMode::Line(i) => {
+                let (s, e) = self.line_bounds(i)?;
+                ((s - LOOP_PRE_ROLL_SECS).max(0.0), e + LOOP_POST_ROLL_SECS)
+            }
+            LoopMode::Ab { a, b } => (a, b?),
+        };
+        // Stop just short of the very end, since the playback position
+        // never goes past the song's duration and couldn't cross `to`.
+        let to = match duration {
+            Some(d) => to.min(d - 0.05),
+            None => to,
+        };
+        (to > from).then_some((from, to))
+    }
+
+    /// Called every frame: while playing, jumps back to the loop's start
+    /// whenever playback crosses its end. Also drops a line loop whose
+    /// line no longer exists (e.g. after re-parsing).
+    fn apply_loop(&mut self) {
+        if let Some(LoopMode::Line(i)) = self.loop_mode {
+            if i >= self.lines.len() {
+                self.loop_mode = None;
+            }
+        }
+        let Some(audio) = &self.audio else { return };
+        if !audio.is_playing() {
+            self.loop_last_pos = None;
+            return;
+        }
+        let pos = audio.position();
+        let prev = self.loop_last_pos.replace(pos);
+        let Some((from, to)) = self.loop_region() else {
+            return;
+        };
+        if loop_should_wrap(prev, pos, to) {
+            if let Some(a) = &mut self.audio {
+                if let Err(e) = a.seek(from) {
+                    self.status = format!("Loop seek failed: {e}");
+                }
+            }
+            self.loop_last_pos = Some(from);
+        }
+    }
+
+    /// Starts looping line `idx` (or, with `None`, the line open in the
+    /// fine-tune panel, else the line being tapped) - or stops the loop if
+    /// a line loop is already running. Opens the fine-tune panel on that
+    /// line and starts playback from the loop's lead-in.
+    fn toggle_loop_line(&mut self, idx: Option<usize>) {
+        if let Some(LoopMode::Line(current)) = self.loop_mode {
+            if idx.is_none() || idx == Some(current) {
+                self.loop_mode = None;
+                self.status = "Loop off.".to_string();
+                return;
+            }
+        }
+        let target = idx
+            .or(self.word_tap_line)
+            .or_else(|| (self.next_untimed < self.lines.len()).then_some(self.next_untimed));
+        let Some(i) = target else {
+            self.status = "Pick a line to loop first (click it in the table below).".to_string();
+            return;
+        };
+        if self.line_bounds(i).is_none() {
+            self.status = format!("Line {} isn't timed yet - tap its start first.", i + 1);
+            return;
+        }
+        self.loop_mode = Some(LoopMode::Line(i));
+        self.word_tap_line = Some(i);
+        if let Some((from, _)) = self.loop_region() {
+            self.seek_and_play(from);
+        }
+        self.status = format!(
+            "Looping line {} - press L or Loop line again to stop.",
+            i + 1
+        );
+    }
+
+    /// A-B loop: "A" marks the current position as the loop start (and
+    /// clears any old end point).
+    fn set_loop_a(&mut self) {
+        let Some(pos) = self.audio.as_ref().map(|a| a.position()) else {
+            return;
+        };
+        self.loop_mode = Some(LoopMode::Ab { a: pos, b: None });
+        self.status = format!(
+            "Loop start (A) set at {} - press B at the end point.",
+            lyrics::format_timecode(pos)
+        );
+    }
+
+    /// A-B loop: "B" marks the current position as the loop end and starts
+    /// looping (jumping back to A right away).
+    fn set_loop_b(&mut self) {
+        let Some(pos) = self.audio.as_ref().map(|a| a.position()) else {
+            return;
+        };
+        let Some(LoopMode::Ab { a, .. }) = self.loop_mode else {
+            self.status = "Set the loop start (A) first.".to_string();
+            return;
+        };
+        if pos < a + MIN_AB_LOOP_SECS {
+            self.status = "Loop end (B) must be after the start (A).".to_string();
+            return;
+        }
+        self.loop_mode = Some(LoopMode::Ab { a, b: Some(pos) });
+        self.seek_and_play(a);
+        self.status = format!(
+            "Looping {} - {}.",
+            lyrics::format_timecode(a),
+            lyrics::format_timecode(pos)
+        );
+    }
+
+    /// Seeks to `pos` and makes sure playback is running from there.
+    fn seek_and_play(&mut self, pos: f64) {
+        let Some(a) = &mut self.audio else { return };
+        let result = if a.is_playing() || a.is_paused() {
+            a.seek(pos).map(|_| a.resume())
+        } else {
+            a.play_from_start().and_then(|_| a.seek(pos))
+        };
+        if let Err(e) = result {
+            self.status = format!("Playback error: {e}");
+        }
+        self.loop_last_pos = None;
     }
 
     /// Same as [`Self::resolved`], but also returns each `TimedLine`'s index
@@ -2548,7 +4216,7 @@ impl KaraokeApp {
             self.status = "Press Play first, then tap.".to_string();
             return;
         }
-        let pos = audio.position();
+        let pos = compensate_tap(audio.position(), self.prefs.tap_latency_ms, audio.speed());
         if let Err(e) = lyrics::check_start_change(&self.lines, idx, pos) {
             self.status = e;
             return;
@@ -2571,7 +4239,7 @@ impl KaraokeApp {
             self.status = "Press Play first, then tap.".to_string();
             return;
         }
-        let pos = audio.position();
+        let pos = compensate_tap(audio.position(), self.prefs.tap_latency_ms, audio.speed());
         let Some(line) = self.lines.get(idx) else {
             return;
         };
@@ -2649,7 +4317,7 @@ impl KaraokeApp {
             self.status = "Press Play first, then click a word to set its time.".to_string();
             return;
         }
-        let pos = audio.position();
+        let pos = compensate_tap(audio.position(), self.prefs.tap_latency_ms, audio.speed());
         if word_idx == 0 {
             if let Err(e) = lyrics::check_start_change(&self.lines, line_idx, pos) {
                 self.status = e;
@@ -2680,7 +4348,7 @@ impl KaraokeApp {
             self.status = "Press Play first, then click a word to set its end time.".to_string();
             return;
         }
-        let pos = audio.position();
+        let pos = compensate_tap(audio.position(), self.prefs.tap_latency_ms, audio.speed());
         let is_last_word = self
             .lines
             .get(line_idx)
@@ -2726,7 +4394,7 @@ impl KaraokeApp {
             self.status = "Press Play first, then tap when the line finishes.".to_string();
             return;
         }
-        let pos = audio.position();
+        let pos = compensate_tap(audio.position(), self.prefs.tap_latency_ms, audio.speed());
         if let Err(e) = lyrics::check_end_change(&self.lines, line_idx, pos) {
             self.status = e;
             return;
@@ -2742,20 +4410,21 @@ impl KaraokeApp {
     /// title, so there's usually nothing to type before exporting.
     fn open_export_dialog(&mut self) {
         if self.export_base_name.trim().is_empty() {
-            self.export_base_name = self
-                .audio
-                .as_ref()
-                .and_then(|a| a.file_name())
-                .map(|n| n.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(n))
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    let t = self.title.trim();
-                    (!t.is_empty()).then(|| t.to_string())
-                })
-                .map(|s| sanitize_export_base_name(&s))
-                .unwrap_or_else(|| "karaoke".to_string());
+            let audio = self.audio.as_ref().and_then(|a| a.path());
+            self.export_base_name = default_export_base_name(audio, &self.title);
         }
         self.show_export_dialog = true;
+    }
+
+    /// Whether any selected export uses lyric timing (as opposed to only
+    /// audio exports like the instrumental/vocals stems).
+    fn any_timed_export(&self) -> bool {
+        self.export_cdg
+            || self.export_video
+            || self.export_lrc
+            || self.export_ultrastar
+            || self.export_ass
+            || self.export_srt
     }
 
     /// Draws the combined export options window: which output(s) to
@@ -2771,23 +4440,10 @@ impl KaraokeApp {
     /// loudly. Instrumental-only exports never touch lyric timing at all,
     /// so they're never blocked by this.
     fn missing_timing_reason(&self) -> Option<String> {
-        if !(self.export_cdg || self.export_video || self.export_lrc || self.export_ultrastar) {
+        if !self.any_timed_export() {
             return None;
         }
-        let total = self.lines.len();
-        let timed_count = self.lines.iter().filter(|l| l.start.is_some()).count();
-        if timed_count == 0 {
-            Some("No lines are timed yet - tap along with the song first.".to_string())
-        } else if timed_count < total {
-            Some(format!(
-                "{} of {total} line(s) don't have a timestamp yet - they'd be silently left \
-                 out of the output(s) otherwise. Tap along (or set times manually) for every \
-                 line before exporting.",
-                total - timed_count
-            ))
-        } else {
-            None
-        }
+        missing_timing(&self.lines)
     }
 
     /// Draws the in-app documentation ("Codex") window, if open - a
@@ -2904,6 +4560,36 @@ impl KaraokeApp {
                 ui.add_space(6.0);
 
                 ui.checkbox(&mut self.export_cdg, "CD+Graphics (.cdg)");
+                ui.add_enabled_ui(self.export_cdg, |ui| {
+                    ui.indent("cdg_opts", |ui| {
+                        ui.checkbox(
+                            &mut self.export_cdg_zip,
+                            "Also package as an MP3+G .zip (.cdg + .mp3)",
+                        )
+                        .on_hover_text(
+                            "The format karaoke hosts and KJ software import songs in: one \
+                             .zip holding the .cdg and an .mp3 with the same name. A song \
+                             that isn't already an MP3 is converted (needs ffmpeg, same as \
+                             video export). The loose .cdg and audio are still saved too.",
+                        );
+                        ui.add_enabled_ui(self.export_cdg_zip, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Zip audio:");
+                                ui.radio_value(&mut self.zip_instrumental, false, "Original song");
+                                ui.radio_value(
+                                    &mut self.zip_instrumental,
+                                    true,
+                                    "Instrumental (vocals removed)",
+                                )
+                                .on_hover_text(
+                                    "Most karaoke tracks are instrumentals. Runs vocal \
+                                     removal (slow - see \"Removing vocals\"), shared with \
+                                     any other vocal-removal export you've picked.",
+                                );
+                            });
+                        });
+                    });
+                });
 
                 ui.checkbox(&mut self.export_lrc, "Lyrics (.lrc)");
                 ui.add_enabled_ui(self.export_lrc, |ui| {
@@ -2917,6 +4603,18 @@ impl KaraokeApp {
 
                 ui.checkbox(&mut self.export_ultrastar, "Lyrics (UltraStar .txt)");
 
+                ui.checkbox(&mut self.export_ass, "Karaoke subtitles (.ass)")
+                    .on_hover_text(
+                        "Subtitles with a word-by-word color wipe, in your voice colors - \
+                         plays in VLC/mpv, and loads into Aegisub, video editors (to burn \
+                         lyrics onto your own footage) and most subtitle tools.",
+                    );
+                ui.checkbox(&mut self.export_srt, "Plain subtitles (.srt)")
+                    .on_hover_text(
+                        "One subtitle per lyric line, no word timing - the most widely \
+                         supported format (YouTube captions, any player or editor).",
+                    );
+
                 ui.checkbox(&mut self.export_video, "Video (.mp4)");
                 ui.add_enabled_ui(self.export_video, |ui| {
                     ui.indent("video_opts", |ui| {
@@ -2925,6 +4623,11 @@ impl KaraokeApp {
                             egui::ComboBox::from_id_source("export_video_res")
                                 .selected_text(self.video_resolution.label())
                                 .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.video_resolution,
+                                        Resolution::Hd720,
+                                        "720p (quick drafts)",
+                                    );
                                     ui.selectable_value(
                                         &mut self.video_resolution,
                                         Resolution::Hd1080,
@@ -2936,6 +4639,73 @@ impl KaraokeApp {
                                         "4K",
                                     );
                                 });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Shape:");
+                            ui.radio_value(
+                                &mut self.video_style.orientation,
+                                video::Orientation::Landscape,
+                                "16:9 (YouTube, TVs)",
+                            );
+                            ui.radio_value(
+                                &mut self.video_style.orientation,
+                                video::Orientation::Portrait,
+                                "9:16 (Shorts, TikTok, Reels)",
+                            );
+                        });
+                        let (fw, fh) = self.video_style.frame_size(self.video_resolution);
+                        ui.label(egui::RichText::new(format!("{fw}x{fh}")).small().weak());
+                        ui.horizontal(|ui| {
+                            ui.label("Lyric size:");
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.video_style.lyric_size_pct,
+                                    video::MIN_LYRIC_SIZE_PCT..=video::MAX_LYRIC_SIZE_PCT,
+                                )
+                                .suffix("%"),
+                            )
+                            .on_hover_text(
+                                "Size of the lyric lines (and backing lane) - the title card \
+                                 keeps its size. Long lines still shrink to fit the frame. \
+                                 The live preview shows the change.",
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.video_style.outline, "Text outline")
+                                .on_hover_text(
+                                    "A dark outline around all text - keeps lyrics readable \
+                                     over a busy image or video background.",
+                                );
+                            ui.checkbox(&mut self.video_style.shadow, "Drop shadow")
+                                .on_hover_text("A soft dark shadow under all text.");
+                        });
+                        if self.video_style.outline || self.video_style.shadow {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Outline/shadow appear in the exported video only, not the \
+                                     live preview.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            let mut fade = self.video_style.fade_out_secs > 0.0;
+                            if ui
+                                .checkbox(&mut fade, "Fade out audio at the end")
+                                .changed()
+                            {
+                                self.video_style.fade_out_secs = if fade { 3.0 } else { 0.0 };
+                            }
+                            if fade {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.video_style.fade_out_secs)
+                                        .range(0.5..=15.0)
+                                        .speed(0.1)
+                                        .fixed_decimals(1)
+                                        .suffix(" s"),
+                                );
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Codec:");
@@ -2955,15 +4725,9 @@ impl KaraokeApp {
                                 });
                         });
                         if self.video_codec == VideoCodec::H264 {
-                            ui.label(
-                                egui::RichText::new(
-                                    "H.264 exports are typically several times larger than AV1 \
+                            help_text(ui, self.prefs.show_tips, "H.264 files are several times larger than AV1.", "H.264 exports are typically several times larger than AV1 \
                                      at the same quality - pick this only if you specifically \
-                                     need compatibility with something that can't play AV1.",
-                                )
-                                .small()
-                                .weak(),
-                            );
+                                     need compatibility with something that can't play AV1.");
                         }
                         ui.checkbox(&mut self.remove_vocals_for_video, "Remove vocals (slow)");
                         ui.checkbox(
@@ -2998,40 +4762,22 @@ impl KaraokeApp {
                 });
 
                 if self.export_video || self.export_instrumental || self.export_vocals {
-                    ui.label(
-                        egui::RichText::new(
-                            "Vocal removal runs a real ML separation model (UVR-MDX-NET) \
+                    help_text(ui, self.prefs.show_tips, "Vocal removal is slow - it runs an AI model on your computer.", "Vocal removal runs a real ML separation model (UVR-MDX-NET) \
                              entirely in-app, on-device - nothing to install separately. It \
                              can still take a while, especially on a machine without a lot of \
-                             CPU headroom.",
-                        )
-                        .small()
-                        .weak(),
-                    );
+                             CPU headroom.");
                 }
                 if self.export_ultrastar {
-                    ui.label(
-                        egui::RichText::new(
-                            "UltraStar export has no pitch data (this app doesn't track \
+                    help_text(ui, self.prefs.show_tips, "UltraStar export has no real pitch data.", "UltraStar export has no pitch data (this app doesn't track \
                              melody) - every note is written at a constant placeholder pitch, \
                              so a game that scores pitch accuracy will treat the whole song as \
-                             one fixed note. Lyrics and timing are real.",
-                        )
-                        .small()
-                        .weak(),
-                    );
+                             one fixed note. Lyrics and timing are real.");
                 }
                 if self.export_lrc || self.export_ultrastar {
                     if let Some(audio) = &self.audio {
                         if audio.is_loaded() {
-                            ui.label(
-                                egui::RichText::new(
-                                    "The loaded audio is copied alongside lyrics exports too \
-                                     (same base filename), same as the .cdg pairing.",
-                                )
-                                .small()
-                                .weak(),
-                            );
+                            help_text(ui, self.prefs.show_tips, "The song's audio is copied next to lyrics exports.", "The loaded audio is copied alongside lyrics exports too \
+                                     (same base filename), same as the .cdg pairing.");
                         }
                     }
                 }
@@ -3049,7 +4795,14 @@ impl KaraokeApp {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Choose folder…").clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        let mut dialog = rfd::FileDialog::new();
+                        if let Some(dir) = &self.export_folder {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        if let Some(dir) = dialog.pick_folder() {
+                            // Remembered across restarts (see `prefs.rs`).
+                            self.prefs.export_folder = Some(dir.clone());
+                            prefs::save(APP_ID, &self.prefs);
                             self.export_folder = Some(dir);
                         }
                     }
@@ -3064,10 +4817,13 @@ impl KaraokeApp {
                     ui.add_space(6.0);
                     ui.colored_label(egui::Color32::from_rgb(230, 160, 40), format!("⚠ {reason}"));
                 }
+                self.draw_export_checklist(ui);
 
                 ui.add_space(10.0);
                 let can_export = (self.export_cdg
                     || self.export_lrc
+                    || self.export_ass
+                    || self.export_srt
                     || self.export_ultrastar
                     || self.export_video
                     || self.export_instrumental
@@ -3085,6 +4841,70 @@ impl KaraokeApp {
                         self.show_export_dialog = false;
                     }
                 });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.strong("Batch export");
+                help_text(ui, self.prefs.show_tips, "Export several saved projects at once, with these choices.", "Export several saved projects (.abyzl) with the choices above, into \
+                         the same folder. Each song keeps its own colors, video settings, font \
+                         and background, and is named after its audio file (or title). Songs \
+                         that aren't fully timed - or are missing audio an output needs - are \
+                         skipped and listed.");
+                ui.horizontal(|ui| {
+                    if ui.button("Choose projects…").clicked() {
+                        if let Some(paths) = rfd::FileDialog::new()
+                            .add_filter("Abyssal CDG project", &[project::FILE_EXTENSION])
+                            .pick_files()
+                        {
+                            for p in paths {
+                                if !self.batch_projects.contains(&p) {
+                                    self.batch_projects.push(p);
+                                }
+                            }
+                        }
+                    }
+                    if !self.batch_projects.is_empty() && ui.small_button("Clear").clicked() {
+                        self.batch_projects.clear();
+                    }
+                    ui.label(format!("{} chosen", self.batch_projects.len()));
+                });
+                if !self.batch_projects.is_empty() {
+                    let mut remove = None;
+                    egui::ScrollArea::vertical()
+                        .id_source("batch_projects_scroll")
+                        .max_height(110.0)
+                        .show(ui, |ui| {
+                            for (i, p) in self.batch_projects.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                    ui.label(
+                                        p.file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default(),
+                                    )
+                                    .on_hover_text(p.display().to_string());
+                                });
+                            }
+                        });
+                    if let Some(i) = remove {
+                        self.batch_projects.remove(i);
+                    }
+                }
+                let can_batch = self.export_options().any()
+                    && self.export_folder.is_some()
+                    && !self.batch_projects.is_empty()
+                    && self.combined_export.is_none();
+                ui.add_enabled_ui(can_batch, |ui| {
+                    if ui
+                        .button(format!("Export {} project(s)", self.batch_projects.len()))
+                        .clicked()
+                    {
+                        self.start_batch_export();
+                    }
+                });
             });
         if !open {
             self.show_export_dialog = false;
@@ -3100,13 +4920,8 @@ impl KaraokeApp {
             self.status = reason;
             return;
         }
-        let do_cdg = self.export_cdg;
-        let do_lrc = self.export_lrc;
-        let do_ultrastar = self.export_ultrastar;
-        let do_video = self.export_video;
-        let do_instrumental = self.export_instrumental;
-        let do_vocals = self.export_vocals;
-        if !do_cdg && !do_lrc && !do_ultrastar && !do_video && !do_instrumental && !do_vocals {
+        let opts = self.export_options();
+        if !opts.any() {
             self.status = "Choose at least one output to export.".to_string();
             return;
         }
@@ -3125,50 +4940,13 @@ impl KaraokeApp {
         // noticing/editing the pre-filled name.
         let base = sanitize_export_base_name(self.export_base_name.trim());
 
-        let audio_path = self
-            .audio
-            .as_ref()
-            .and_then(|a| a.path())
-            .map(|p| p.to_path_buf());
-        if (do_video || do_instrumental || do_vocals) && audio_path.is_none() {
+        let inputs = self.export_inputs();
+        if opts.needs_audio() && inputs.audio_path.is_none() {
             self.status =
-                "Load an audio file first - video/instrumental/vocals export need it.".to_string();
+                "Load an audio file first - video/instrumental/vocals/zip export need it."
+                    .to_string();
             return;
         }
-
-        let (timed, total_duration) = self.resolved();
-        let backing = self.resolved_backing();
-        // LRC has no notion of a second track, but it doesn't need one:
-        // players just show whatever line's timestamp was reached most
-        // recently, so backing lines are interleaved by start time.
-        let mut lrc_lines: Vec<TimedLine> = timed.iter().chain(backing.iter()).cloned().collect();
-        lrc_lines.sort_by(|a, b| {
-            a.start
-                .partial_cmp(&b.start)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let timing_settings = self.timing_settings;
-        let cdg_palette = self.palette();
-        let video_palette = self.video_palette();
-        let title = (!self.title.trim().is_empty()).then(|| self.title.trim().to_string());
-        let artist = (!self.artist.trim().is_empty()).then(|| self.artist.trim().to_string());
-        let resolution = self.video_resolution;
-        let video_codec = self.video_codec;
-        let show_credit_line = self.show_credit_line;
-        let background = self.background.clone();
-        let background_fit = self.background_fit;
-        let background_dim = self.background_dim;
-        let custom_font_bytes = self.loaded_font_bytes();
-        let remove_vocals_for_video = self.remove_vocals_for_video;
-        let instrumental_ext = self.instrumental_format.extension();
-        let lrc_enhanced = self.lrc_enhanced_words;
-
-        let cdg_path = folder.join(format!("{base}.cdg"));
-        let lrc_path = folder.join(format!("{base}.lrc"));
-        let ultrastar_path = folder.join(format!("{base}.txt"));
-        let video_path = folder.join(format!("{base}.mp4"));
-        let instrumental_path = folder.join(format!("{base}-instrumental.{instrumental_ext}"));
-        let vocals_path = folder.join(format!("{base}-vocals.{instrumental_ext}"));
 
         let progress = Arc::new(AtomicU32::new(0));
         let result: Arc<Mutex<Option<Vec<ExportOutcome>>>> = Arc::new(Mutex::new(None));
@@ -3177,250 +4955,621 @@ impl KaraokeApp {
 
         self.status = "Exporting…".to_string();
         self.show_export_dialog = false;
-        self.combined_export = Some(CombinedExportHandle { progress, result });
+        self.combined_export = Some(CombinedExportHandle {
+            progress,
+            result,
+            folder: folder.clone(),
+        });
 
         std::thread::spawn(move || {
-            let mut outcomes = Vec::new();
-
-            // Equal-weighted phases across whatever was selected - video
-            // reports its own fine-grained sub-progress within its slice
-            // (usually the slowest step by far), the others just jump from
-            // 0% to 100% of their slice on completion.
-            let phase_count = do_cdg as u32
-                + do_lrc as u32
-                + do_ultrastar as u32
-                + do_video as u32
-                + do_instrumental as u32
-                + do_vocals as u32;
-            let phase_count = phase_count.max(1);
-            let mut phase_index = 0u32;
-            let set_progress = move |idx: u32, frac_within: f32| {
-                let overall = (idx as f32 + frac_within.clamp(0.0, 1.0)) / phase_count as f32;
-                progress_clone.store((overall * 1000.0) as u32, Ordering::Relaxed);
-            };
-
-            // Auto-pair the loaded audio next to whichever of .cdg/.lrc/
-            // UltraStar's .txt actually gets written (same base filename,
-            // in the same folder) so it's ready for pickup by a karaoke
-            // player/game without a manual copy or rename - all of these
-            // resolve to the *same* paired-audio destination for a given
-            // base name/folder, so this only needs to run once even if
-            // several of them are selected together.
-            let mut paired_audio_sibling: Option<PathBuf> = None;
-
-            if do_cdg {
-                let bytes = export::render_cdg_with_settings(
-                    &timed,
-                    &backing,
-                    total_duration,
-                    &cdg_palette,
-                    title.as_deref(),
-                    artist.as_deref(),
-                    &timing_settings,
-                );
-                let r = std::fs::write(&cdg_path, &bytes)
-                    .map(|()| cdg_path.clone())
-                    .map_err(|e| e.to_string());
-                if r.is_ok() {
-                    paired_audio_sibling.get_or_insert_with(|| cdg_path.clone());
-                }
-                outcomes.push(ExportOutcome {
-                    label: "CDG file",
-                    result: r,
-                });
-
-                phase_index += 1;
-                set_progress(phase_index, 0.0);
-            }
-
-            if do_lrc {
-                let text = formats::export_lrc(
-                    &lrc_lines,
-                    lrc_enhanced,
-                    title.as_deref(),
-                    artist.as_deref(),
-                );
-                let r = std::fs::write(&lrc_path, text)
-                    .map(|()| lrc_path.clone())
-                    .map_err(|e| e.to_string());
-                if r.is_ok() {
-                    paired_audio_sibling.get_or_insert_with(|| lrc_path.clone());
-                }
-                outcomes.push(ExportOutcome {
-                    label: "LRC lyrics",
-                    result: r,
-                });
-
-                phase_index += 1;
-                set_progress(phase_index, 0.0);
-            }
-
-            if do_ultrastar {
-                // UltraStar's `#MP3:` header is a bare filename relative to
-                // the note file's own folder, not a path - it needs to
-                // match whatever the paired-audio copy below actually ends
-                // up named as.
-                let mp3_filename = audio_path.as_ref().and_then(|a| {
-                    export::paired_audio_path(a, &ultrastar_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                });
-                let text = formats::export_ultrastar(
-                    &timed,
-                    title.as_deref(),
-                    artist.as_deref(),
-                    mp3_filename.as_deref(),
-                );
-                let r = std::fs::write(&ultrastar_path, text)
-                    .map(|()| ultrastar_path.clone())
-                    .map_err(|e| e.to_string());
-                if r.is_ok() {
-                    paired_audio_sibling.get_or_insert_with(|| ultrastar_path.clone());
-                }
-                outcomes.push(ExportOutcome {
-                    label: "UltraStar lyrics",
-                    result: r,
-                });
-
-                phase_index += 1;
-                set_progress(phase_index, 0.0);
-            }
-
-            if let Some(sibling) = &paired_audio_sibling {
-                if let Some(audio_path) = &audio_path {
-                    let paired =
-                        export::copy_paired_audio(audio_path, sibling).map_err(|e| e.to_string());
-                    outcomes.push(ExportOutcome {
-                        label: "Paired audio",
-                        result: paired,
-                    });
-                }
-            }
-
-            // Vocal separation is shared: if the instrumental export, the
-            // vocals export, and/or the video's "remove vocals" are all
-            // requested together, run the (slow) separation model exactly
-            // once - both stems come out of that single pass (see
-            // `vocals.rs`), so there's never a reason to separate the same
-            // song twice, no matter how many of these are picked.
-            let need_separation = do_instrumental || do_vocals || remove_vocals_for_video;
-            let shared_separation: Option<Result<vocals::Separation, String>> = if need_separation {
-                audio_path.as_ref().map(|audio_path| {
-                    vocals::load_separator()
-                        .and_then(|mut sep| vocals::separate(&mut sep, audio_path, |_| {}))
-                        .map_err(|e| e.to_string())
-                })
-            } else {
-                None
-            };
-
-            if do_instrumental {
-                let r = match &shared_separation {
-                    Some(Ok(sep)) => vocals::write_stem_to_file(
-                        &sep.instrumental,
-                        sep.sample_rate,
-                        &instrumental_path,
-                    )
-                    .map(|()| instrumental_path.clone())
-                    .map_err(|e| e.to_string()),
-                    Some(Err(e)) => Err(e.clone()),
-                    None => Err("no audio loaded".to_string()),
-                };
-                outcomes.push(ExportOutcome {
-                    label: "Instrumental audio",
-                    result: r,
-                });
-                phase_index += 1;
-                set_progress(phase_index, 0.0);
-            }
-
-            if do_vocals {
-                let r = match &shared_separation {
-                    Some(Ok(sep)) => {
-                        vocals::write_stem_to_file(&sep.vocals, sep.sample_rate, &vocals_path)
-                            .map(|()| vocals_path.clone())
-                            .map_err(|e| e.to_string())
-                    }
-                    Some(Err(e)) => Err(e.clone()),
-                    None => Err("no audio loaded".to_string()),
-                };
-                outcomes.push(ExportOutcome {
-                    label: "Vocals audio",
-                    result: r,
-                });
-                phase_index += 1;
-                set_progress(phase_index, 0.0);
-            }
-
-            if do_video {
-                let video_result: Result<PathBuf, String> = (|| {
-                    let audio_path = audio_path
-                        .as_ref()
-                        .ok_or_else(|| "no audio loaded".to_string())?;
-
-                    let mut own_temp: Option<PathBuf> = None;
-                    let render_audio_path: PathBuf = if remove_vocals_for_video {
-                        let tmp = std::env::temp_dir().join(format!(
-                            "abyssal-cdg-instrumental-{}.wav",
-                            std::process::id()
-                        ));
-                        match &shared_separation {
-                            Some(Ok(sep)) => {
-                                vocals::write_stem_to_file(
-                                    &sep.instrumental,
-                                    sep.sample_rate,
-                                    &tmp,
-                                )
-                                .map_err(|e| format!("Vocal removal failed: {e}"))?;
-                            }
-                            Some(Err(e)) => return Err(format!("Vocal removal failed: {e}")),
-                            None => return Err("Vocal removal failed: no audio loaded".to_string()),
-                        }
-                        own_temp = Some(tmp.clone());
-                        tmp
-                    } else {
-                        audio_path.clone()
-                    };
-
-                    let video_phase = phase_index;
-                    let r = video::render_video(
-                        &timed,
-                        &backing,
-                        total_duration,
-                        &video_palette,
-                        title.as_deref(),
-                        artist.as_deref(),
-                        resolution,
-                        video_codec,
-                        30,
-                        &render_audio_path,
-                        background.as_ref(),
-                        background_fit,
-                        background_dim,
-                        custom_font_bytes,
-                        &video_path,
-                        &timing_settings,
-                        show_credit_line,
-                        |p| set_progress(video_phase, p),
-                    );
-
-                    if let Some(tmp) = &own_temp {
-                        let _ = std::fs::remove_file(tmp);
-                    }
-
-                    r.map(|()| video_path.clone()).map_err(|e| e.to_string())
-                })();
-
-                outcomes.push(ExportOutcome {
-                    label: "Video",
-                    result: video_result,
-                });
-                phase_index += 1;
-                set_progress(phase_index, 0.0);
-            }
-
+            let outcomes = run_export(&inputs, &opts, &folder, &base, &|p| {
+                progress_clone.store((p * 1000.0) as u32, Ordering::Relaxed)
+            });
             *result_clone.lock().unwrap() = Some(outcomes);
         });
+    }
+
+    /// Starts a batch export of [`Self::batch_projects`] with the export
+    /// dialog's current choices, into the chosen export folder - see
+    /// [`run_batch_export`]. Shares the single-export progress bar.
+    fn start_batch_export(&mut self) {
+        if self.combined_export.is_some() {
+            self.status = "An export is already in progress.".to_string();
+            return;
+        }
+        let opts = self.export_options();
+        if !opts.any() {
+            self.status = "Choose at least one output to export.".to_string();
+            return;
+        }
+        let Some(folder) = self.export_folder.clone() else {
+            self.status = "Choose an output folder first.".to_string();
+            return;
+        };
+        if self.batch_projects.is_empty() {
+            self.status = "Choose the project files to batch export first.".to_string();
+            return;
+        }
+        let projects = self.batch_projects.clone();
+        let progress = Arc::new(AtomicU32::new(0));
+        let result: Arc<Mutex<Option<Vec<ExportOutcome>>>> = Arc::new(Mutex::new(None));
+        let progress_clone = progress.clone();
+        let result_clone = result.clone();
+        self.status = format!("Batch exporting {} project(s)…", projects.len());
+        self.batch_running = true;
+        self.show_export_dialog = false;
+        self.combined_export = Some(CombinedExportHandle {
+            progress,
+            result,
+            folder: folder.clone(),
+        });
+        std::thread::spawn(move || {
+            let outcomes = run_batch_export(&projects, &opts, &folder, &|p| {
+                progress_clone.store((p * 1000.0) as u32, Ordering::Relaxed)
+            });
+            *result_clone.lock().unwrap() = Some(outcomes);
+        });
+    }
+
+    /// Notices when the status message changes (any of the ~100 places
+    /// that set it), classifies it, and starts a toast for anything that
+    /// isn't routine Info.
+    fn track_status(&mut self) {
+        if self.status == self.status_seen {
+            return;
+        }
+        self.status_seen = self.status.clone();
+        self.status_kind = classify_status(&self.status);
+        self.toast_until = self
+            .status_kind
+            .toast_secs()
+            .filter(|_| !self.status.is_empty())
+            .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f32(secs));
+    }
+
+    /// "📂 Open folder" for the last export's folder, if there was one.
+    fn open_folder_button(&mut self, ui: &mut egui::Ui) {
+        if let Some(dir) = self.last_export_folder.clone() {
+            if ui
+                .small_button("📂 Open folder")
+                .on_hover_text(dir.display().to_string())
+                .clicked()
+            {
+                if let Err(e) = open_in_file_manager(&dir) {
+                    self.status = format!("Couldn't open the folder: {e}");
+                }
+            }
+        }
+    }
+
+    /// The toast in the bottom-right corner for the latest success/
+    /// warning/error: its first line (an export's full list stays in the
+    /// status line), fading out over its last half second. Click ✖ (or
+    /// anywhere on it) to dismiss.
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some(until) = self.toast_until else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now >= until {
+            self.toast_until = None;
+            return;
+        }
+        let remaining = (until - now).as_secs_f32();
+        let opacity = (remaining / 0.5).min(1.0);
+        let kind = self.status_kind;
+        let first_line: String = self
+            .status
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(140)
+            .collect();
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new("status_toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_opacity(opacity);
+                let color = kind.color(ui.visuals());
+                let frame = egui::Frame::popup(ui.style())
+                    .stroke(egui::Stroke::new(1.5_f32, color))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+                let resp = frame
+                    .show(ui, |ui| {
+                        ui.set_max_width(420.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{}{first_line}", kind.icon()))
+                                    .color(color)
+                                    .strong(),
+                            );
+                            self.open_folder_button(ui);
+                            if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    })
+                    .response;
+                if resp.interact(egui::Sense::click()).clicked() {
+                    dismiss = true;
+                }
+            });
+        if dismiss {
+            self.toast_until = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// "01:23.4 / 05:06.4" next to the seek bar. Click it to type a time
+    /// (MM:SS.SS, or plain seconds) and press Enter to jump there; Escape
+    /// or clicking away cancels.
+    fn draw_time_readout(&mut self, ui: &mut egui::Ui, duration: Option<f64>) {
+        let pos = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
+        let total = format_time(duration.unwrap_or(0.0));
+        match self.time_jump_edit.as_mut() {
+            Some(text) => {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .desired_width(70.0)
+                        .hint_text("MM:SS"),
+                );
+                resp.request_focus();
+                ui.label(format!("/ {total}"));
+                if resp.lost_focus() {
+                    let entered = text.trim().to_string();
+                    let commit = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    self.time_jump_edit = None;
+                    if commit && !entered.is_empty() {
+                        match parse_jump_time(&entered) {
+                            Some(t) => {
+                                if let Some(a) = &mut self.audio {
+                                    if let Err(e) = a.seek(t) {
+                                        self.status = format!("Seek error: {e}");
+                                    }
+                                }
+                            }
+                            None => {
+                                self.status =
+                                    format!("Couldn't read \"{entered}\" as a time (try MM:SS.SS).")
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} / {total}", format_time(pos)))
+                                .monospace(),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Click to type a time to jump to.")
+                    .on_hover_cursor(egui::CursorIcon::Text)
+                    .clicked()
+                {
+                    self.time_jump_edit = Some(format_time(pos));
+                }
+            }
+        }
+    }
+
+    /// Opens the Copy timing dialog for the checked lines, pointed at the
+    /// next place they repeat (see `lyrics::find_repeat`), else the lines
+    /// right after them.
+    fn open_copy_timing_dialog(&mut self) {
+        let sources: Vec<usize> = self.selected_lines.iter().copied().collect();
+        let Some(&last) = sources.last() else { return };
+        let n = sources.len();
+        let first_target = lyrics::find_repeat(&self.lines, &sources)
+            .unwrap_or((last + 1).min(self.lines.len().saturating_sub(n)));
+        self.copy_dialog = Some(CopyTimingDialog {
+            sources,
+            first_target,
+        });
+    }
+
+    /// Runs the copy (see `lyrics::copy_timing`) with the repeat starting at
+    /// `start`, reporting the outcome; closes the dialog on success.
+    fn apply_copy_timing(&mut self, start: f64) {
+        let Some(d) = &self.copy_dialog else { return };
+        let (sources, first) = (d.sources.clone(), d.first_target);
+        let n = sources.len();
+        match lyrics::copy_timing(&mut self.lines, &sources, first, start) {
+            Ok(differing) => {
+                self.recompute_next_untimed();
+                self.audition_seek(start);
+                self.status = format!(
+                    "Copied the timing of {n} line(s) onto lines {}-{}.{}",
+                    first + 1,
+                    first + n,
+                    if differing > 0 {
+                        format!(
+                            " {differing} of them have different words, so only their line \
+                             start/end were copied."
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+                self.copy_dialog = None;
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// The Copy timing dialog: which lines are copied, where to (with a
+    /// line-by-line preview of whether the words match), and when the
+    /// repeat starts - its existing start, or tapped live while playing.
+    fn draw_copy_timing_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = &self.copy_dialog else { return };
+        let sources = d.sources.clone();
+        let mut first_target = d.first_target;
+        let n = sources.len();
+        let len = self.lines.len();
+        let mut open = true;
+        let mut apply_at: Option<f64> = None;
+        let mut cancel = false;
+        egui::Window::new("📋 Copy timing")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let src_start = sources.first().and_then(|&i| self.lines[i].start);
+                ui.label(format!(
+                    "Copy the timing of {n} line(s), starting at line {} ({}), onto the repeat \
+                     starting at line:",
+                    sources[0] + 1,
+                    src_start.map(lyrics::format_timecode).unwrap_or_default()
+                ));
+                ui.horizontal(|ui| {
+                    let mut shown = first_target + 1;
+                    ui.add(egui::DragValue::new(&mut shown).range(1..=len.saturating_sub(n) + 1));
+                    first_target = shown.saturating_sub(1).min(len.saturating_sub(n));
+                    if ui
+                        .small_button("Find repeat")
+                        .on_hover_text("Jump to the next lines with the same words.")
+                        .clicked()
+                    {
+                        if let Some(j) = lyrics::find_repeat(&self.lines, &sources) {
+                            first_target = j;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                egui::Grid::new("copy_timing_preview")
+                    .num_columns(3)
+                    .spacing([10.0, 2.0])
+                    .show(ui, |ui| {
+                        for (k, &src) in sources.iter().enumerate() {
+                            let Some(dst) = self.lines.get(first_target + k) else {
+                                break;
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}. {}",
+                                    src + 1,
+                                    lyrics::normalize_text(&self.lines[src].text)
+                                ))
+                                .weak(),
+                            );
+                            ui.label(format!(
+                                "→ {}. {}",
+                                first_target + k + 1,
+                                lyrics::normalize_text(&dst.text)
+                            ));
+                            let same_units = lyrics::timing_units(&dst.text).len()
+                                == lyrics::timing_units(&self.lines[src].text).len();
+                            if same_units {
+                                ui.colored_label(STEP_DONE, "✔").on_hover_text(
+                                    "Same number of words - every word's timing is copied.",
+                                );
+                            } else {
+                                ui.colored_label(egui::Color32::from_rgb(230, 160, 40), "≠")
+                                    .on_hover_text(
+                                        "Different words - only the line's start/end is \
+                                         copied; its words go back to the estimate.",
+                                    );
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.label("The repeat starts:");
+                let target_start = self.lines.get(first_target).and_then(|l| l.start);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(t) = target_start {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!(
+                                        "Where line {} already starts ({})",
+                                        first_target + 1,
+                                        lyrics::format_timecode(t)
+                                    ))
+                                    .color(egui::Color32::WHITE),
+                                )
+                                .fill(ACCENT),
+                            )
+                            .clicked()
+                        {
+                            apply_at = Some(t);
+                        }
+                        ui.label("or");
+                    }
+                    let playing = self.audio.as_ref().is_some_and(|a| a.is_playing());
+                    ui.add_enabled_ui(playing, |ui| {
+                        if ui
+                            .button("⏱ It starts now")
+                            .on_hover_text(
+                                "While the song plays, click the instant the repeat's first \
+                                 line starts being sung.",
+                            )
+                            .clicked()
+                        {
+                            if let Some(a) = &self.audio {
+                                apply_at = Some(compensate_tap(
+                                    a.position(),
+                                    self.prefs.tap_latency_ms,
+                                    a.speed(),
+                                ));
+                            }
+                        }
+                    });
+                    if !playing {
+                        ui.label(
+                            egui::RichText::new("(play the song to tap it)")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        if let Some(d) = &mut self.copy_dialog {
+            d.first_target = first_target;
+        }
+        if !open || cancel {
+            self.copy_dialog = None;
+        } else if let Some(t) = apply_at {
+            self.apply_copy_timing(t);
+        }
+    }
+
+    /// Applies the saved UI size and the app's accent color on the first
+    /// frame; afterwards, saves the UI size whenever it changes (the top
+    /// panel's buttons, or egui's own Ctrl+= / Ctrl+- / Ctrl+0).
+    fn sync_ui_style(&mut self, ctx: &egui::Context) {
+        // A zoom change only takes effect at the start of a later frame, so
+        // the first few frames after applying the saved size are left alone -
+        // otherwise a not-yet-applied size could be "noticed" as a change
+        // and saved over the user's setting.
+        const SETTLE_FRAMES: u8 = 3;
+        let Some(frames) = self.ui_style_frames else {
+            self.ui_style_frames = Some(0);
+            ctx.set_zoom_factor(self.prefs.ui_zoom);
+            ctx.style_mut(|style| {
+                // Selected items, slider/progress fills and text selection
+                // in the accent purple - the same color as the primary
+                // buttons and the step bar's current step.
+                style.visuals.selection.bg_fill = ACCENT;
+                style.visuals.selection.stroke.color = egui::Color32::WHITE;
+                style.visuals.hyperlink_color = egui::Color32::from_rgb(185, 150, 245);
+            });
+            return;
+        };
+        if frames < SETTLE_FRAMES {
+            self.ui_style_frames = Some(frames + 1);
+            return;
+        }
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.prefs.ui_zoom).abs() > 0.001 {
+            let clamped = zoom.clamp(prefs::MIN_UI_ZOOM, prefs::MAX_UI_ZOOM);
+            if (clamped - zoom).abs() > 0.001 {
+                ctx.set_zoom_factor(clamped);
+            }
+            self.prefs.ui_zoom = clamped;
+            prefs::save(APP_ID, &self.prefs);
+        }
+    }
+
+    fn workflow_snapshot(&self) -> WorkflowSnapshot {
+        WorkflowSnapshot {
+            has_audio: self.audio.as_ref().is_some_and(|a| a.is_loaded()),
+            has_lyrics_text: !self.lyrics_raw.trim().is_empty(),
+            lines: self.lines.len(),
+            timed: self.lines.iter().filter(|l| l.start.is_some()).count(),
+            estimated: checks::lines_on_estimated_timing(&self.lines).len(),
+            exported: self.exported_this_project,
+        }
+    }
+
+    /// The step bar across the top: Audio → Lyrics → Tap → Fine-tune →
+    /// Export, each ticked off as it's done, then one highlighted "Next"
+    /// line saying what to do now, with a button that does it.
+    fn draw_step_bar(&mut self, ui: &mut egui::Ui) {
+        let snap = self.workflow_snapshot();
+        let (statuses, next) = workflow_status(&snap);
+        ui.horizontal_wrapped(|ui| {
+            for (k, (step, status)) in WorkflowStep::ALL.iter().zip(statuses).enumerate() {
+                if k > 0 {
+                    ui.label(egui::RichText::new("›").weak());
+                }
+                let (fill, text_color, mark) = match status {
+                    StepStatus::Done => (STEP_DONE, egui::Color32::WHITE, "✔".to_string()),
+                    StepStatus::Current => (ACCENT, egui::Color32::WHITE, format!("{}", k + 1)),
+                    StepStatus::Optional => (
+                        ui.visuals().faint_bg_color,
+                        ui.visuals().weak_text_color(),
+                        "◇".to_string(),
+                    ),
+                    StepStatus::Todo => (
+                        ui.visuals().faint_bg_color,
+                        ui.visuals().weak_text_color(),
+                        format!("{}", k + 1),
+                    ),
+                };
+                let mut label = format!("{mark}  {}", step.label());
+                if *step == WorkflowStep::Tap && snap.lines > 0 && status != StepStatus::Done {
+                    label.push_str(&format!("  {}/{}", snap.timed, snap.lines));
+                }
+                egui::Frame::none()
+                    .fill(fill)
+                    .rounding(10.0)
+                    .inner_margin(egui::Margin::symmetric(10.0, 3.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(label).color(text_color).strong());
+                    })
+                    .response
+                    .on_hover_text(step.hint());
+            }
+        });
+
+        // The "Next" line.
+        let all_done = statuses.iter().all(|s| *s == StepStatus::Done);
+        let message = match next {
+            WorkflowStep::Audio => {
+                "Next: load the song's audio file (or drop it onto the window).".to_string()
+            }
+            WorkflowStep::Lyrics if snap.has_lyrics_text => {
+                "Next: click Parse lyrics to turn the pasted text into lines.".to_string()
+            }
+            WorkflowStep::Lyrics => "Next: paste the lyrics into box 1 on the left (one line \
+                                     per line of text), or load a lyrics file."
+                .to_string(),
+            WorkflowStep::Tap => format!(
+                "Next: press Play and tap Space the instant each line starts, and again when \
+                 it ends - {} of {} line(s) timed so far.",
+                snap.timed, snap.lines
+            ),
+            _ if all_done => "Exported! Keep tweaking and export again any time.".to_string(),
+            _ if snap.estimated > 0 => format!(
+                "Every line is timed - export now, or first fine-tune the word timing of {} \
+                 line(s) (click words as they're sung, or Auto-align).",
+                snap.estimated
+            ),
+            _ => "Everything's timed - ready to export.".to_string(),
+        };
+        egui::Frame::none()
+            .stroke(egui::Stroke::new(1.0_f32, ACCENT))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(message).strong());
+                    let primary = |text: &str| {
+                        egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
+                            .fill(ACCENT)
+                    };
+                    match next {
+                        WorkflowStep::Audio => {
+                            if ui.add(primary("🎵 Load audio…")).clicked() {
+                                self.load_audio_dialog();
+                            }
+                        }
+                        WorkflowStep::Lyrics if snap.has_lyrics_text => {
+                            if ui.add(primary("Parse lyrics")).clicked() {
+                                self.parse_lyrics();
+                            }
+                        }
+                        WorkflowStep::Lyrics => {
+                            if ui.add(primary("Load lyrics file…")).clicked() {
+                                self.load_lyrics_file_dialog();
+                            }
+                        }
+                        WorkflowStep::Tap => {
+                            let playing = self.audio.as_ref().is_some_and(|a| a.is_playing());
+                            if !playing && ui.add(primary("▶ Start tapping")).clicked() {
+                                self.start_tapping_from_next_line();
+                            }
+                        }
+                        _ => {
+                            if ui.add(primary("Export…")).clicked() {
+                                self.open_export_dialog();
+                            }
+                            if snap.estimated > 0
+                                && self.align_job.is_none()
+                                && ui
+                                    .button("🪄 Auto-align words")
+                                    .on_hover_text(
+                                        "Fill in every timed line's word timing from the audio.",
+                                    )
+                                    .clicked()
+                            {
+                                self.start_word_alignment();
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
+    /// The step bar's "Start tapping": plays from a couple of seconds
+    /// before the last tapped point (the start of the song if nothing is
+    /// tapped yet), so picking up where you left off is one click.
+    fn start_tapping_from_next_line(&mut self) {
+        let resume = self.lines[..self.next_untimed.min(self.lines.len())]
+            .iter()
+            .rev()
+            .filter(|l| !l.is_backing)
+            .find_map(|l| l.sing_end_override.or(l.start))
+            .map(|t| (t - 2.0).max(0.0))
+            .unwrap_or(0.0);
+        self.seek_and_play(resume);
+        self.status = "Tap Space the instant each line starts, and again when it ends.".to_string();
+    }
+
+    /// The export dialog's current "what to export, and how" choices.
+    fn export_options(&self) -> ExportOptions {
+        ExportOptions {
+            cdg: self.export_cdg,
+            lrc: self.export_lrc,
+            ultrastar: self.export_ultrastar,
+            ass: self.export_ass,
+            srt: self.export_srt,
+            video: self.export_video,
+            instrumental: self.export_instrumental,
+            vocals: self.export_vocals,
+            zip: self.export_cdg_zip,
+            zip_instrumental: self.zip_instrumental,
+            lrc_enhanced: self.lrc_enhanced_words,
+            remove_vocals_for_video: self.remove_vocals_for_video,
+            instrumental_ext: self.instrumental_format.extension(),
+        }
+    }
+
+    /// Everything about the open song an export needs (see [`ExportInputs`]).
+    fn export_inputs(&self) -> ExportInputs {
+        ExportInputs {
+            lines: self.lines.clone(),
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            colors: self.export_colors(),
+            timing_settings: self.timing_settings,
+            video_resolution: self.video_resolution,
+            video_codec: self.video_codec,
+            video_style: self.video_style,
+            outro: self.outro.clone(),
+            show_credit_line: self.show_credit_line,
+            background: self.background.clone(),
+            background_fit: self.background_fit,
+            background_dim: self.background_dim,
+            font_family: self.selected_font_family.clone(),
+            font_bytes: self.loaded_font_bytes(),
+            audio_path: self
+                .audio
+                .as_ref()
+                .and_then(|a| a.path())
+                .map(Path::to_path_buf),
+            audio_duration: self.audio.as_ref().and_then(|a| a.duration()),
+        }
     }
 
     /// Checks on a running combined export, if any, updating status when
@@ -3434,6 +5583,13 @@ impl KaraokeApp {
         if let Some(outcomes) = finished {
             let any_err = outcomes.iter().any(|o| o.result.is_err());
             let any_ok = outcomes.iter().any(|o| o.result.is_ok());
+            if any_ok && !self.batch_running {
+                self.exported_this_project = true;
+            }
+            if any_ok {
+                self.last_export_folder = Some(handle.folder.clone());
+            }
+            self.batch_running = false;
             let lines: Vec<String> = outcomes
                 .iter()
                 .map(|o| match &o.result {
@@ -3462,6 +5618,170 @@ impl KaraokeApp {
     /// syncing). Letterboxed to 16:9 on black, so it can be resized or
     /// maximized to any shape. Closing the window docks the preview back
     /// into the right panel.
+    /// The export dialog's pre-export checklist (see `checks.rs`): a
+    /// collapsible list of warnings/notes for whatever's about to be
+    /// exported, each with a "Show" button (jumps to the line) and, where
+    /// there's an obvious fix, a button for that. Never blocks exporting.
+    fn draw_export_checklist(&mut self, ui: &mut egui::Ui) {
+        let targets = checks::Targets {
+            cdg: self.export_cdg,
+            timed: self.any_timed_export(),
+        };
+        if !targets.cdg && !targets.timed {
+            return;
+        }
+        let duration = self.audio.as_ref().and_then(|a| a.duration());
+        let mut issues = checks::run(
+            &self.lines,
+            &self.title,
+            &self.artist,
+            &self.timing_settings,
+            duration,
+            targets,
+        );
+        // Color readability (see the Colors panel) - only for outputs that
+        // show colors.
+        if self.export_cdg || self.export_video || self.export_ass {
+            for warning in color_warnings(&self.export_colors(), &self.voices_in_use()) {
+                issues.push(checks::Issue {
+                    severity: checks::Severity::Note,
+                    message: format!("Colors: {warning}"),
+                    line: None,
+                    fix: None,
+                });
+            }
+        }
+        let warnings = issues
+            .iter()
+            .filter(|i| i.severity == checks::Severity::Warning)
+            .count();
+        let notes = issues.len() - warnings;
+        let amber = egui::Color32::from_rgb(230, 160, 40);
+        ui.add_space(6.0);
+        if issues.is_empty() {
+            ui.label("✅ Checklist: nothing to fix.");
+            return;
+        }
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        let header = match (warnings, notes) {
+            (0, n) => format!("ℹ Checklist: {}", plural(n, "note")),
+            (w, 0) => format!("⚠ Checklist: {}", plural(w, "warning")),
+            (w, n) => format!(
+                "⚠ Checklist: {}, {}",
+                plural(w, "warning"),
+                plural(n, "note")
+            ),
+        };
+        let mut show_line = None;
+        let mut fix = None;
+        egui::CollapsingHeader::new(egui::RichText::new(header).color(if warnings > 0 {
+            amber
+        } else {
+            ui.visuals().text_color()
+        }))
+        .id_source("export_checklist")
+        .default_open(warnings > 0)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Worth a look before exporting - none of these stop the export.",
+                )
+                .small()
+                .weak(),
+            );
+            egui::ScrollArea::vertical()
+                .id_source("export_checklist_scroll")
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    for issue in &issues {
+                        ui.horizontal_wrapped(|ui| {
+                            match issue.severity {
+                                checks::Severity::Warning => ui.colored_label(amber, "⚠"),
+                                checks::Severity::Note => ui.label("ℹ"),
+                            };
+                            ui.label(&issue.message);
+                            if let Some(i) = issue.line {
+                                if ui.small_button("Show").clicked() {
+                                    show_line = Some(i);
+                                }
+                            }
+                            if let Some(checks::Fix::SplitLine(i)) = issue.fix {
+                                if ui
+                                    .small_button("Split line")
+                                    .on_hover_text(
+                                        "Split it into two lines at the middle word, keeping \
+                                         its timing - updates the lyrics box too. Ctrl+Z \
+                                         undoes it.",
+                                    )
+                                    .clicked()
+                                {
+                                    fix = Some(checks::Fix::SplitLine(i));
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+                });
+        });
+        if let Some(i) = show_line {
+            self.show_line(i);
+        }
+        if let Some(checks::Fix::SplitLine(i)) = fix {
+            self.split_line_in_two(i);
+        }
+    }
+
+    /// Brings line `i` into view: opens it in the fine-tune panel, scrolls
+    /// the timing table to it, and moves playback to just before it.
+    fn show_line(&mut self, i: usize) {
+        if i >= self.lines.len() {
+            return;
+        }
+        self.word_tap_line = Some(i);
+        self.timing_table_scroll_request = Some(i);
+        if let Some((start, _)) = self.line_bounds(i) {
+            if let Some(a) = &mut self.audio {
+                let _ = a.seek((start - 1.0).max(0.0));
+            }
+        }
+        self.status = format!("Line {}: {}", i + 1, self.lines[i].text);
+    }
+
+    /// The checklist's "Split line" fix - see `lyrics::split_line`.
+    fn split_line_in_two(&mut self, i: usize) {
+        let Some(line) = self.lines.get(i) else {
+            return;
+        };
+        let Some(at_word) = lyrics::best_split_word(&line.text) else {
+            return;
+        };
+        // When the second half's first word is highlighted - manual or
+        // estimated - becomes the split point in time.
+        let split_time = self.resolved_timed_line(i).and_then(|t| {
+            lyrics::word_timings(&t)
+                .get(at_word)
+                .map(|w| w.highlight_at)
+        });
+        match lyrics::split_line(
+            &mut self.lines,
+            &mut self.lyrics_raw,
+            i,
+            at_word,
+            split_time,
+        ) {
+            Ok(()) => {
+                self.lyrics_edited_span = None;
+                self.selected_lines.clear();
+                if self.word_tap_line.is_some_and(|w| w > i) {
+                    self.word_tap_line = self.word_tap_line.map(|w| w + 1);
+                }
+                self.recompute_next_untimed();
+                self.status = format!("Split line {} into lines {} and {}.", i + 1, i + 1, i + 2);
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
     fn show_preview_window(&mut self, ctx: &egui::Context) {
         let builder = egui::ViewportBuilder::default()
             .with_title("Abyssal CDG Creator - Preview")
@@ -3494,7 +5814,11 @@ impl KaraokeApp {
                     .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
                         let avail = ui.available_size();
-                        let height = avail.x.min(avail.y * 16.0 / 9.0) * 9.0 / 16.0;
+                        let aspect = match self.video_style.orientation {
+                            video::Orientation::Landscape => 16.0 / 9.0,
+                            video::Orientation::Portrait => 9.0 / 16.0,
+                        };
+                        let height = avail.x.min(avail.y * aspect) / aspect;
                         ui.add_space(((avail.y - height) / 2.0).max(0.0));
                         ui.vertical_centered(|ui| self.draw_preview(ui, Some(avail.y)));
                     });
@@ -3521,6 +5845,12 @@ impl KaraokeApp {
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
             self.save_project_as_dialog();
         }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
+            self.open_export_dialog();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_shortcuts = !self.show_shortcuts;
+        }
 
         // Keyboard shortcuts - only when no text field etc. has focus, so
         // typing a space in the lyrics box or title/artist fields doesn't
@@ -3534,6 +5864,8 @@ impl KaraokeApp {
                 // mouse while fine-tuning with the timeline/word panel.
                 if self.next_untimed >= self.lines.len() {
                     self.toggle_play_pause();
+                } else if ctx.input(|i| i.modifiers.shift) {
+                    self.tap_end_and_start_next();
                 } else {
                     self.tap_next();
                 }
@@ -3589,9 +5921,154 @@ impl KaraokeApp {
             if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Screaming);
             }
+            if ctx.input(|i| i.key_pressed(egui::Key::L) && !i.modifiers.command) {
+                self.toggle_loop_line(None);
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::B) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Backing);
             }
+            if ctx.input(|i| i.key_pressed(egui::Key::Questionmark)) {
+                self.show_shortcuts = !self.show_shortcuts;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+                if let Some(a) = &mut self.audio {
+                    let _ = a.seek(0.0);
+                }
+            }
+            // , / . nudge the current line's start; with Shift, shift the
+            // whole selection (start, end and word timing together).
+            for (key, delta) in [(egui::Key::Comma, -0.1), (egui::Key::Period, 0.1)] {
+                let (pressed, shift) = ctx.input(|i| {
+                    (
+                        i.key_pressed(key) && !i.modifiers.command,
+                        i.modifiers.shift,
+                    )
+                });
+                if !pressed {
+                    continue;
+                }
+                if shift {
+                    self.shift_selection(delta);
+                } else if let Some(i) = self.edit_target() {
+                    self.nudge_line_start(i, delta);
+                } else {
+                    self.status = "Tap a line (or click one in the table) to nudge it.".to_string();
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.command) {
+                match self.edit_target() {
+                    Some(i) if self.lines[i].is_backing => self.tap_backing_line(i),
+                    Some(i) => self.retap_line(i),
+                    None => {
+                        self.status = "Click a line in the table first, then press Enter to \
+                                       re-tap it."
+                            .to_string()
+                    }
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+                if let Some(i) = self.edit_target() {
+                    self.lines[i].start = None;
+                    self.lines[i].sing_end_override = None;
+                    self.recompute_next_untimed();
+                    self.status = format!("Cleared line {}'s timing (Ctrl+Z to undo).", i + 1);
+                }
+            }
+        }
+    }
+
+    /// The line keyboard edits (nudge, re-tap, clear) apply to: the one open
+    /// in the fine-tune panel, else the most recently tapped main line.
+    fn edit_target(&self) -> Option<usize> {
+        if let Some(i) = self.word_tap_line.filter(|&i| i < self.lines.len()) {
+            return Some(i);
+        }
+        let upto = self.next_untimed.min(self.lines.len());
+        (0..upto)
+            .rev()
+            .find(|&i| !self.lines[i].is_backing && self.lines[i].start.is_some())
+    }
+
+    /// Moves line `i`'s start by `delta` seconds (the table's -0.1s/+0.1s
+    /// and the , / . keys), checked like a typed time so it can't cross
+    /// the previous line's end or its own end, then replays from just
+    /// before it so you hear the change.
+    fn nudge_line_start(&mut self, i: usize, delta: f64) {
+        let Some(start) = self.lines.get(i).and_then(|l| l.start) else {
+            self.status = format!("Line {} isn't timed yet - tap its start first.", i + 1);
+            return;
+        };
+        let new_start = (start + delta).max(0.0);
+        match lyrics::check_start_change(&self.lines, i, new_start) {
+            Ok(()) => {
+                self.lines[i].start = Some(new_start);
+                self.audition_seek(new_start);
+                self.status = format!(
+                    "Line {} starts at {}.",
+                    i + 1,
+                    lyrics::format_timecode(new_start)
+                );
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Shifts the selected lines (table checkboxes) by `delta` seconds - the
+    /// same as the "Shift selection" buttons, from Shift+, / Shift+.
+    fn shift_selection(&mut self, delta: f64) {
+        if self.selected_lines.is_empty() {
+            self.status = "Select lines with the table's checkboxes first.".to_string();
+            return;
+        }
+        let indices: Vec<usize> = self.selected_lines.iter().copied().collect();
+        self.status = match lyrics::shift_lines(&mut self.lines, &indices, delta) {
+            Ok(n) => format!(
+                "Shifted {n} line(s) {} by {:.2}s.",
+                if delta < 0.0 { "earlier" } else { "later" },
+                delta.abs()
+            ),
+            Err(e) => e,
+        };
+    }
+
+    /// The keyboard-shortcut cheat sheet (F1 / ?), from [`SHORTCUTS`].
+    fn draw_shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("⌨ Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Single-key shortcuts work whenever you're not typing in a text box. \
+                         \"Current line\" = the line open in the fine-tune panel, else the \
+                         one you tapped last.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                for (group, keys) in SHORTCUTS {
+                    ui.add_space(6.0);
+                    ui.strong(*group);
+                    egui::Grid::new(("shortcuts", *group))
+                        .num_columns(2)
+                        .spacing([16.0, 3.0])
+                        .show(ui, |ui| {
+                            for (key, what) in *keys {
+                                ui.label(egui::RichText::new(*key).monospace().color(ACCENT));
+                                ui.label(*what);
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+        if !open {
+            self.show_shortcuts = false;
         }
     }
 
@@ -3605,23 +6082,189 @@ impl KaraokeApp {
     ///
     /// Fills the available width at 16:9; `max_height`, when given (the
     /// popped-out preview window), also caps it to fit that height.
-    fn draw_preview(&mut self, ui: &mut egui::Ui, max_height: Option<f32>) {
+    /// Hash of everything the `.cdg` export depends on - lyric lines and
+    /// their timing, palette, title/artist, timing settings and song length.
+    fn cdg_preview_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(&self.lines)
+            .unwrap_or_default()
+            .hash(&mut h);
+        format!("{:?}", self.palette()).hash(&mut h);
+        format!("{:?}", self.timing_settings).hash(&mut h);
+        format!("{:?}", self.outro).hash(&mut h);
+        self.title.trim().hash(&mut h);
+        self.artist.trim().hash(&mut h);
+        self.audio
+            .as_ref()
+            .and_then(|a| a.duration())
+            .map(f64::to_bits)
+            .hash(&mut h);
+        h.finish()
+    }
+
+    /// Keeps the `.cdg` preview's decoded stream up to date: re-hashes the
+    /// inputs at most every [`CDG_PREVIEW_RECHECK`], starts a background
+    /// render when they changed (one at a time - a newer change waits for
+    /// the running one, then renders again), and installs finished ones.
+    /// Returns true while a render is in flight.
+    fn update_cdg_preview(&mut self, ctx: &egui::Context) -> bool {
+        let now = std::time::Instant::now();
+        let due = self
+            .cdg_preview
+            .last_check
+            .is_none_or(|t| now.duration_since(t) >= CDG_PREVIEW_RECHECK);
+        if due {
+            self.cdg_preview.last_check = Some(now);
+            self.cdg_preview.wanted_key = self.cdg_preview_key();
+        }
+        if let Some((key, rx)) = &self.cdg_preview.job {
+            match rx.try_recv() {
+                Ok(playback) => {
+                    self.cdg_preview.current = Some((*key, playback));
+                    self.cdg_preview.shown_pos = None;
+                    self.cdg_preview.job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.cdg_preview.job = None,
+            }
+        }
+        let wanted = self.cdg_preview.wanted_key;
+        let have = self.cdg_preview.current.as_ref().map(|(k, _)| *k);
+        if self.cdg_preview.job.is_none() && have != Some(wanted) {
+            let (timed, total) = self.resolved();
+            let backing = self.resolved_backing();
+            let palette = self.palette();
+            let settings = self.timing_settings;
+            let title = (!self.title.trim().is_empty()).then(|| self.title.trim().to_string());
+            let artist = (!self.artist.trim().is_empty()).then(|| self.artist.trim().to_string());
+            let outro = export::resolve_outro(
+                &self.outro,
+                &timed,
+                &backing,
+                total,
+                title.is_some() || artist.is_some(),
+            );
+            let (tx, rx) = std::sync::mpsc::channel();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let bytes = export::render_cdg_with_settings(
+                    &timed,
+                    &backing,
+                    total,
+                    &palette,
+                    title.as_deref(),
+                    artist.as_deref(),
+                    &settings,
+                    outro.as_ref(),
+                );
+                let _ = tx.send(cdg_decode::CdgPlayback::new(bytes));
+                repaint.request_repaint();
+            });
+            self.cdg_preview.job = Some((wanted, rx));
+        }
+        self.cdg_preview.job.is_some()
+    }
+
+    /// The preview's ".cdg (exact)" mode: the decoded `.cdg` frame at the
+    /// current playback position, scaled up with nearest-neighbor so its
+    /// real pixels stay crisp, at the format's own 300:216 shape.
+    fn draw_cdg_preview(&mut self, ui: &mut egui::Ui, max_height: Option<f32>) {
+        let rendering = self.update_cdg_preview(ui.ctx());
+        let aspect = cdg_decode::WIDTH as f32 / cdg_decode::HEIGHT as f32;
+        let width = match max_height {
+            Some(h) => ui.available_width().min(h * aspect),
+            None => ui.available_width(),
+        };
+        let size = egui::vec2(width, width / aspect);
         let t = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
-        let (timed, _total) = self.resolved();
+        if let Some((_, playback)) = &mut self.cdg_preview.current {
+            let pos = playback.seek(t);
+            if self.cdg_preview.shown_pos != Some(pos) || self.cdg_preview.texture.is_none() {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [cdg_decode::WIDTH, cdg_decode::HEIGHT],
+                    &playback.rgba(),
+                );
+                match &mut self.cdg_preview.texture {
+                    Some(tex) => tex.set(image, egui::TextureOptions::NEAREST),
+                    None => {
+                        self.cdg_preview.texture = Some(ui.ctx().load_texture(
+                            "cdg_preview",
+                            image,
+                            egui::TextureOptions::NEAREST,
+                        ))
+                    }
+                }
+                self.cdg_preview.shown_pos = Some(pos);
+            }
+        }
+        match &self.cdg_preview.texture {
+            Some(tex) => {
+                ui.image((tex.id(), size));
+            }
+            None => {
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+            }
+        }
+        if rendering {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Updating .cdg preview…").small().weak());
+            });
+        }
+    }
+
+    fn draw_preview(&mut self, ui: &mut egui::Ui, max_height: Option<f32>) {
+        let toggle_top = ui.cursor().top();
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.preview_mode, PreviewMode::Video, "Video")
+                .on_hover_text(
+                    "The video export's look: multi-line verse blocks with a smooth wipe.",
+                );
+            ui.selectable_value(&mut self.preview_mode, PreviewMode::Cdg, ".cdg (exact)")
+                .on_hover_text(
+                    "The real .cdg output, decoded exactly as a karaoke player shows it - \
+                     300x216, 16 colors, one line at a time. Updates a moment after you \
+                     change timing, colors or text.",
+                );
+        });
+        let max_height = max_height.map(|h| (h - (ui.cursor().top() - toggle_top)).max(60.0));
+        if self.preview_mode == PreviewMode::Cdg {
+            self.draw_cdg_preview(ui, max_height);
+            return;
+        }
+        let t = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
+        let (timed, total) = self.resolved();
         let backing = self.resolved_backing();
         let card_end = export::title_card_end(&timed);
+        let outro = export::resolve_outro(
+            &self.outro,
+            &timed,
+            &backing,
+            total,
+            !self.title.trim().is_empty() || !self.artist.trim().is_empty(),
+        );
 
         // Fills whatever width it's given (the right panel can be dragged
         // wide), always 16:9. Text sizes below are already proportional to
         // `height`; `s` scales the few remaining fixed pixel sizes (countdown
         // dots, small gaps) and never drops below 1.0, so a preview at or
         // below the panel's default width looks exactly as it always has.
+        // 9:16 instead when the video export is set to portrait (Shorts/
+        // TikTok/Reels). Sizes scale from the frame's short side and lyric
+        // sizes from the lyric size setting, the same as the export (see
+        // `video::Canvas::unit`/`lyric_px`).
+        let portrait = self.video_style.orientation == video::Orientation::Portrait;
+        let aspect = if portrait { 9.0 / 16.0 } else { 16.0 / 9.0 };
         let width = match max_height {
-            Some(h) => ui.available_width().min(h * 16.0 / 9.0),
+            Some(h) => ui.available_width().min(h * aspect),
             None => ui.available_width(),
         };
-        let height = width * 9.0 / 16.0;
-        let s = (height / PREVIEW_BASE_HEIGHT).max(1.0);
+        let height = width / aspect;
+        let unit = width.min(height);
+        let lyric_unit = unit * self.video_style.lyric_scale();
+        let s = (unit / PREVIEW_BASE_HEIGHT).max(1.0);
 
         // The background texture is rendered at the smallest of a few fixed
         // 16:9 resolutions that covers the preview's on-screen pixel width,
@@ -3634,7 +6277,12 @@ impl KaraokeApp {
             .copied()
             .find(|&w| w as f32 >= px_width)
             .unwrap_or(PREVIEW_BG_WIDTHS[PREVIEW_BG_WIDTHS.len() - 1]);
-        self.ensure_background_preview(ui.ctx(), bg_width, bg_width * 9 / 16);
+        let bg_height = if portrait {
+            bg_width * 16 / 9
+        } else {
+            bg_width * 9 / 16
+        };
+        self.ensure_background_preview(ui.ctx(), bg_width, bg_height);
 
         let (rect, _response) =
             ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -3678,6 +6326,40 @@ impl KaraokeApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(height * 0.15);
 
+                // The outro card, matching `video::draw_outro`: its lines
+                // (the first larger), then title / "by artist", fading in.
+                if let Some(o) = outro.as_ref().filter(|o| t >= o.start) {
+                    let alpha = ((t - o.start) / 0.6).clamp(0.0, 1.0) as f32;
+                    ui.add_space(height * 0.1);
+                    for (k, line) in o.lines.iter().enumerate() {
+                        let text = egui::RichText::new(line);
+                        let text = if k == 0 {
+                            text.size(unit * 0.08).strong()
+                        } else {
+                            text.size(unit * 0.05)
+                        };
+                        ui.colored_label(self.color_title.gamma_multiply(alpha), text);
+                    }
+                    if o.show_title {
+                        if !self.title.trim().is_empty() {
+                            ui.colored_label(
+                                self.color_title.gamma_multiply(alpha),
+                                egui::RichText::new(self.title.trim())
+                                    .size(unit * 0.06)
+                                    .strong(),
+                            );
+                        }
+                        if !self.artist.trim().is_empty() {
+                            ui.colored_label(
+                                self.color_artist.gamma_multiply(alpha),
+                                egui::RichText::new(format!("by {}", self.artist.trim()))
+                                    .size(unit * 0.045),
+                            );
+                        }
+                    }
+                    return;
+                }
+
                 if has_title_card && t < card_end {
                     // Every size in this function is a fraction of `height`
                     // (the preview rect's own pixel height), matching
@@ -3690,15 +6372,13 @@ impl KaraokeApp {
                     if !self.title.trim().is_empty() {
                         ui.colored_label(
                             self.color_title,
-                            egui::RichText::new(&self.title)
-                                .size(height * 0.10)
-                                .strong(),
+                            egui::RichText::new(&self.title).size(unit * 0.10).strong(),
                         );
                     }
                     if !self.artist.trim().is_empty() {
                         ui.colored_label(
                             self.color_artist,
-                            egui::RichText::new(format!("by {}", self.artist)).size(height * 0.05),
+                            egui::RichText::new(format!("by {}", self.artist)).size(unit * 0.05),
                         );
                     }
                     if !legend_singers.is_empty() {
@@ -3723,7 +6403,7 @@ impl KaraokeApp {
                                 0.0,
                                 egui::TextFormat {
                                     color: unsung,
-                                    font_id: egui::FontId::proportional(height * 0.04),
+                                    font_id: egui::FontId::proportional(unit * 0.04),
                                     ..Default::default()
                                 },
                             );
@@ -3734,7 +6414,7 @@ impl KaraokeApp {
                         ui.add_space(10.0 * s);
                         ui.colored_label(
                             self.color_preview,
-                            egui::RichText::new(video::CREDIT_TEXT).size(height * 0.028),
+                            egui::RichText::new(video::CREDIT_TEXT).size(unit * 0.028),
                         );
                     }
                     return;
@@ -3797,7 +6477,7 @@ impl KaraokeApp {
                                         ui.colored_label(
                                             faded_color(unsung, reveal_alpha),
                                             egui::RichText::new(normalized)
-                                                .size(height * 0.055)
+                                                .size(lyric_unit * 0.055)
                                                 .family(lyric_family.clone()),
                                         );
                                     }
@@ -3929,7 +6609,7 @@ impl KaraokeApp {
                                             ui.colored_label(
                                                 faded_color(unsung, reveal_alpha),
                                                 egui::RichText::new(normalized)
-                                                    .size(height * 0.055)
+                                                    .size(lyric_unit * 0.055)
                                                     .family(lyric_family.clone()),
                                             );
                                         }
@@ -3970,11 +6650,11 @@ impl KaraokeApp {
                                     ui.colored_label(
                                         roll_unsung,
                                         egui::RichText::new(roll_normalized)
-                                            .size(height * 0.055)
+                                            .size(lyric_unit * 0.055)
                                             .family(lyric_family.clone()),
                                     );
                                 } else {
-                                    ui.add_space(height * 0.11);
+                                    ui.add_space(lyric_unit * 0.11);
                                 }
                                 continue;
                             }
@@ -3994,11 +6674,11 @@ impl KaraokeApp {
                                         ui.colored_label(
                                             faded_color(highlight, alpha),
                                             egui::RichText::new(normalized)
-                                                .size(height * 0.055)
+                                                .size(lyric_unit * 0.055)
                                                 .family(lyric_family.clone()),
                                         );
                                     } else {
-                                        ui.add_space(height * 0.11);
+                                        ui.add_space(lyric_unit * 0.11);
                                     }
                                 }
                                 std::cmp::Ordering::Equal => {
@@ -4014,11 +6694,13 @@ impl KaraokeApp {
                                         // timestamp is reached (which looked instantaneous for
                                         // long-held words and words with few characters alike).
                                         let chars: Vec<char> = normalized.chars().collect();
-                                        let spans = lyrics::word_char_spans(&normalized);
+                                        let spans = lyrics::word_char_spans(&line.text);
                                         let boundary = lyrics::current_line_wipe_fraction(line, t)
                                             * chars.len().max(1) as f32;
-                                        let font_id =
-                                            egui::FontId::new(height * 0.055, lyric_family.clone());
+                                        let font_id = egui::FontId::new(
+                                            lyric_unit * 0.055,
+                                            lyric_family.clone(),
+                                        );
                                         for (i, &(offset, len)) in spans.iter().enumerate() {
                                             let word_text: String =
                                                 chars[offset..offset + len].iter().collect();
@@ -4061,17 +6743,17 @@ impl KaraokeApp {
                                             ui.colored_label(
                                                 faded_color(highlight, alpha),
                                                 egui::RichText::new(normalized)
-                                                    .size(height * 0.055)
+                                                    .size(lyric_unit * 0.055)
                                                     .family(lyric_family.clone()),
                                             );
                                         } else {
-                                            ui.add_space(height * 0.11);
+                                            ui.add_space(lyric_unit * 0.11);
                                         }
                                     }
                                 }
                                 std::cmp::Ordering::Greater => {
                                     if hide_upcoming {
-                                        ui.add_space(height * 0.11);
+                                        ui.add_space(lyric_unit * 0.11);
                                     } else {
                                         // Fading in only applies to a line that was
                                         // actually hidden and just got revealed by the
@@ -4090,7 +6772,7 @@ impl KaraokeApp {
                                             ui.colored_label(
                                                 faded_color(unsung, alpha),
                                                 egui::RichText::new(normalized)
-                                                    .size(height * 0.055)
+                                                    .size(lyric_unit * 0.055)
                                                     .family(lyric_family.clone()),
                                             );
                                         }
@@ -4120,8 +6802,10 @@ impl KaraokeApp {
         if let Some(k) = lyrics::active_backing_line(&windows, t) {
             let line = &backing[k];
             let (unsung, highlight) = self.singer_colors(line.singer);
-            let font_id =
-                egui::FontId::new(height * video::BACKING_LANE_FONT, self.lyric_font_family());
+            let font_id = egui::FontId::new(
+                lyric_unit * video::BACKING_LANE_FONT,
+                self.lyric_font_family(),
+            );
             let normalized = lyrics::normalize_text(&line.text);
             let job = if t >= line.start && t < line.sing_end {
                 wipe_layout_job(
@@ -4201,7 +6885,10 @@ impl KaraokeApp {
                     .clamp(timeline::MIN_PX_PER_SEC, timeline::MAX_PX_PER_SEC);
                 self.timeline_view.scroll_secs = 0.0;
             }
-            ui.label(
+            help_text(
+                ui,
+                self.prefs.show_tips,
+                "Drag bubbles · scroll to zoom · Shift+scroll to pan.",
                 "Drag a bubble to move it, its edges to trim start/end. Click or drag \
                  empty space to seek/scrub playback - scroll to zoom, shift+scroll to pan.",
             );
@@ -4702,6 +7389,32 @@ impl KaraokeApp {
             }
         }
 
+        // Active loop region, shaded behind the playhead.
+        if let Some((from, to)) = self.loop_region() {
+            let x0 = self
+                .timeline_view
+                .time_to_x(rect.left(), from)
+                .max(rect.left());
+            let x1 = self
+                .timeline_view
+                .time_to_x(rect.left(), to)
+                .min(rect.right());
+            if x1 > x0 {
+                let band = egui::Rect::from_x_y_ranges(x0..=x1, rect.top()..=rect.bottom());
+                painter.rect_filled(
+                    band,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(90, 160, 255, 28),
+                );
+                for x in [x0, x1] {
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 160, 255)),
+                    );
+                }
+            }
+        }
+
         // Playhead - drawn last so it's never hidden behind a bubble.
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         if let Some(audio) = &self.audio {
@@ -4859,15 +7572,19 @@ impl eframe::App for KaraokeApp {
         }
         self.ensure_font_loaded();
         self.ensure_egui_font_installed(ctx);
+        self.apply_loop();
         self.auto_follow_word_tap_line();
 
         self.handle_keyboard_shortcuts(ctx);
+        self.sync_ui_style(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("Abyssal CDG Creator");
             });
+            ui.add_space(4.0);
+            self.draw_step_bar(ui);
             ui.add_space(4.0);
 
             if let Some(err) = &self.audio_error {
@@ -4916,18 +7633,17 @@ impl eframe::App for KaraokeApp {
                     }
                 }
             });
-            ui.label(
-                egui::RichText::new(
-                    format!(
-                        "Saves everything - lyrics, timing, colors, the audio file's path - \
+            help_text(
+                ui,
+                self.prefs.show_tips,
+                "Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo.",
+                format!(
+                    "Saves everything - lyrics, timing, colors, the audio file's path - \
                          to a .{} project file, so you can pick up where you left off. \
                          Ctrl+S saves; Ctrl+Shift+S always asks for a location. Ctrl+Z undoes \
                          a tap/drag/nudge/edit; Ctrl+Shift+Z (or Ctrl+Y) redoes it.",
-                        project::FILE_EXTENSION
-                    ),
-                )
-                .small()
-                .weak(),
+                    project::FILE_EXTENSION
+                ),
             );
 
             ui.horizontal(|ui| {
@@ -4948,41 +7664,47 @@ impl eframe::App for KaraokeApp {
                 }
             });
 
+            // Transport row: ⏮, one Play/Pause toggle, ⏪ seek bar ⏩, and a
+            // time readout you can click to type a time to jump to.
             ui.horizontal(|ui| {
-                let has_audio = self.audio.as_ref().map(|a| a.is_loaded()).unwrap_or(false);
+                let known_duration = self.audio.as_ref().and_then(|a| a.duration());
+                let has_audio = self.audio.as_ref().is_some_and(|a| a.is_loaded());
                 ui.add_enabled_ui(has_audio, |ui| {
-                    if ui.button("▶ Play from start").clicked() {
+                    if ui
+                        .button("⏮")
+                        .on_hover_text("Back to the start (keeps playing if it was).")
+                        .clicked()
+                    {
                         if let Some(a) = &mut self.audio {
-                            if let Err(e) = a.play_from_start() {
-                                self.status = format!("Playback error: {e}");
+                            if let Err(e) = a.seek(0.0) {
+                                self.status = format!("Seek error: {e}");
                             }
                         }
                     }
-                    if ui.button("⏸ Pause").clicked() {
-                        if let Some(a) = &mut self.audio {
-                            a.pause();
-                        }
+                    let playing = self.audio.as_ref().is_some_and(|a| a.is_playing());
+                    let (label, hover) = if playing {
+                        (
+                            "⏸ Pause",
+                            "Pause playback. Space also pauses once every line is timed.",
+                        )
+                    } else {
+                        ("▶ Play", "Play (or resume) from the current position.")
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(label)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(ACCENT)
+                            .min_size(egui::vec2(84.0, 0.0)),
+                        )
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.toggle_play_pause();
                     }
-                    if ui.button("▶ Resume").clicked() {
-                        if let Some(a) = &mut self.audio {
-                            a.resume();
-                        }
-                    }
-                    if ui.button("⏹ Stop").clicked() {
-                        if let Some(a) = &mut self.audio {
-                            a.stop();
-                        }
-                    }
-                });
-                if let Some(a) = &self.audio {
-                    ui.label(format!("{} / {}", format_time(a.position()), format_time(a.duration().unwrap_or(0.0))));
-                }
-            });
-
-            ui.horizontal(|ui| {
-                let known_duration = self.audio.as_ref().and_then(|a| a.duration());
-                let has_audio = self.audio.as_ref().map(|a| a.is_loaded()).unwrap_or(false);
-                ui.add_enabled_ui(has_audio, |ui| {
                     let live_pos = self.audio.as_ref().map(|a| a.position()).unwrap_or(0.0);
                     // If we don't know the song's length (rare - some files
                     // don't report a frame count), fall back to a range that
@@ -5023,12 +7745,120 @@ impl eframe::App for KaraokeApp {
                             let _ = a.seek(target);
                         }
                     }
+
+                    self.draw_time_readout(ui, known_duration);
                 });
                 if known_duration.is_none() && has_audio {
                     ui.label("(exact song length unknown - seek range is approximate)");
                 }
             });
-            ui.label("Drag the bar (or use ⏪/⏩, or the left/right arrow keys) to jump anywhere in the song - handy for redoing a line without replaying from the start.");
+
+            // Speed and loop share one row.
+            ui.horizontal_wrapped(|ui| {
+                let has_audio = self.audio.as_ref().is_some_and(|a| a.is_loaded());
+                ui.add_enabled_ui(has_audio, |ui| {
+                    ui.label("Speed:");
+                    let current = self.audio.as_ref().map(|a| a.speed()).unwrap_or(1.0);
+                    for (speed, label) in [(0.5f32, "0.5×"), (0.75, "0.75×"), (1.0, "1×")] {
+                        let selected = (current - speed).abs() < 0.001;
+                        if ui
+                            .selectable_label(selected, label)
+                            .on_hover_text(
+                                "Slow the song down for tapping fast lines or fine-tuning \
+                                 words. Taps still record the real song time. Pitch drops \
+                                 along with speed - this only affects playback here, never \
+                                 the exported files.",
+                            )
+                            .clicked()
+                        {
+                            if let Some(a) = &mut self.audio {
+                                a.set_speed(speed);
+                            }
+                        }
+                    }
+                    if current < 0.999 {
+                        ui.label(
+                            egui::RichText::new("slowed down - exports are always full speed")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    ui.separator();
+                    ui.label("Loop:");
+                    let line_loop = match self.loop_mode {
+                        Some(LoopMode::Line(i)) => Some(i),
+                        _ => None,
+                    };
+                    let label = match line_loop {
+                        Some(i) => format!("🔁 Line {}  [L]", i + 1),
+                        None => "🔁 Loop line  [L]".to_string(),
+                    };
+                    if ui
+                        .selectable_label(line_loop.is_some(), label)
+                        .on_hover_text(
+                            "Repeat the line open in the fine-tune panel (or the line being \
+                             tapped), with a second of lead-in, so you can click its words \
+                             again and again until they land. Follows the line's timing as \
+                             you change it. Click again (or press L) to stop.",
+                        )
+                        .clicked()
+                    {
+                        self.toggle_loop_line(None);
+                    }
+                    ui.separator();
+                    let ab = match self.loop_mode {
+                        Some(LoopMode::Ab { a, b }) => Some((a, b)),
+                        _ => None,
+                    };
+                    if ui
+                        .selectable_label(ab.is_some(), "A")
+                        .on_hover_text("Mark the current position as the loop start.")
+                        .clicked()
+                    {
+                        self.set_loop_a();
+                    }
+                    if ui
+                        .selectable_label(ab.is_some_and(|(_, b)| b.is_some()), "B")
+                        .on_hover_text(
+                            "Mark the current position as the loop end and start looping \
+                             between A and B.",
+                        )
+                        .clicked()
+                    {
+                        self.set_loop_b();
+                    }
+                    if self.loop_mode.is_some() {
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text("Stop looping.")
+                            .clicked()
+                        {
+                            self.loop_mode = None;
+                            self.status = "Loop off.".to_string();
+                        }
+                        if let Some((from, to)) = self.loop_region() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} - {}",
+                                    lyrics::format_timecode(from),
+                                    lyrics::format_timecode(to)
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    }
+                });
+            });
+
+            help_text(
+                ui,
+                self.prefs.show_tips,
+                "Drag to jump · click the time to type one · ←/→ keys skip.",
+                "Drag the bar (or use ⏪/⏩, or the left/right arrow keys) to jump anywhere in \
+                 the song - handy for redoing a line without replaying from the start. Or \
+                 click the time readout, type a time (1:23.5, or seconds) and press Enter.",
+            );
 
             ui.horizontal(|ui| {
                 ui.label("Song title:");
@@ -5036,15 +7866,106 @@ impl eframe::App for KaraokeApp {
                 ui.label("Artist:");
                 ui.add(egui::TextEdit::singleline(&mut self.artist).desired_width(220.0));
             });
-            ui.label(
-                egui::RichText::new(
-                    "Tip: name imported audio files \"Artist - Song Name.ext\" and these \
+            help_text(
+                ui,
+                self.prefs.show_tips,
+                "Tip: \"Artist - Song.mp3\" fills these in.",
+                "Tip: name imported audio files \"Artist - Song Name.ext\" and these \
                      fields fill in automatically when they're both still blank.",
-                )
-                .small()
-                .weak(),
             );
 
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.outro.enabled, "Outro card")
+                    .on_hover_text(
+                        "A closing card after the last line, until the song ends - in the \
+                         video, the .cdg, the subtitles and the live preview. Needs at \
+                         least 2 seconds of song left after the last line.",
+                    );
+                ui.add_enabled_ui(self.outro.enabled, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.outro.text)
+                            .desired_rows(2)
+                            .desired_width(240.0)
+                            .hint_text("Thanks for singing!"),
+                    )
+                    .on_hover_text(format!(
+                        "Up to {} lines - the first is shown largest.",
+                        lyrics::MAX_OUTRO_LINES
+                    ));
+                    ui.checkbox(&mut self.outro.show_title, "+ title & artist");
+                });
+            });
+            if self.outro.enabled {
+                let (timed, total) = self.resolved();
+                let backing = self.resolved_backing();
+                let note = match export::outro_window(&timed, &backing, total) {
+                    Some((start, end)) => format!(
+                        "Shown {} - {} (from {:.1}s after the last line).",
+                        lyrics::format_timecode(start),
+                        lyrics::format_timecode(end),
+                        export::OUTRO_GAP_SECS
+                    ),
+                    None if timed.is_empty() => {
+                        "Shown after the last line, once lines are timed.".to_string()
+                    }
+                    None => format!(
+                        "Not shown: the song ends less than {:.1}s after the last line.",
+                        export::OUTRO_GAP_SECS + export::MIN_OUTRO_SECS
+                    ),
+                };
+                ui.label(egui::RichText::new(note).small().weak());
+            }
+
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut self.prefs.show_tips, "💡 Tips")
+                    .on_hover_text(
+                        "Show the full explanations under each control. Turn off once you \
+                         know your way around - each becomes a one-line summary, with the \
+                         full text on its ⓘ.",
+                    )
+                    .changed()
+                {
+                    prefs::save(APP_ID, &self.prefs);
+                }
+                if ui
+                    .button("⌨ Shortcuts")
+                    .on_hover_text("Every keyboard shortcut (F1 or ?).")
+                    .clicked()
+                {
+                    self.show_shortcuts = !self.show_shortcuts;
+                }
+                ui.separator();
+                ui.label("UI size:");
+                let zoom = ui.ctx().zoom_factor();
+                if ui
+                    .add_enabled(
+                        zoom > prefs::MIN_UI_ZOOM + 0.001,
+                        egui::Button::new("−").small(),
+                    )
+                    .on_hover_text("Smaller (Ctrl+-)")
+                    .clicked()
+                {
+                    egui::gui_zoom::zoom_out(ui.ctx());
+                }
+                if ui
+                    .small_button(format!("{:.0}%", zoom * 100.0))
+                    .on_hover_text("Back to 100% (Ctrl+0)")
+                    .clicked()
+                {
+                    ui.ctx().set_zoom_factor(1.0);
+                }
+                if ui
+                    .add_enabled(
+                        zoom < prefs::MAX_UI_ZOOM - 0.001,
+                        egui::Button::new("+").small(),
+                    )
+                    .on_hover_text("Bigger (Ctrl+=)")
+                    .clicked()
+                {
+                    egui::gui_zoom::zoom_in(ui.ctx());
+                }
+            });
             ui.checkbox(&mut self.auto_follow_words, "Auto-follow fine-tune panel")
                 .on_hover_text(
                     "While the \"Fine-tune words\" panel is open and the song is playing, it \
@@ -5057,6 +7978,10 @@ impl eframe::App for KaraokeApp {
 
         self.draw_export_dialog(ctx);
         self.draw_codex(ctx);
+        self.draw_shortcuts_window(ctx);
+        self.draw_copy_timing_dialog(ctx);
+        self.track_status();
+        self.draw_toast(ctx);
         self.draw_disclaimer_modal(ctx);
 
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
@@ -5065,7 +7990,15 @@ impl eframe::App for KaraokeApp {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     if ui
-                        .add_sized([120.0, 28.0], egui::Button::new("Export…"))
+                        .add_sized(
+                            [120.0, 28.0],
+                            egui::Button::new(
+                                egui::RichText::new("Export…")
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(ACCENT),
+                        )
                         .clicked()
                     {
                         self.open_export_dialog();
@@ -5113,9 +8046,11 @@ impl eframe::App for KaraokeApp {
                     ui.spinner();
                 }
             });
-            ui.label(
-                egui::RichText::new(
-                    "Auto-align isolates vocals first, then runs a real speech-recognition \
+            help_text(
+                ui,
+                self.prefs.show_tips,
+                "Auto-align fills in word timing from the audio - always review it.",
+                "Auto-align isolates vocals first, then runs a real speech-recognition \
                      model (once per already-timed line) against just the singing to fill in \
                      every word's timing automatically, replacing any existing word timing \
                      (estimated or manually tapped) for lines it successfully aligns - the song \
@@ -5126,9 +8061,6 @@ impl eframe::App for KaraokeApp {
                      not one trained for singing, so always play the result back and fine-tune \
                      anything that's off before exporting - treat it as a fast first pass, not \
                      a substitute for a final review. Undo (Ctrl+Z) if a result doesn't help.",
-                )
-                .small()
-                .weak(),
             );
             if let Some(handle) = &self.combined_export {
                 let frac = handle.progress.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -5139,7 +8071,14 @@ impl eframe::App for KaraokeApp {
                 ui.add(egui::ProgressBar::new(frac).show_percentage());
             }
             if !self.status.is_empty() {
-                ui.label(&self.status);
+                ui.horizontal_wrapped(|ui| {
+                    let kind = classify_status(&self.status);
+                    ui.label(
+                        egui::RichText::new(format!("{}{}", kind.icon(), self.status))
+                            .color(kind.color(ui.visuals())),
+                    );
+                    self.open_folder_button(ui);
+                });
             }
             ui.add_space(4.0);
         });
@@ -5186,25 +8125,60 @@ impl eframe::App for KaraokeApp {
                 if ui.button("Load lyrics file…").clicked() {
                     self.load_lyrics_file_dialog();
                 }
-                ui.label(
-                    egui::RichText::new(
-                        "Supports LRC (.lrc), UltraStar (.txt), and KOK - auto-detected.",
-                    )
-                    .small()
-                    .weak(),
+                help_text(
+                    ui,
+                    self.prefs.show_tips,
+                    "LRC, UltraStar and KOK files are supported.",
+                    "Supports LRC (.lrc), UltraStar (.txt), and KOK - auto-detected.",
+                );
+                help_text(
+                    ui,
+                    self.prefs.show_tips,
+                    "Tip: beau|ti|ful times each syllable.",
+                    "Tip: split a long held word into syllables with | (e.g. beau|ti|ful) \
+                         to time each syllable on its own - it still shows as one word.",
                 );
                 ui.add_space(8.0);
                 ui.separator();
                 ui.label("2. Tap along:");
-                ui.label(
+                help_text(
+                    ui,
+                    self.prefs.show_tips,
+                    "Space: tap each line's start, then its end · Shift+Space: end + start \
+                     next · M/F/D/S/B: voice.",
                     "Press Play, then press Space (or click below) the instant each line \
                      starts being sung, and again the instant it ends - two taps per line. \
                      Lines fill in top to bottom automatically - missed one? Drag the seek \
                      bar back a few seconds and try again. (Skipping the end-tap is fine too - \
                      it'll just fall back to an automatic estimate until you set it, here or \
-                     in the table below.) Press M/F/D/S to set that line's voice (Male/Female/\
-                     Duet/Screaming) without leaving the keyboard.",
+                     in the table below.) Line runs straight into the next one? Shift+Space \
+                     ends it and starts the next in one tap. Press M/F/D/S/B to set that \
+                     line's voice (Male/Female/Duet/Screaming/Backing) without leaving the \
+                     keyboard.",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Tap latency:");
+                    let resp = ui
+                        .add(
+                            egui::DragValue::new(&mut self.prefs.tap_latency_ms)
+                                .range(0.0..=prefs::MAX_TAP_LATENCY_MS)
+                                .speed(1.0)
+                                .fixed_decimals(0)
+                                .suffix(" ms"),
+                        )
+                        .on_hover_text(
+                            "Subtracted from every tap (tap-along, re-tap, backing lines, and \
+                             word/line-end taps in the fine-tune panel), to cancel out how \
+                             late you tap after hearing a line start - typically 100-200 ms, \
+                             more with Bluetooth headphones. If your taps consistently land \
+                             a bit late on the timeline, raise this. Saved on this computer, \
+                             not in the project, and only affects new taps.",
+                        );
+                    // Save when an edit finishes, not on every frame of a drag.
+                    if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                        prefs::save(APP_ID, &self.prefs);
+                    }
+                });
                 let can_tap = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false)
                     && self.next_untimed < self.lines.len();
                 ui.add_enabled_ui(can_tap, |ui| {
@@ -5223,10 +8197,44 @@ impl eframe::App for KaraokeApp {
                         "⏱ Tap next line".to_string()
                     };
                     if ui
-                        .add_sized([ui.available_width(), 48.0], egui::Button::new(label))
+                        .add_sized(
+                            [ui.available_width(), 48.0],
+                            egui::Button::new(
+                                egui::RichText::new(label)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(ACCENT),
+                        )
                         .clicked()
                     {
                         self.tap_next();
+                    }
+                    // Back-to-back lines: one press ends this line and starts
+                    // the next at the same instant (see
+                    // `tap_end_and_start_next`). Only offered at an end tap
+                    // with another line still to go.
+                    let has_next_main = self.lines[self.next_untimed.min(self.lines.len())..]
+                        .iter()
+                        .skip(1)
+                        .any(|l| !l.is_backing);
+                    if self.tap_phase == TapPhase::End
+                        && has_next_main
+                        && ui
+                            .add_sized(
+                                [ui.available_width(), 24.0],
+                                egui::Button::new(
+                                    "⏭ End this line + start the next  [Shift+Space]",
+                                ),
+                            )
+                            .on_hover_text(
+                                "For lines sung straight into each other with no gap: sets \
+                                 this line's end and the next line's start at the same \
+                                 instant, in one tap.",
+                            )
+                            .clicked()
+                    {
+                        self.tap_end_and_start_next();
                     }
                 });
             });
@@ -5273,7 +8281,16 @@ impl eframe::App for KaraokeApp {
                         }
                         ui.add_space(10.0);
                         ui.separator();
-                        egui::CollapsingHeader::new("Colors")
+                        let color_issues =
+                            color_warnings(&self.export_colors(), &self.voices_in_use());
+                        let header = if color_issues.is_empty() {
+                            egui::RichText::new("Colors")
+                        } else {
+                            egui::RichText::new(format!("Colors  ⚠ {}", color_issues.len()))
+                                .color(egui::Color32::from_rgb(230, 160, 40))
+                        };
+                        egui::CollapsingHeader::new(header)
+                            .id_source("colors_section")
                             .default_open(false)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -5294,13 +8311,18 @@ impl eframe::App for KaraokeApp {
                                             }
                                         });
                                 });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Pick a look, or fine-tune individual colors below.",
-                                    )
-                                    .small()
-                                    .weak(),
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "",
+                                    "Pick a look, or fine-tune individual colors below.",
                                 );
+                                for issue in &color_issues {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(230, 160, 40),
+                                        egui::RichText::new(format!("⚠ {issue}")).small(),
+                                    );
+                                }
                                 ui.add_space(6.0);
                                 egui::Grid::new("colors_grid")
                                     .num_columns(2)
@@ -5382,16 +8404,15 @@ impl eframe::App for KaraokeApp {
                         egui::CollapsingHeader::new("Background")
                             .default_open(false)
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Show an image or video behind the lyrics in the video \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "An image or video behind the lyrics (video and preview only).",
+                                    "Show an image or video behind the lyrics in the video \
                                          export and the preview above, instead of the flat \
                                          Background color. The .cdg export always uses the flat \
                                          color instead - it's a fixed 300x216, 16-color format \
                                          with no room for real images.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                                 ui.add_space(4.0);
                                 ui.horizontal(|ui| {
@@ -5447,14 +8468,13 @@ impl eframe::App for KaraokeApp {
                                             }
                                         });
                                 });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Cover crops the edges so nothing gets stretched; \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "Cover fills the frame; Contain shows it all.",
+                                    "Cover crops the edges so nothing gets stretched; \
                                          Contain shows the whole image/video with bars added \
                                          if the aspect ratio doesn't match.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                                 ui.add_space(6.0);
                                 ui.horizontal(|ui| {
@@ -5464,28 +8484,26 @@ impl eframe::App for KaraokeApp {
                                             .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                                     );
                                 });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "How much of a black scrim to blend over the \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "Darkens the background so lyrics stay readable.",
+                                    "How much of a black scrim to blend over the \
                                          background image/video so the lyrics stay legible on \
                                          top of it.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                             });
                         egui::CollapsingHeader::new("Font")
                             .default_open(false)
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Choose a font for lyric text in the video export and \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "Video and preview only - the .cdg uses its own pixel font.",
+                                    "Choose a font for lyric text in the video export and \
                                          the preview above. The .cdg export always uses its own \
                                          fixed built-in font instead - it's a 300x216, 16-color \
                                          tile format with no room for an arbitrary scalable font.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                                 ui.add_space(4.0);
 
@@ -5598,15 +8616,14 @@ impl eframe::App for KaraokeApp {
                         egui::CollapsingHeader::new("Timing")
                             .default_open(false)
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Tunes the word-timing estimate and the \"get ready\" \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "Tunes the automatic estimates.",
+                                    "Tunes the word-timing estimate and the \"get ready\" \
                                          countdown's sensitivity - used only where you haven't \
                                          fine-tuned something yourself (a manually tapped word, \
                                          or an auto-aligned line). Saved with the project.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                                 ui.add_space(4.0);
 
@@ -5620,14 +8637,13 @@ impl eframe::App for KaraokeApp {
                                         .custom_formatter(|v, _| format!("{v:.2}s")),
                                     );
                                 });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "How long each word is assumed to take to sing, for the \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "Estimated time per word.",
+                                    "How long each word is assumed to take to sing, for the \
                                          word-by-word color wipe - only matters for words you \
                                          haven't fine-tuned by hand.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                                 ui.add_space(6.0);
 
@@ -5641,14 +8657,13 @@ impl eframe::App for KaraokeApp {
                                         .custom_formatter(|v, _| format!("{v:.2}s")),
                                     );
                                 });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "A floor under the estimate above, so even a single \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "Shortest estimated line.",
+                                    "A floor under the estimate above, so even a single \
                                          short word still gets a readable amount of time on \
                                          screen.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                                 ui.add_space(6.0);
 
@@ -5662,14 +8677,13 @@ impl eframe::App for KaraokeApp {
                                         .custom_formatter(|v, _| format!("{v:.1}s")),
                                     );
                                 });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "How long a gap before a line starts (or before the \
+                                help_text(
+                                    ui,
+                                    self.prefs.show_tips,
+                                    "Gap that triggers the countdown.",
+                                    "How long a gap before a line starts (or before the \
                                          first line, after the title card) needs to be before \
                                          the \"get ready\" countdown dots appear.",
-                                    )
-                                    .small()
-                                    .weak(),
                                 );
                                 ui.add_space(6.0);
 
@@ -5682,6 +8696,33 @@ impl eframe::App for KaraokeApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("3. Review / fine-tune timestamps and voice:");
+            if !self.lines.is_empty() {
+                let statuses = line_statuses(&self.lines);
+                let count = |k: LineStatus| statuses.iter().filter(|s| **s == k).count();
+                let (untimed, estimated, tuned) = (
+                    count(LineStatus::Untimed),
+                    count(LineStatus::Estimated),
+                    count(LineStatus::FineTuned),
+                );
+                let timed = statuses.len() - untimed;
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::ProgressBar::new(timed as f32 / statuses.len() as f32)
+                            .desired_width(120.0)
+                            .fill(ACCENT),
+                    );
+                    let visuals = ui.visuals().clone();
+                    let part = |ui: &mut egui::Ui, k: LineStatus, text: String| {
+                        ui.label(egui::RichText::new("●").color(k.color(&visuals)));
+                        ui.label(text).on_hover_text(k.describe());
+                    };
+                    part(ui, LineStatus::Untimed, format!("{timed}/{} timed", statuses.len()));
+                    if estimated > 0 {
+                        part(ui, LineStatus::Estimated, format!("{estimated} estimated"));
+                    }
+                    part(ui, LineStatus::FineTuned, format!("{tuned} fine-tuned"));
+                });
+            }
 
             // Per-word fine-tuning strip - only shown while a line is selected.
             if let Some(i) = self.word_tap_line {
@@ -5690,11 +8731,22 @@ impl eframe::App for KaraokeApp {
                         ui.horizontal(|ui| {
                             ui.strong("Fine-tune words:");
                             ui.label(&self.lines[i].text);
+                            let looping_this = self.loop_mode == Some(LoopMode::Line(i));
+                            if ui
+                                .selectable_label(looping_this, "🔁 Loop this line")
+                                .on_hover_text(
+                                    "Repeat this line (with a second of lead-in) while you \
+                                     click its words. Shortcut: L.",
+                                )
+                                .clicked()
+                            {
+                                self.toggle_loop_line(Some(i));
+                            }
                             if ui.small_button("Close").clicked() {
                                 self.word_tap_line = None;
                             }
                         });
-                        ui.label(if self.auto_follow_words {
+                        help_text(ui, self.prefs.show_tips, "Click each word the instant it's sung.", if self.auto_follow_words {
                             "Play the song and just click each word the instant it's sung - \
                              this panel follows along automatically as the song moves from \
                              line to line, so there's no need to reselect a line yourself. \
@@ -5715,21 +8767,44 @@ impl eframe::App for KaraokeApp {
                                 "Start",
                             );
                             ui.selectable_value(&mut self.word_tap_mode, WordTapMode::End, "End");
-                            ui.label(
+                            help_text(
+                                ui,
+                                self.prefs.show_tips,
+                                "End: where a held word stops.",
                                 "- by default a word's highlight just runs until the next \
                                  word starts; set an End to make it stop (and freeze) sooner, \
                                  e.g. for a held note followed by a pause.",
                             );
                         });
-                        ui.label(
+                        help_text(
+                            ui,
+                            self.prefs.show_tips,
+                            "Green start · blue end · teal both.",
                             "Green = start manually timed, blue = end manually timed, teal = \
                              both; the rest still use the automatic estimate.",
                         );
-                        let words: Vec<String> = self.lines[i]
-                            .text
-                            .split_whitespace()
-                            .map(|s| s.to_string())
-                            .collect();
+                        // One button per timing unit: a word marked `beau|ti|ful`
+                        // gets a button per syllable, shown with a trailing/
+                        // leading dash so they read as one word.
+                        let words: Vec<String> = {
+                            let units = lyrics::timing_units(&self.lines[i].text);
+                            let mut prev_ended_word = true;
+                            units
+                                .iter()
+                                .map(|&(u, ends_word)| {
+                                    let mut label = String::new();
+                                    if !prev_ended_word {
+                                        label.push('-');
+                                    }
+                                    label.push_str(u);
+                                    if !ends_word {
+                                        label.push('-');
+                                    }
+                                    prev_ended_word = ends_word;
+                                    label
+                                })
+                                .collect()
+                        };
                         ui.horizontal_wrapped(|ui| {
                             for (w_idx, word) in words.iter().enumerate() {
                                 let manual_start =
@@ -5855,20 +8930,106 @@ impl eframe::App for KaraokeApp {
                 });
             });
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Click rows' checkboxes to select/deselect them one at a time - \
-                         Shift-click for a range.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                let any_selected = !self.selected_lines.is_empty();
+                ui.add_enabled_ui(any_selected, |ui| {
+                    ui.label("Shift selection:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.shift_amount_secs)
+                            .range(0.01..=30.0)
+                            .speed(0.01)
+                            .fixed_decimals(2)
+                            .suffix(" s"),
+                    );
+                    let mut delta = None;
+                    if ui
+                        .button("◀ Earlier")
+                        .on_hover_text(
+                            "Move every selected line (start, end, and word timing) earlier \
+                             by this amount. Handy for a whole song or section that was \
+                             tapped consistently late.",
+                        )
+                        .clicked()
+                    {
+                        delta = Some(-self.shift_amount_secs);
+                    }
+                    if ui
+                        .button("Later ▶")
+                        .on_hover_text(
+                            "Move every selected line (start, end, and word timing) later by \
+                             this amount.",
+                        )
+                        .clicked()
+                    {
+                        delta = Some(self.shift_amount_secs);
+                    }
+                    if let Some(delta) = delta {
+                        let indices: Vec<usize> = self.selected_lines.iter().copied().collect();
+                        self.status = match lyrics::shift_lines(&mut self.lines, &indices, delta) {
+                            Ok(n) => format!(
+                                "Shifted {n} line(s) {} by {:.2}s.",
+                                if delta < 0.0 { "earlier" } else { "later" },
+                                delta.abs()
+                            ),
+                            Err(e) => e,
+                        };
+                    }
+                });
+                ui.separator();
+                let all_timed = !self.selected_lines.is_empty()
+                    && self.selected_lines.iter().all(|&i| {
+                        self.lines.get(i).is_some_and(|l| l.start.is_some())
+                    });
+                ui.add_enabled_ui(all_timed, |ui| {
+                    if ui
+                        .button("📋 Copy timing to…")
+                        .on_hover_text(
+                            "Copy the selected (timed) lines' timing onto a repeat of them - a \
+                             second chorus sung to the same rhythm. Every line and word lands \
+                             at the same spacing; you just set where the repeat starts.",
+                        )
+                        .clicked()
+                    {
+                        self.open_copy_timing_dialog();
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                help_text(ui, self.prefs.show_tips, "Shift-click selects a range.", "Click rows' checkboxes to select/deselect them one at a time - \
+                         Shift-click for a range.");
                 ui.checkbox(&mut self.compact_timing_table, "Compact table")
                     .on_hover_text(
                         "Truncate long lyric lines in the table below (hover a truncated \
                          one to see the full text) instead of letting them widen the table.",
                     );
+                ui.checkbox(&mut self.follow_timing_table, "Follow current line")
+                    .on_hover_text(
+                        "While the song plays, keep the line being timed scrolled into view \
+                         in the table below. You can still scroll by hand - it only moves \
+                         again when the next line comes up.",
+                    );
             });
+
+            // Which row (if any) the table should bring into view this
+            // frame: the next line to tap while tapping along, otherwise
+            // the line the fine-tune panel is following. Only while
+            // playing, and only when that row changes - so clicking a row
+            // while paused, or scrolling by hand, never gets yanked away.
+            let follow_target = if self.next_untimed < self.lines.len() {
+                Some(self.next_untimed)
+            } else {
+                self.word_tap_line
+            };
+            let is_playing = self.audio.as_ref().is_some_and(|a| a.is_playing());
+            let scroll_to_row = if self.follow_timing_table
+                && is_playing
+                && follow_target != self.timing_table_scrolled_to
+            {
+                follow_target
+            } else {
+                None
+            };
+            let scroll_to_row = self.timing_table_scroll_request.take().or(scroll_to_row);
+            self.timing_table_scrolled_to = follow_target;
 
             egui::ScrollArea::vertical()
                 .id_source("timing_scroll")
@@ -5923,6 +9084,20 @@ impl eframe::App for KaraokeApp {
                     // guarantee, not a guess.
                     let row_height = ui.spacing().interact_size.y;
 
+                    // Which row's action buttons to show: the hovered row
+                    // (from last frame's row positions), plus whichever rows
+                    // are in play anyway - see `row_active` below.
+                    let hovered_row = ui.ctx().pointer_hover_pos().and_then(|p| {
+                        if !self.table_clip.contains(p) {
+                            return None;
+                        }
+                        self.table_row_spans.iter().position(|span| span.contains(p.y))
+                    });
+                    self.table_clip = ui.clip_rect();
+                    let mut row_spans: Vec<egui::Rangef> = Vec::with_capacity(self.lines.len());
+                    let statuses = line_statuses(&self.lines);
+                    let half_gap = 2.0;
+
                     ui.horizontal_top(|ui| {
                         // Sticky first column: just the row-selection
                         // checkboxes, in their own fixed-width Grid outside
@@ -5949,7 +9124,29 @@ impl eframe::App for KaraokeApp {
                                     // See `apply_row_selection_click` for
                                     // the click/shift-click semantics.
                                     let mut checked = self.selected_lines.contains(&i);
-                                    let checkbox_resp = ui.checkbox(&mut checked, "");
+                                    let mut checkbox_resp = None;
+                                    let cell = ui.horizontal(|ui| {
+                                        let status = statuses[i];
+                                        ui.label(
+                                            egui::RichText::new("●")
+                                                .color(status.color(ui.visuals())),
+                                        )
+                                        .on_hover_text(status.describe());
+                                        checkbox_resp = Some(ui.checkbox(&mut checked, ""));
+                                    });
+                                    let r = cell.response.rect;
+                                    row_spans.push(egui::Rangef::new(
+                                        r.top() - half_gap,
+                                        r.bottom() + half_gap,
+                                    ));
+                                    let checkbox_resp = checkbox_resp.expect("drawn above");
+                                    // Auto-follow scrolls via this sticky
+                                    // column (outside the horizontal
+                                    // ScrollArea) so it only ever moves
+                                    // the table vertically.
+                                    if scroll_to_row == Some(i) {
+                                        checkbox_resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
                                     if checkbox_resp.clicked() {
                                         let shift = ui.input(|inp| inp.modifiers.shift);
                                         selection_click = Some((i, shift));
@@ -6232,6 +9429,13 @@ impl eframe::App for KaraokeApp {
                                     }
                                 });
 
+                                // Action buttons only on the active row - hidden
+                                // (space kept, so nothing shifts) elsewhere.
+                                let row_active = hovered_row == Some(i)
+                                    || self.word_tap_line == Some(i)
+                                    || self.next_untimed == i
+                                    || self.selected_lines.contains(&i);
+                                ui.add_visible_ui(row_active, |ui| {
                                 if self.lines[i].is_backing {
                                     // Backing lines aren't part of tap-along,
                                     // so their own Tap button does both ends:
@@ -6254,9 +9458,13 @@ impl eframe::App for KaraokeApp {
                                 } else if ui.small_button("Tap").clicked() {
                                     retap_idx = Some(i);
                                 }
+                                });
+                                ui.add_visible_ui(row_active, |ui| {
                                 if ui.small_button("Words").clicked() {
                                     words_idx = Some(i);
                                 }
+                                });
+                                ui.add_visible_ui(row_active, |ui| {
                                 if ui
                                     .selectable_label(self.lines[i].is_backing, "Backing")
                                     .on_hover_text(
@@ -6270,6 +9478,8 @@ impl eframe::App for KaraokeApp {
                                 {
                                     backing_toggle_idx = Some(i);
                                 }
+                                });
+                                ui.add_visible_ui(row_active, |ui| {
                                 ui.horizontal(|ui| {
                                     if self.lines[i].start.is_some() {
                                         if ui.small_button("-0.1s").clicked() {
@@ -6283,11 +9493,14 @@ impl eframe::App for KaraokeApp {
                                         }
                                     }
                                 });
+                                });
                                 ui.end_row();
                                         }
                                     });
                             });
                     });
+
+                    self.table_row_spans = row_spans;
 
                     if let Some((i, shift)) = selection_click {
                                 apply_row_selection_click(
@@ -6311,12 +9524,7 @@ impl eframe::App for KaraokeApp {
                                 self.toggle_backing_line(i);
                             }
                             if let Some((i, delta)) = nudge {
-                                if let Some(s) = &mut self.lines[i].start {
-                                    *s = (*s + delta).max(0.0);
-                                }
-                                if let Some(new_start) = self.lines[i].start {
-                                    self.audition_seek(new_start);
-                                }
+                                self.nudge_line_start(i, delta);
                             }
                             if let Some(i) = clear_idx {
                                 self.lines[i].start = None;
@@ -6426,6 +9634,429 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn colors_from(p: Palette) -> ExportColors {
+        let c = color32_from_cdg;
+        ExportColors {
+            bg: c(p.background),
+            default_unsung: c(p.default_unsung),
+            default_highlight: c(p.default_highlight),
+            male_unsung: c(p.male_unsung),
+            male_highlight: c(p.male_highlight),
+            female_unsung: c(p.female_unsung),
+            female_highlight: c(p.female_highlight),
+            duet_unsung: c(p.duet_unsung),
+            duet_highlight: c(p.duet_highlight),
+            preview: c(p.preview),
+            title: c(p.title),
+            artist: c(p.artist),
+            screaming_unsung: c(p.screaming_unsung),
+            screaming_highlight: c(p.screaming_highlight),
+            backing_unsung: c(p.backing_unsung),
+            backing_highlight: c(p.backing_highlight),
+        }
+    }
+
+    #[test]
+    fn built_in_presets_pass_every_readability_check() {
+        for preset in ALL_COLOR_PRESETS {
+            let warnings = color_warnings(&colors_from(preset.palette()), &Singer::ALL);
+            assert!(warnings.is_empty(), "{}: {warnings:#?}", preset.label());
+        }
+    }
+
+    #[test]
+    fn color_checks_catch_collapsed_faint_and_clashing_colors() {
+        let mut c = colors_from(Palette::default());
+        // Two 8-bit colors that round to the same CDG shade.
+        // 240 and 250 both round to shade 14 of 15; 10 rounds to 0.
+        c.male_unsung = egui::Color32::from_rgb(240, 240, 0);
+        c.male_highlight = egui::Color32::from_rgb(250, 250, 10);
+        // Dark text on the dark background.
+        c.female_unsung = egui::Color32::from_rgb(40, 0, 50);
+        let w = color_warnings(&c, &[Singer::Male, Singer::Female]);
+        assert!(
+            w.iter()
+                .any(|m| m.starts_with("Male: the upcoming and sung colors come out identical")),
+            "{w:#?}"
+        );
+        assert!(
+            w.iter()
+                .any(|m| m.starts_with("Female upcoming text is hard to read")),
+            "{w:#?}"
+        );
+        // Unused voices aren't checked.
+        assert!(!w.iter().any(|m| m.contains("Screaming")));
+        // Two voices singing in the same color.
+        let mut c = colors_from(Palette::default());
+        c.duet_highlight = c.male_highlight;
+        let w = color_warnings(&c, &[Singer::Male, Singer::Duet]);
+        assert!(
+            w.iter()
+                .any(|m| m.starts_with("Male and Duet sing in nearly the same color")),
+            "{w:#?}"
+        );
+    }
+
+    #[test]
+    fn contrast_ratio_matches_wcag_reference_values() {
+        let black = [0.0, 0.0, 0.0];
+        let white = [255.0, 255.0, 255.0];
+        assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(white, white) - 1.0).abs() < 1e-6);
+        // #777777 on white is ~4.48:1.
+        assert!((contrast_ratio([119.0, 119.0, 119.0], white) - 4.48).abs() < 0.02);
+    }
+
+    #[test]
+    fn line_statuses_mark_untimed_estimated_and_fine_tuned() {
+        let mut untimed = LyricLine::new("not yet");
+        untimed.start = None;
+        let mut estimated = LyricLine::new("two words");
+        estimated.start = Some(1.0);
+        let mut tuned = LyricLine::new("two words");
+        tuned.start = Some(3.0);
+        tuned.word_overrides = vec![Some(3.0), Some(3.6)];
+        let mut single = LyricLine::new("Yeah");
+        single.start = Some(5.0);
+        assert_eq!(
+            line_statuses(&[untimed, estimated, tuned, single]),
+            vec![
+                LineStatus::Untimed,
+                LineStatus::Estimated,
+                LineStatus::FineTuned,
+                // One word: nothing left to fine-tune.
+                LineStatus::FineTuned,
+            ]
+        );
+    }
+
+    #[test]
+    fn shortcut_cheat_sheet_has_no_duplicate_keys() {
+        let mut seen = std::collections::HashSet::new();
+        for (_, keys) in SHORTCUTS {
+            for (key, what) in *keys {
+                assert!(!what.is_empty());
+                assert!(seen.insert(*key), "{key} listed twice");
+            }
+        }
+        // The new shortcuts are documented.
+        for key in [", / .", "Enter", "Delete", "Ctrl+E", "Home", "F1 or ?"] {
+            assert!(seen.contains(key), "{key} missing from the cheat sheet");
+        }
+    }
+
+    #[test]
+    fn jump_times_accept_the_common_forms() {
+        assert_eq!(parse_jump_time("83"), Some(83.0));
+        assert_eq!(parse_jump_time(" 1:23.5 "), Some(83.5));
+        assert_eq!(parse_jump_time("01:02:03"), Some(3723.0));
+        assert_eq!(parse_jump_time("-5"), None);
+        assert_eq!(parse_jump_time("abc"), None);
+        assert_eq!(parse_jump_time("1:2:3:4"), None);
+        assert_eq!(parse_jump_time("nan"), None);
+    }
+
+    #[test]
+    fn status_messages_are_classified_by_wording() {
+        use StatusKind::*;
+        let cases = [
+            ("Export complete!\nCDG file: saved to /x.cdg", Success),
+            (
+                "Export finished with some errors:\nVideo: failed - boom",
+                Warning,
+            ),
+            ("Export failed:\nCDG file: failed - disk full", Error),
+            ("Couldn't load audio: no such file", Error),
+            (
+                "Start (00:01.00) can't be before the previous line starts (00:02.00).",
+                Error,
+            ),
+            ("Press Play first, then tap along with the song.", Warning),
+            ("Choose an output folder first.", Warning),
+            (
+                "Loaded project, but its audio file wasn't found at /a.mp3 - load it manually.",
+                Warning,
+            ),
+            ("Saved project to /tmp/song.abyzl", Success),
+            ("Auto-aligned 40 word(s) across 9 line(s).", Success),
+            ("Line 3 ended at 00:12.40.", Info),
+            ("Looping line 4 - press L or Loop line again to stop.", Info),
+            ("Loop end (B) must be after the start (A).", Error),
+            ("", Info),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(classify_status(msg), want, "{msg}");
+        }
+    }
+
+    #[test]
+    fn only_non_routine_statuses_get_a_toast() {
+        assert_eq!(StatusKind::Info.toast_secs(), None);
+        assert!(StatusKind::Error.toast_secs() > StatusKind::Success.toast_secs());
+    }
+
+    #[test]
+    fn step_bar_walks_the_required_steps_in_order() {
+        use StepStatus::*;
+        let mut snap = WorkflowSnapshot::default();
+        let (st, next) = workflow_status(&snap);
+        assert_eq!(next, WorkflowStep::Audio);
+        assert_eq!(st, [Current, Todo, Todo, Optional, Todo]);
+
+        snap.has_audio = true;
+        assert_eq!(workflow_status(&snap).1, WorkflowStep::Lyrics);
+
+        snap.lines = 4;
+        snap.timed = 2;
+        let (st, next) = workflow_status(&snap);
+        assert_eq!(next, WorkflowStep::Tap);
+        assert_eq!(st[..3], [Done, Done, Current]);
+
+        // All timed, words still estimated: Export is next, Fine-tune is
+        // optional and doesn't block it.
+        snap.timed = 4;
+        snap.estimated = 3;
+        let (st, next) = workflow_status(&snap);
+        assert_eq!(next, WorkflowStep::Export);
+        assert_eq!(st[3], Optional);
+        assert_eq!(st[4], Current);
+
+        snap.estimated = 0;
+        snap.exported = true;
+        let (st, _) = workflow_status(&snap);
+        assert_eq!(st, [Done; 5]);
+    }
+
+    #[test]
+    fn step_bar_never_skips_audio_even_with_timed_lyrics() {
+        // e.g. a project whose audio file went missing.
+        let snap = WorkflowSnapshot {
+            lines: 3,
+            timed: 3,
+            ..Default::default()
+        };
+        let (st, next) = workflow_status(&snap);
+        assert_eq!(next, WorkflowStep::Audio);
+        assert_eq!(st[0], StepStatus::Current);
+        assert_eq!(st[2], StepStatus::Done);
+    }
+
+    /// A minimal saved project (old-style file, defaults for everything
+    /// newer) with the given title, audio path and lines.
+    fn write_test_project(
+        dir: &Path,
+        name: &str,
+        title: &str,
+        audio: Option<&Path>,
+        lines: &[LyricLine],
+    ) -> PathBuf {
+        let c = serde_json::json!({ "r": 200, "g": 200, "b": 200 });
+        let json = serde_json::json!({
+            "version": 1,
+            "audio_path": audio,
+            "lyrics_raw": lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n"),
+            "lines": lines,
+            "title": title,
+            "artist": "Band",
+            "colors": {
+                "background": c, "male_unsung": c, "male_highlight": c,
+                "female_unsung": c, "female_highlight": c, "duet_unsung": c,
+                "duet_highlight": c, "preview": c, "title": c, "artist": c,
+                "screaming_unsung": c, "screaming_highlight": c
+            },
+            "video_resolution": "Hd1080",
+        });
+        let path = dir.join(format!("{name}.{}", project::FILE_EXTENSION));
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        path
+    }
+
+    fn timed_line(text: &str, start: f64, end: f64) -> LyricLine {
+        let mut l = LyricLine::new(text);
+        l.start = Some(start);
+        l.sing_end_override = Some(end);
+        l
+    }
+
+    fn text_only_options() -> ExportOptions {
+        ExportOptions {
+            cdg: true,
+            lrc: true,
+            ultrastar: false,
+            ass: false,
+            srt: true,
+            video: false,
+            instrumental: false,
+            vocals: false,
+            zip: false,
+            zip_instrumental: false,
+            lrc_enhanced: true,
+            remove_vocals_for_video: false,
+            instrumental_ext: "mp3",
+        }
+    }
+
+    #[test]
+    fn batch_export_writes_each_song_and_skips_ones_that_cannot_export() {
+        let dir = std::env::temp_dir().join(format!("abyssal-batch-test-{}", std::process::id()));
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let a = write_test_project(
+            &dir,
+            "a",
+            "First Song",
+            None,
+            &[timed_line("hello there", 1.0, 3.0)],
+        );
+        // Same title -> same default file name: must not overwrite "a".
+        let b = write_test_project(
+            &dir,
+            "b",
+            "First Song",
+            None,
+            &[timed_line("another one", 2.0, 4.0)],
+        );
+        let untimed =
+            write_test_project(&dir, "c", "Untimed", None, &[LyricLine::new("not tapped")]);
+        let missing = dir.join("nope.abyzl");
+
+        let progress = std::cell::RefCell::new(Vec::new());
+        let outcomes = run_batch_export(
+            &[a, b, untimed, missing],
+            &text_only_options(),
+            &out,
+            &|p| progress.borrow_mut().push(p),
+        );
+
+        for f in [
+            "First Song.cdg",
+            "First Song.lrc",
+            "First Song.srt",
+            "First Song (2).cdg",
+            "First Song (2).lrc",
+        ] {
+            assert!(
+                out.join(f).is_file(),
+                "{f} missing; outcomes: {:?}",
+                outcomes
+                    .iter()
+                    .map(|o| (&o.label, &o.result))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let lrc = std::fs::read_to_string(out.join("First Song (2).lrc")).unwrap();
+        assert!(lrc.contains("another"), "{lrc}");
+        // Every output of the two good songs succeeded, labeled per song.
+        let ok: Vec<_> = outcomes.iter().filter(|o| o.result.is_ok()).collect();
+        assert_eq!(ok.len(), 6);
+        assert!(ok
+            .iter()
+            .all(|o| o.label.starts_with("a - ") || o.label.starts_with("b - ")));
+        // The untimed and unreadable projects were skipped with a reason.
+        let skipped: Vec<_> = outcomes.iter().filter(|o| o.result.is_err()).collect();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().any(|o| o.label == "c"
+            && o.result
+                .as_ref()
+                .unwrap_err()
+                .contains("No lines are timed")));
+        assert!(
+            skipped
+                .iter()
+                .any(|o| o.label == "nope"
+                    && o.result.as_ref().unwrap_err().contains("couldn't open"))
+        );
+        // Progress only moves forward and finishes at 100%.
+        let p = progress.borrow();
+        assert!(p.windows(2).all(|w| w[1] >= w[0]), "{p:?}");
+        assert_eq!(p.last(), Some(&1.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_skips_a_song_whose_audio_is_needed_but_missing() {
+        let dir = std::env::temp_dir().join(format!("abyssal-batch-audio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_test_project(
+            &dir,
+            "song",
+            "Song",
+            Some(Path::new("/definitely/not/here.mp3")),
+            &[timed_line("hi there", 1.0, 2.0)],
+        );
+        let opts = ExportOptions {
+            video: true,
+            ..text_only_options()
+        };
+        let outcomes = run_batch_export(&[p], &opts, &dir, &|_| {});
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0]
+            .result
+            .as_ref()
+            .unwrap_err()
+            .contains("audio file wasn't found"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_names_default_and_stay_unique() {
+        assert_eq!(
+            default_export_base_name(Some(Path::new("/m/Artist - Song.flac")), "T"),
+            "Artist - Song"
+        );
+        assert_eq!(default_export_base_name(None, "  My Title "), "My Title");
+        assert_eq!(default_export_base_name(None, "   "), "karaoke");
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(unique_base_name("Song", &mut used), "Song");
+        assert_eq!(unique_base_name("song", &mut used), "song (2)");
+        assert_eq!(unique_base_name("Song", &mut used), "Song (3)");
+    }
+
+    #[test]
+    fn project_colors_convert_the_same_way_loading_a_project_does() {
+        // Old file without Default/Backing colors: Default falls back to
+        // Male's, Backing to the default palette's.
+        let c = project::RgbColor {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
+        let colors = project::ProjectColors {
+            background: c,
+            default_unsung: None,
+            default_highlight: None,
+            male_unsung: project::RgbColor { r: 1, g: 2, b: 3 },
+            male_highlight: c,
+            female_unsung: c,
+            female_highlight: c,
+            duet_unsung: c,
+            duet_highlight: c,
+            preview: c,
+            title: c,
+            artist: c,
+            screaming_unsung: c,
+            screaming_highlight: c,
+            backing_unsung: None,
+            backing_highlight: None,
+        };
+        let e = ExportColors::from_project(&colors);
+        assert_eq!(e.default_unsung, e.male_unsung);
+        assert_eq!(
+            e.backing_unsung,
+            color32_from_cdg(Palette::default().backing_unsung)
+        );
+    }
+
+    #[test]
+    fn loop_wraps_only_on_a_forward_crossing_of_its_end() {
+        assert!(loop_should_wrap(Some(9.98), 10.01, 10.0));
+        assert!(!loop_should_wrap(Some(9.0), 9.5, 10.0));
+        // Seeking past the end by hand: already beyond it last frame.
+        assert!(!loop_should_wrap(Some(30.0), 30.02, 10.0));
+        // First frame after starting/seeking never wraps.
+        assert!(!loop_should_wrap(None, 12.0, 10.0));
+    }
 
     #[test]
     fn lyrics_edit_tracking_finds_a_pasted_block() {

@@ -1,8 +1,9 @@
 # Features
 
 The full walkthrough of what this app does and how to use it. See
-[README.md](README.md) for a quick overview, installing a prebuilt release,
-and building from source.
+[README.md](README.md) for a quick overview,
+[docs/INSTALLING.md](docs/INSTALLING.md) for installing, and
+[docs/BUILDING.md](docs/BUILDING.md) for building from source.
 
 The very first time you launch the app on a given machine, a one-time
 disclaimer window (the same content as the Codex's "Legal Disclaimer &
@@ -11,6 +12,88 @@ before anything else, with an "I Understand" button to dismiss it. It's a
 per-machine, not per-project, acknowledgment - once dismissed, it never
 shows again on that machine regardless of which project you open or
 create afterward.
+
+## Contents
+
+- [Finding your way around](#finding-your-way-around)
+- [What it does](#what-it-does) - the whole workflow, step by step
+- [Two very different export formats](#two-very-different-export-formats)
+- [The "get ready" countdown](#the-get-ready-countdown)
+- [The fine-tuning timeline](#the-fine-tuning-timeline)
+- [Removing vocals](#removing-vocals)
+- [Auto-aligning word timing](#auto-aligning-word-timing)
+- [Live preview vs. the exported file](#live-preview-vs-the-exported-file)
+- [Importing existing lyric files](#importing-existing-lyric-files)
+- [Exporting to LRC / UltraStar](#exporting-to-lrc--ultrastar)
+- [Copying a chorus's timing](#copying-a-choruss-timing)
+- [Syllables (per-syllable timing)](#syllables-per-syllable-timing)
+- [Video export options](#video-export-options)
+- [Exporting subtitles (.ass / .srt)](#exporting-subtitles-ass--srt)
+- [Outro card](#outro-card)
+- [Batch export](#batch-export)
+- [Pre-export checklist](#pre-export-checklist)
+- [Known limitations / ideas for extending it](#known-limitations--ideas-for-extending-it)
+
+## Finding your way around
+
+### The step bar
+The step bar across the top of the window -
+**Audio › Lyrics › Tap › Fine-tune › Export** - ticks each step off (✔)
+as you finish it, highlights the one you're on (with a running "12/40"
+count while tapping), and the line under it always says what to do now,
+with a button that does it: *Load audio…*, *Parse lyrics*, *▶ Start
+tapping* (picks up a couple of seconds before your last tap), *Export…*.
+Fine-tuning words is marked ◇ optional - it never stands between you and
+exporting. Hover any step for a one-line reminder of what it involves.
+
+### Play controls
+One row: **⏮** back to the start, one **▶ Play / ⏸
+Pause** button, ⏪ 5s, the seek bar, 5s ⏩, and the time readout - click
+it, type a time (`1:23.5`, `1:02:03`, or plain seconds) and press Enter
+to jump there. Speed and Loop sit together on the row below.
+
+### The timing table
+Each row has a status dot - amber = not
+timed yet, grey = timed with estimated word timing, green = fine-tuned
+(or a one-word line) - and a progress bar above the table counts them
+("23/41 timed · 6 estimated · 17 fine-tuned"). A row's Tap / Words /
+Backing / ±0.1s / ✕ buttons appear when you hover it (and stay on the
+line you're tapping, the one open in the fine-tune panel, and any
+checked rows), so a long song isn't a wall of buttons.
+
+### Keyboard shortcuts
+Press **F1** or **?** (or click **⌨ Shortcuts**
+in the top panel) for the full list. Beyond tapping (Space, Shift+Space,
+M/F/D/S/B): **, / .** nudge the current line's start by 0.1s
+(**Shift+, / Shift+.** shift the selected lines instead), **Enter**
+re-taps the current line, **Delete** clears its timing, **Home** jumps to
+the start, **L** loops the line, **Ctrl+E** opens Export. "Current line"
+is the one open in the fine-tune panel, otherwise the one you tapped
+last. Single-key shortcuts never fire while you're typing in a text box.
+
+### Messages and toasts
+The status line at the bottom of the top
+panel is color-coded - green ✔ for success, amber ⚠ for something to do
+first (or a partial success), red ✖ for an error - and anything other
+than routine progress also pops up as a toast in the bottom-right corner
+that fades after a few seconds (click to dismiss). After an export, a
+**📂 Open folder** button opens the output folder in your file manager.
+
+### Tips, UI size and remembered settings
+Untick **💡 Tips** (top panel) and the
+explanations under each control shrink to a one-line summary - hover its
+ⓘ for the full text. It's remembered on this computer, and starts on for
+a fresh install so first-time users get the full guidance.
+
+**UI size − 100% +** in the top panel (or
+Ctrl+= / Ctrl+- / Ctrl+0) scales the whole window - handy on a 4K
+screen - and is remembered on this computer. The app's purple accent marks
+the main actions (Play, Tap, Export, the step bar's current step) and
+selections throughout.
+
+The folder you pick in the export
+dialog is filled in automatically next time - even after restarting the
+app - as long as it still exists, and **Choose folder…** opens there.
 
 ## What it does
 
@@ -41,6 +124,26 @@ create afterward.
    says which one (start or end, and which line) the next press will set.
    Skipping the end-tap is fine too - it just falls back to an automatic
    estimate until you set it, either later or via the timeline/table below.
+   For lines sung straight into each other with no gap, **Shift+Space**
+   (or the **End this line + start the next** button under the tap
+   button) ends the current line and starts the next one at the same
+   instant, in one tap. A live tap is never thrown away: if you've
+   seeked back and tap a line's start before the previous line's end,
+   that end is pulled back to meet it, and an end tapped after the next
+   line's (already-set) start is clamped to it.
+   **Tap latency** (under the tap button) subtracts a fixed number of
+   milliseconds from every tap - tap-along, re-taps, backing lines, and
+   word/line-end taps in the fine-tune panel - to cancel out how late you
+   tap after hearing a line start (typically 100-200 ms, more with
+   Bluetooth headphones). If your taps consistently land a little late on
+   the timeline, raise it. It's saved on this computer, not in the
+   project, since it's about you and your headphones rather than the
+   song, and it only affects new taps. To fix a song you've already
+   tapped, select its lines (or **Select all**) and use **Shift
+   selection ◀ Earlier / Later ▶** above the timing table - it moves each
+   selected line's start, end and word timing together by the amount you
+   set, and refuses (changing nothing) if that would overlap an
+   unselected line or go before the start of the song.
    Press **M/F/D/S/B** at any point to set the current line's voice
    (Male/Female/Duet/Screaming/Backing) without reaching for the mouse.
    Tap-along skips backing-vocal lines (see step 7) - they're timed
@@ -52,6 +155,14 @@ create afterward.
    ⏪5s/5s⏩ buttons, or the left/right arrow keys) to jump straight back to any
    point in the song and pick up tapping again from there - no need to
    replay from the start.
+   **Fast song?** The **Speed** buttons under the play controls (0.5× / 0.75× / 1×)
+   slow playback down for tapping fast lines or fine-tuning words. Taps
+   still record the real song time (and tap latency compensation scales
+   with the speed, since your reaction time is real time, not song time).
+   Pitch drops along with the speed - it's a timing aid, not a
+   pitch-preserving time stretch - and it only affects playback in the
+   app, never anything exported. It stays set across seeks and restarts
+   until you change it.
 6. **Watch the live preview** update in real time as the song plays, so you
    can see exactly how the exported file will look *before* you export -
    word-by-word color wipe, verse-style multi-line blocks, countdown dots
@@ -117,6 +228,17 @@ create afterward.
      needs a click - turn Auto-follow off to keep the panel on one line
      until you click a different one yourself (or a bubble on the
      timeline).
+   - **Loop a line while you fine-tune it**: **🔁 Loop this line** in the
+     fine-tune panel (or **Loop line** next to Speed, or the **L** key)
+     repeats that line with a second of lead-in and half a second after,
+     so you can click its words over and over until they land. The loop
+     follows the line's timing as you change it, and Auto-follow holds
+     still on the looped line meanwhile. For any other stretch of the
+     song, **A** and **B** set a free loop from the current playback
+     position. The loop only jumps back when playback reaches its end, so
+     you can still seek anywhere; **✖** (or L again, for a line loop)
+     stops it. The active loop is shaded on the timeline. Pairs well with
+     the **Speed** buttons.
    - Fine-tune visually on the **timeline** at the bottom of the window
      (see below) - a waveform of the loaded audio is drawn behind the
      bubbles, so you can drag one to line up with an actual vocal onset
@@ -140,6 +262,17 @@ create afterward.
    uses its own color pair, separate from Male - it starts out looking
    identical to Male, but can be set independently, e.g. to match a
    background image/video's palette.
+   **Readability checks.** The Colors section checks your colors the way
+   the `.cdg` will actually show them (only 16 shades per color channel,
+   so two picked colors can come out identical) for the voices your song
+   uses: an upcoming/sung pair too close for the wipe to show, text too
+   faint against the background (under the usual 3:1 contrast for large
+   text), or two voices singing in nearly the same color. Any problems
+   show as **⚠ N** on the Colors header, listed inside it, and as notes in
+   the export checklist. Every built-in preset passes (Abyssal's upcoming
+   colors were brightened just enough - same hues, still dark and moody -
+   to read on a TV across a room); the Classic look now has Duet sing in sky blue rather than orange, which
+   is hard to tell from Male's yellow with red-green color blindness.
 10. **Use an image or video as the background** (album art, a music video,
     ...) instead of a flat color - the **Background** panel below the
     preview lets you choose one, pick a **fit** mode, and adjust a **dim**
@@ -156,9 +289,13 @@ create afterward.
     video background rather than true playback. The `.cdg` export always
     uses the flat color instead - it's a fixed 300x216, 16-color format
     with no room for real images.
-11. **Export** a `.cdg` file, a real **MP4 video**, an **instrumental copy
-    of the audio**, and/or **LRC/UltraStar lyrics files** (see below) - any
-    combination, from one dialog with one shared progress bar.
+11. **Export** a `.cdg` file (optionally packaged with an `.mp3` as an
+    MP3+G `.zip`), a real **MP4 video**, an **instrumental or vocals-only
+    copy of the audio**, **`.ass`/`.srt` subtitles**, and/or
+    **LRC/UltraStar lyrics files** (see below) - any combination, from one
+    dialog with one shared progress bar, after a quick pre-export
+    checklist. Several saved projects can be exported in one go with
+    **Batch export**.
 
 Along the way: **Ctrl+Z/Ctrl+Shift+Z** undo/redo almost anything (tapping,
 nudging, dragging, auto-align, parsing), so there's no need to be careful
@@ -188,11 +325,12 @@ carrying over whatever the previous project had selected.
   longer lines so nothing clips off-screen.
 - **`.mp4`** is a real video file (AV1 by default, H.264 selectable for
   compatibility - see "Known limitations" below - plus AAC audio, at
-  your choice of 1080p or 4K) with proper anti-aliased text - this is the "looks like a modern
+  720p, 1080p or 4K, in 16:9 or vertical 9:16 - see "Video export
+  options" below) with proper anti-aliased text - this is the "looks like a modern
   KaraFun/karadeo.com video" option, and it has no resolution ceiling at
   all. It's a much heavier file and needs `ffmpeg` (bundled with an
-  installed copy of the app - see the README's Building section for a dev
-  build), but it'll look sharp on any screen. Unlike the `.cdg`
+  installed copy of the app - see [docs/BUILDING.md](docs/BUILDING.md) for a
+  dev build), but it'll look sharp on any screen. Unlike the `.cdg`
   path (which only has room for one current line + a one-line preview),
   the video groups lines into verse-style blocks of up to 5 lines, split
   **exactly wherever you left a blank line in your pasted lyrics** - so if
@@ -388,7 +526,18 @@ one step if a result isn't an improvement.
 
 ## Live preview vs. the exported file
 
-The in-app preview isn't a literal decoder for either export format - it's
+The preview has two modes, switched with the **Video / .cdg (exact)**
+buttons above it (in the side panel or the popped-out window).
+
+**.cdg (exact)** *is* a literal decoder: it renders the real `.cdg` bytes
+the exporter would write (in the background, a moment after you change
+timing, colors or text) and plays them back at the current position,
+exactly as a karaoke player would show them - the 300x216 canvas, its
+16-color palette, the 2x/1x text sizing, the one-line-plus-preview
+layout, and any clipping. Pixels are scaled up without smoothing so you
+see the real blocky look.
+
+**Video** (the default) isn't a literal decoder - it's
 a second renderer that draws the *same* timing/color/layout data live,
 using the same underlying timing math (word highlight times, countdown
 windows, title card duration, block grouping) shared with both exporters.
@@ -400,8 +549,8 @@ the one most people are timing against. The `.cdg` export is more
 constrained (one current line + a single dim preview line underneath, per
 the format's tiny 300x216 canvas) and won't look identical to the preview
 even though the *timing* is identical. If you're targeting `.cdg`
-specifically, the most direct way to check its exact look is to just
-export it - a short song encodes quickly - and skim the result.
+specifically, switch the preview to **.cdg (exact)** to see its real
+look.
 
 Same idea applies to a **video background**: the live preview shows one
 representative frame from it rather than true playback (full frame-accurate
@@ -421,6 +570,16 @@ Never Gonna Give You Up.mp3
 This "MP3+G" pairing is what karaoke jukebox software (e.g. PCDJ, Karafun
 Player, KJ software, most standalone karaoke machines with a USB/SD slot)
 expects and will detect automatically.
+
+**MP3+G `.zip`.** Tick **Also package as an MP3+G .zip** under `.cdg` in
+the export dialog to also get `Song.zip` holding `Song.cdg` and
+`Song.mp3` - the format many karaoke hosts and KJ programs import songs
+in. Pick the zip's audio: the **original song** (copied as-is if it's
+already an MP3, otherwise converted to a 320kbps MP3 with the bundled
+ffmpeg) or the **instrumental** (vocals removed - most karaoke tracks are
+instrumentals; this runs the vocal-removal model, shared with any other
+vocal-removal export picked at the same time). The loose `.cdg` and
+paired audio are still saved alongside it.
 
 ## Importing existing lyric files
 
@@ -481,13 +640,156 @@ pairing, the loaded audio is copied alongside either one under the
 matching base filename if you have it loaded, ready to drop into a
 folder-based player/game library.
 
+## Copying a chorus's timing
+
+Choruses usually repeat to the same rhythm, so once one is timed (and its
+words fine-tuned), the others don't need tapping from scratch. Tick the
+timed chorus lines' checkboxes in the timing table and click **📋 Copy
+timing to…**:
+
+- The dialog points at the next place those lines repeat (same words,
+  ignoring capitalization and punctuation) - **Find repeat** jumps to it
+  again, or set the first line yourself.
+- A preview pairs each copied line with its target: ✔ = same words, so
+  every word's timing is copied; ≠ = different words, so only the line's
+  start/end are copied and its words go back to the estimate.
+- Set where the repeat starts: **Where line N already starts** (if it's
+  tapped), or play the song and click **⏱ It starts now** the moment the
+  repeat begins (tap latency compensation applies).
+
+Every line and word lands at the same spacing as the original. It's
+all-or-nothing - if the copy would overlap a neighboring line, nothing
+changes and the status says which line - and Ctrl+Z undoes it.
+
+## Syllables (per-syllable timing)
+
+For a word held across several notes, mark its syllables with `|` in the
+pasted lyrics - `beau|ti|ful` - and each syllable becomes its own timing
+unit: its own button in the fine-tune panel (shown as `beau-` `-ti-`
+`-ful`), its own bubble on the timeline, its own highlight time in the
+wipe. It still *displays* as one word ("beautiful") everywhere - preview,
+video, `.cdg`, subtitles. Adding marks to an already-timed word keeps its
+start (now the first syllable's) and end (the last syllable's); the
+syllables in between start out estimated.
+
+`|` rather than `-` so real hyphenated words ("well-known", "x-ray") stay
+as they are. Auto-align still aligns whole words and divides each word's
+time among its syllables by letter count. Exports carry syllables through:
+LRC2 writes a tag per syllable (`<..>beau<..>ti<..>ful`), UltraStar a note
+per syllable, `.ass` a `\kf` per syllable. Importing works the other way:
+UltraStar syllable notes and LRC2 tags inside a word become `|`-marked
+syllables with their own times (previously UltraStar syllables were merged
+into whole words, and LRC2 mid-word tags made the line's word timing
+unusable); UltraStar `~` hold notes extend the previous syllable.
+
+## Video export options
+
+Under **Video (.mp4)** in the export dialog, alongside resolution and
+codec (all saved with the project):
+
+- **Resolution** - 720p (quick drafts, smaller files), 1080p or 4K.
+- **Shape** - **16:9** (YouTube, TVs, karaoke screens) or **9:16**
+  (YouTube Shorts, TikTok, Instagram Reels). Text is sized from the
+  frame's short side, so lyrics are the same size either way up instead of
+  overflowing the narrow vertical frame. The live preview switches shape
+  to match.
+- **Lyric size** (60-160%) - the lyric lines and backing lane; the title
+  card keeps its size. Long lines still shrink to fit. Shown in the live
+  preview.
+- **Text outline** / **Drop shadow** - a dark outline and/or soft shadow
+  under all text, for legibility over a busy image or video background.
+  Exported video only (the live preview doesn't draw them).
+- **Fade out audio at the end** - over the last 0.5-15 seconds.
+
+## Exporting subtitles (.ass / .srt)
+
+Two subtitle exports in the export dialog, for putting lyrics on your own
+video or uploading captions:
+
+- **Karaoke subtitles (.ass)** - each line appears a second before it's
+  sung and each word sweeps from its unsung to its sung color as it's
+  sung (`\kf` karaoke tags, from the same word timing as the `.cdg`/video
+  wipe - a word with a manually set end pauses before the next one). One
+  style per voice in your Colors-panel colors, a smaller style for
+  backing lines, and the title/artist card. Uses your chosen lyric font
+  (Arial if none is chosen; a player without that font substitutes its
+  own). Plays in VLC and mpv, opens in Aegisub, and most video editors can
+  burn it into a video.
+- **Plain subtitles (.srt)** - one cue per lyric line (backing lines
+  included, interleaved by time) plus the title/artist, no word timing.
+  The most widely supported format - YouTube captions, any player.
+
+Both need every line timed, like the other lyric exports.
+
+## Outro card
+
+Tick **Outro card** under the song title/artist fields to end the song
+with a closing card - your own text (up to 3 lines, the first shown
+largest; "Thanks for singing!" by default), optionally followed by the
+title and "by artist". It appears 1.5 seconds after the last line (main
+or backing) finishes and stays until the song ends, fading in - in the
+video, the live preview (both modes), the `.cdg` and the `.ass`/`.srt`
+subtitles. The line under the checkbox shows exactly when it'll be on
+screen; if the song ends less than 3.5 seconds after its last line,
+there's no room and it's skipped. Saved with the project; off by default.
+
+## Batch export
+
+At the bottom of the export dialog, **Batch export** exports several
+saved projects (`.abyzl`) in one go, with the dialog's current choices
+(which formats, zip audio, LRC style, stem format, remove vocals) into
+the chosen folder. **Choose projects…** adds files (pick as many as you
+like, run it again to add more, ✖ removes one), then **Export N
+project(s)**. Projects are read straight from their files - the project
+you have open isn't touched.
+
+- Each song uses its own saved colors, video resolution/codec/shape/style,
+  lyric font, background and audio file.
+- Files are named the way the export dialog would name them: after the
+  song's audio file, else its title. Two songs that would get the same
+  name become `Name` and `Name (2)` rather than overwriting each other.
+- A song that can't be exported - its file won't open, not every line is
+  timed, or an output needs its audio file and it's not where the project
+  says - is skipped with the reason, and the rest carry on. The status
+  bar lists every file written and every song skipped.
+
+## Pre-export checklist
+
+The export dialog runs a quick checklist over whatever you're about to
+export and lists anything worth a look - **warnings** (⚠, will visibly
+look wrong) first, then **notes** (ℹ, often fine). None of them stop the
+export; only missing timing does that. Each item has a **Show** button
+that opens the line in the fine-tune panel, scrolls the timing table to
+it and moves playback to just before it.
+
+- **Line too long for `.cdg`** (`.cdg` only) - a row fits 48 characters;
+  the rest is cut off. **Split line** splits it into two lines at the
+  middle word, keeping its timing (the split falls where the second
+  half's first word is sung) and updating the lyrics box to match.
+  Ctrl+Z undoes it.
+- **Characters the `.cdg` can't draw** (`.cdg` only) - see "Known
+  limitations" below.
+- **Lines that start after the song ends** - never shown.
+- **Lines sung for under 0.3s** - usually a double-tap; the whole wipe
+  flashes by.
+- **Words highlighted for under 60ms** (note) - flash rather than wipe.
+- **Lines still on estimated word timing** (note) - fine for a quick
+  export; click words or run Auto-align for an accurate wipe.
+
 ## Known limitations / ideas for extending it
 
-- Text wider than 48 characters gets clipped (very long lyric lines) -
-  consider auto-splitting long lines during parsing if you hit this.
-- Only Latin/basic-ASCII glyphs are available from `font8x8`'s basic set;
-  accented characters will render blank. Swap in a different font source in
-  `font.rs` if you need broader character coverage.
+- In the `.cdg`, text wider than 48 characters gets clipped - the
+  export dialog's checklist flags these lines and can split them for you.
+- The `.cdg` font is a fixed bitmap font covering ASCII and Latin-1
+  (é, ñ, ü, ç, ß, ¿, ...). Curly quotes, long dashes and ellipses (as
+  pasted from most lyrics sites) draw as their plain equivalents, and
+  other accented Latin letters (ő, š, ł, ...) as their base letter -
+  your lyric text itself is never changed. Anything else (non-Latin
+  scripts, emoji) still renders blank in the `.cdg`; the export dialog
+  lists any such characters before you export. The video export uses a
+  real font and isn't affected - and if your chosen lyric font is missing
+  a curly quote or accented letter, the same plain stand-in is drawn
+  instead of leaving a gap.
 - Tapping sets both the start and end of each line (two taps), but the
   word-by-word wipe *within* that window is still an *estimate* by default
   (word count x ~0.45s/word) unless you fine-tune specific words via the
@@ -520,16 +822,27 @@ folder-based player/game library.
   row-selection checkboxes stay visible on the left no matter how far
   right you've scrolled, and the **Compact table** checkbox truncates
   long lyric lines (hover a truncated one for the full text) if you want
-  less to scroll through. Drag the divider between the side panels and
+  less to scroll through. While the song plays, the table also scrolls
+  itself to keep the line being timed in view (the next line to tap, or
+  the line the fine-tune panel is following) - turn off **Follow current
+  line** above the table to scroll it yourself. It only moves when the
+  next line comes up, so scrolling by hand in between isn't fought.
+  Drag the divider between the side panels and
   the middle to resize if you want more room - it's remembered across
   restarts.
-- The live preview is a second renderer reading the same timing data, not
-  a decoder of the actual `.cdg` bytes - see "Live preview vs. the exported
-  file" above.
-- Vocal removal always uses one hardcoded model
-  (`UVR-MDX-NET-Inst_HQ_3.onnx`) - there's no in-app way to pick a
-  different separation model or tune its parameters (segment size,
-  overlap, etc.) yet.
+- The live preview's default **Video** mode is a second renderer reading
+  the same timing data (switch to **.cdg (exact)** to see the real `.cdg`
+  output decoded) - see "Live preview vs. the exported file" above. Its
+  Video mode doesn't draw the video export's text outline/drop shadow;
+  those only appear in the exported `.mp4`.
+- Slowed-down playback (0.5x / 0.75x) lowers the pitch along with the
+  tempo - it's a timing aid, not a pitch-preserving time-stretch, and it
+  never affects exports.
+- Vocal removal for exports (instrumental/vocals audio, the video's
+  "Remove vocals", the MP3+G zip's instrumental) always uses one model
+  (`UVR-MDX-NET-Inst_HQ_3.onnx`) - only auto-align's own vocal isolation
+  has a model choice, and there's no way to tune the model's parameters
+  (segment size, overlap, etc.) yet.
 - Exported `.mp4` video defaults to **AV1** (via the bundled SVT-AV1
   encoder, BSD-2-Clause-Patent - see `src/video.rs`), a real
   quality-targeted (CRF) encoder: one `crf` value (32, picked for this
@@ -542,8 +855,8 @@ folder-based player/game library.
   the export dialog for compatibility - older devices/software, or a
   downstream tool that expects H.264 specifically. Unlike AV1, openh264
   has no CRF-style "target a quality level, let file size float" mode, so
-  the H.264 option uses a fixed bitrate (`src/video.rs` - 5M for 1080p,
-  14M for 4K, already tuned down once against real exports to avoid
+  the H.264 option uses a fixed bitrate (`src/video.rs` - 3M for 720p,
+  5M for 1080p, 14M for 4K, in either orientation - already tuned down once against real exports to avoid
   needlessly huge files for this app's low-motion content) rather than
   genuinely optimized encoding. The export dialog discloses this
   trade-off next to the codec picker rather than silently encoding

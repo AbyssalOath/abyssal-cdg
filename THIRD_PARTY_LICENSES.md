@@ -161,8 +161,8 @@ Apache-2.0 OR BSD-3-Clause (2): moxcms, pxfm
 Apache-2.0 OR BSD-3-Clause OR MIT (2): num_enum, num_enum_derive
 Apache-2.0 OR CC0-1.0 (1): imgref
 Apache-2.0 OR ISC OR MIT (1): rustls
-Apache-2.0 OR LGPL-2.1-or-later OR MIT (2): r-efi, r-efi
-Apache-2.0 OR MIT (313): (see `cargo license` for the full list - too long to usefully inline; includes ort, ndarray, rustfft, realfft, rubato, hound, bzip2-rs, ureq, dirs, unicode-normalization, serde, egui_commonmark, egui_extras, sha2, and most of the rest of this project's direct dependencies)
+Apache-2.0 OR LGPL-2.1-or-later OR MIT (1): r-efi
+Apache-2.0 OR MIT (312): (see `cargo license` for the full list - too long to usefully inline; includes ort, ndarray, rustfft, realfft, rubato, hound, bzip2-rs, ureq, dirs, unicode-normalization, serde, egui_commonmark, egui_extras, sha2, flate2, crc32fast, and most of the rest of this project's direct dependencies)
 Apache-2.0 OR MIT OR Zlib (18): bytemuck, bytemuck_derive, cursor-icon, dispatch2, glow, miniz_oxide, objc2-app-kit, objc2-core-foundation, objc2-core-graphics, objc2-io-surface, raw-window-handle, raw-window-handle, tinyvec, visibility, xkeysym, zune-core, zune-inflate, zune-jpeg
 BSD-2-Clause (3): av1-grain, rav1e, v_frame
 BSD-3-Clause (5): avif-serialize, exr, lebe, ravif, subtle

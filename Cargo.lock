@@ -20,15 +20,17 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "abyssal-cdg"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "ab_glyph",
  "anyhow",
  "bzip2-rs",
+ "crc32fast",
  "dirs",
  "eframe",
  "egui",
  "egui_commonmark",
+ "flate2",
  "font-kit",
  "font8x8",
  "hound",

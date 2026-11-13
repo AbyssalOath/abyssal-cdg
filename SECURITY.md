@@ -30,7 +30,7 @@ Abyssal CDG Creator is a local, single-user desktop application. It has no netwo
 client of its own, no telemetry, no accounts, and no server component - everything it
 does happens on the machine it's running on, on files the user explicitly chooses (via
 a file-open/save dialog, dragging a file onto the window, or picking one from the
-"Recent" list), plus a small, fixed-location autosave/recent-files store in the app's
+"Recent" list), plus a small, fixed-location autosave/recent-files/preferences store in the app's
 own per-user data directory (see "Design notes" below). That significantly limits
 what a "vulnerability" can mean here.
 
@@ -64,11 +64,19 @@ what a "vulnerability" can mean here.
   the language actually selected downloads, on first use. `onnxrt.rs` (the ONNX
   Runtime library itself) and `ffmpeg_path.rs`'s `ffmpeg` binary specifically (as
   opposed to openh264) deliberately do *not* auto-download - see the note below.
-- Path traversal via a shared `.abyzl` project file's `title` field, which
-  auto-fills the export dialog's base filename with no validation of its own -
-  `main.rs`'s `sanitize_export_base_name` reduces it to `Path::file_name()` (discarding
-  any traversal sequence or absolute-path override) before it's used to build any of
-  the 6 export output paths. A report showing a way around that reduction is in scope.
+- Path traversal via a shared `.abyzl` project file's `title` field (or its audio
+  file's name), which auto-fills the export base filename with no validation of its
+  own - `main.rs`'s `sanitize_export_base_name` reduces it to `Path::file_name()`
+  (discarding any traversal sequence or absolute-path override) before it's used to
+  build any export output path, the names of the entries inside an MP3+G `.zip`, or a
+  **batch export**'s per-song file names (`default_export_base_name`). Batch export
+  reads each chosen project file directly, without loading it into the app, so a
+  malicious project in a batch is the same surface as opening it. A report showing a
+  way around that reduction is in scope.
+- Injection into the generated `.ass` subtitles: lyric/title text is escaped
+  (`formats.rs`'s `ass_escape` - `{`, `}` and `\` replaced) so it can't open an
+  override block or escape sequence in a player that renders the file. A way to get
+  styling or script tags through from lyrics is in scope.
 - Path handling bugs that write or read outside of what the user selected (in a file
   dialog, dropped onto the window, or picked from the "Recent" list), including the
   throwaway temp files `vocals.rs`/`main.rs` create (under the OS temp dir, named with
@@ -139,6 +147,9 @@ security issue):**
   manual setup instructions (the official archive URL to fetch, or - for macOS
   x86_64, which has no official archive - a pointer to the release workflow's
   from-source build job) rather than silently fetching and unpacking an archive.
+- **📂 Open folder** (after an export) launches the system file manager -
+  `explorer` / `open` / `xdg-open`, via `Command::arg` with no shell - on the export
+  folder the user chose, and nothing else.
 - `ffmpeg` is invoked as a subprocess with a fixed, hardcoded argument list plus a
   handful of typed values (paths, an enum-selected resolution, an integer fps) passed
   as individual `Command::arg`s - never interpolated into a shell string. Keep it that
@@ -151,8 +162,8 @@ security issue):**
   installed tool for either. Neither shells out to Python/`audio-separator`/`aeneas`
   anymore.
 - File I/O is mostly user-directed: audio/lyrics/project files are opened, and
-  `.cdg`/`.mp4`/instrumental audio/vocals audio/`.lrc`/UltraStar `.txt`/`.abyzl`
-  project files are saved, through `rfd`'s native file dialogs, a file dropped onto
+  `.cdg`/MP3+G `.zip`/`.mp4`/instrumental audio/vocals audio/`.lrc`/UltraStar
+  `.txt`/`.ass`/`.srt`/`.abyzl` project files are saved, through `rfd`'s native file dialogs, a file dropped onto
   the window, or a path picked from the "Recent" list (itself built only from paths
   the user previously opened through one of those routes). The paths this app takes
   on its own initiative are the crash-recovery autosave and the recent-files list

@@ -1,206 +1,117 @@
 # Abyssal CDG Creator
 
-A desktop application written in Rust and egui for creating real CD+G karaoke files from audio and lyrics.
-
-Abyssal CDG Creator is designed for people who want to make karaoke tracks without fighting complex or outdated software. Import audio, paste lyrics, automatically align timing, customize colors and layout, and export authentic `.cdg` files compatible with karaoke players and MP3+G software.
-
-Creating karaoke tracks still takes effort, but Abyssal CDG Creator aims to make the process faster, simpler, and more approachable.
-
-**You're responsible for the audio/lyrics you use with this tool** - see [DISCLAIMER.md](DISCLAIMER.md).
+**Make real karaoke files from a song and its lyrics.** Load the audio,
+paste the lyrics, tap along - and export a `.cdg` for karaoke machines and
+MP3+G players, an MP4 karaoke video, subtitles, or lyric files.
 
 [![CI](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml/badge.svg)](https://github.com/AbyssalOath/abyssal-cdg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/AbyssalOath/abyssal-cdg)](https://github.com/AbyssalOath/abyssal-cdg/releases/latest)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
 ![Rust: stable](https://img.shields.io/badge/rust-stable-blue)
 
-## Demonstrations
-![Usage Screenshot](assets/screenshots/usage.png)
+![Abyssal CDG Creator](assets/screenshots/usage.png)
 
-![Export Screenshot](assets/screenshots/export.png)
+Free and open source, for Windows, macOS and Linux. Everything - vocal
+removal, video export, auto-alignment - runs on your own computer, with
+nothing extra to install.
 
-![MP4 Screenshot](assets/screenshots/abyssal-cdg-example-3.png)
+**You're responsible for the audio and lyrics you use with this tool** -
+see [DISCLAIMER.md](DISCLAIMER.md).
 
-## What it does
+## Download
 
-Paste (or import) lyrics, load an audio file, and tap **Space** along with
-the song to time each line - then export a real karaoke `.cdg` file, an
-MP4 video, an instrumental/vocals-only copy of the audio, or LRC/UltraStar
-lyrics files, any combination at once. A live preview shows exactly how
-the export will look as you go, and everything is undoable (Ctrl+Z).
+Get the installer for your system from the
+**[latest release](https://github.com/AbyssalOath/abyssal-cdg/releases/latest)**:
+`.msi`/`.exe` (Windows), `.dmg` (macOS), `.AppImage`/`.deb` (Linux).
 
-Highlights:
+The app isn't code-signed, so the first launch shows a warning on Windows
+and macOS, and the Linux AppImage needs `chmod +x` first.
+**[docs/INSTALLING.md](docs/INSTALLING.md)** has the one-click way past
+each, plus how to verify your download.
 
-- **Two fine-tuning tools beyond tapping**: a draggable waveform timeline,
-  and one-click **auto-align** (real speech-recognition, run against
-  isolated vocals for better accuracy, to fill in word-level timing
-  automatically) - best-effort, not perfect, so still worth a quick
-  review before exporting.
-- **Vocal removal** built in (a real ML separation model, not a filter
-  trick) - for an instrumental/vocals-only export, or to sing against.
-- **Custom colors/presets, a background image or video, and per-line
-  Male/Female/Duet/Screaming/Backing voices** for duets and intense sections.
-- **Overlapping backing vocals** - mark any lyric line as a backing vocal
-  and it's timed independently, overlapping the main lyrics freely (a
-  screamed part behind the lead, a duet where both singers overlap with
-  different words), shown in its own lane.
-- **Imports** existing LRC, UltraStar, and KOK lyric files with their
-  timing intact; **exports** to LRC/UltraStar too, not just `.cdg`/`.mp4`.
+## Your first song in five steps
 
-See [FEATURES.md](FEATURES.md) for the full walkthrough of every feature
-above, plus known limitations.
+The **step bar** across the top of the app walks you through these and
+always shows what to do next.
 
-## Installing a prebuilt release
+1. **Audio** - load the song (mp3, wav, flac, ogg, m4a, aac), or drop it
+   on the window.
+2. **Lyrics** - paste them (one line per line; a blank line starts a new
+   verse) and click **Parse lyrics**, or load an LRC/UltraStar/KOK file.
+3. **Tap** - press Play, then **Space** the instant each line starts and
+   again when it ends. Slow the song down or loop a line if it's fast.
+4. **Fine-tune** *(optional)* - click words as they're sung, drag bubbles
+   on the timeline, or let **🪄 Auto-align** do it from the audio.
+5. **Export** - pick your formats, check the pre-export checklist, done.
 
-Each [GitHub release](../../releases) includes a `.dmg` (macOS), `.msi`/`.exe`
-installer (Windows), and `.AppImage`/`.deb` (Linux) - no Rust toolchain or
-build step needed, and nothing else to separately install either: vocal
-removal, video export, and the ONNX Runtime/ffmpeg they both depend on are
-all bundled in (see [ARCHITECTURE.md](ARCHITECTURE.md#bundled-binaries-and-models-no-external-subprocess-dependencies-left)
-for exactly what's bundled vs. downloaded automatically, and why). Two
-things to know before you install:
+Press **F1** in the app for every keyboard shortcut, and untick **💡 Tips**
+once you know your way around.
 
-- **Linux: the `.AppImage` won't run until you mark it executable.** Not
-  specific to this app - plain HTTP downloads (any browser, `curl`, `wget`,
-  ...) have no way to carry a file's Unix permission bits, so *every*
-  AppImage from *every* project needs this once, right after downloading:
-  ```bash
-  chmod +x Abyssal-CDG-Creator_*.AppImage
-  ```
-  The `.deb` doesn't need this - `dpkg`/your package manager sets the right
-  permissions on install.
-- **macOS: "Apple could not verify... is free of malware."** This app isn't
-  currently signed with a paid Apple Developer ID or notarized by Apple (that
-  program costs $99/year), so Gatekeeper shows this warning on first launch
-  for *any* app downloaded outside the App Store that isn't notarized - it's
-  not a sign of anything actually wrong with the app. To open it anyway:
-  right-click (or Control-click) the app in Finder and choose **Open**, then
-  confirm **Open** in the dialog that appears (this only needs to be done
-  once); or go to **System Settings -> Privacy & Security**, scroll to the
-  blocked-app notice near the bottom, and click **Open Anyway**. If you'd
-  rather not click through a warning at all, you can also strip the
-  quarantine flag yourself in Terminal:
-  ```bash
-  xattr -d com.apple.quarantine "/Applications/Abyssal CDG Creator.app"
-  ```
-- **Windows: "Windows protected your PC" (SmartScreen)** can appear for the
-  same reason (no paid code-signing certificate) - click **More info**, then
-  **Run anyway**.
+## Highlights
 
-Neither warning means the download was tampered with; it's the standard
-"nobody paid Apple/Microsoft to vouch for this build" message every
-unsigned/unnotarized indie app shows. Every release also publishes a
-`SHA256SUMS.txt` alongside the installers, so you can confirm your download
-matches what was actually built (`sha256sum -c` on Linux/macOS, or
-`Get-FileHash` on Windows) - this proves the file wasn't corrupted or
-swapped in transit, though it's not a substitute for the paid code signing
-this project doesn't have. See [SECURITY.md](SECURITY.md) if you want to
-verify what a release actually does before running it - it's all open
-source, built by the same CI workflow that produced the artifact.
+**Timing**
+- Tap-along with latency compensation, slow-down (0.5×/0.75×), line and A-B
+  looping, and one-tap hand-off for lines sung back to back.
+- Word-by-word fine-tuning - by clicking, on a waveform timeline, or
+  automatically with **auto-align** (a speech model run against isolated
+  vocals; best-effort, so give it a listen).
+- **Syllable timing** for held words: `beau|ti|ful`.
+- **Copy a chorus's timing** onto its repeats in one go.
 
-## Building
+**Looks**
+- Color presets and per-voice colors (Male/Female/Duet/Screaming/Backing,
+  plus your own singer names), with readability warnings for the `.cdg`'s
+  16-color palette.
+- Overlapping **backing vocals** in their own lane.
+- Background image or video, custom fonts, text outline/shadow, an outro
+  card.
+- A live preview that can switch to the **exact** `.cdg` output.
 
-You need a normal, reasonably current Rust toolchain (install via
-[rustup](https://rustup.rs) if you don't have one - `rustc --version`
-should be 1.88 or newer, ideally current stable; that floor comes from the
-strictest MSRV among this project's own dependencies, `image`/`libloading`
-- see [BUILD_TROUBLESHOOTING.md](BUILD_TROUBLESHOOTING.md) if `cargo
-build` fails outright).
+**Exports** (any combination at once, or a batch of saved projects)
+- `.cdg` (+ MP3+G `.zip`) for karaoke machines and KJ software.
+- MP4 video in 16:9 or vertical 9:16, 720p to 4K.
+- Instrumental and vocals-only audio (built-in AI vocal removal).
+- `.ass` karaoke subtitles, `.srt`, LRC and UltraStar.
 
-**MP4 video export and MP3 stem output** need `ffmpeg` (the `.cdg` export
-and WAV output don't). A packaged release bundles its own custom-built
-`ffmpeg`, so this is nothing to install for an installed copy of the app.
-A `cargo run` dev build has no such bundle, so it falls back to a
-system-installed `ffmpeg` on PATH:
+The full walkthrough is in **[FEATURES.md](FEATURES.md)**, and the newest
+changes are in **[CHANGELOG.md](CHANGELOG.md)**.
 
-```bash
-# Debian/Ubuntu
-sudo apt install ffmpeg
-# macOS
-brew install ffmpeg
-# Windows: download from https://ffmpeg.org/download.html and add it to PATH
-```
+<details>
+<summary>More screenshots</summary>
 
-The app checks for `ffmpeg` before starting a video export and will tell
-you clearly if neither is available, rather than failing silently.
+![Export dialog](assets/screenshots/export.png)
 
-**Vocal removal and auto-align** need nothing extra either - both run
-their ONNX model in-process (no Python, no subprocess); the separation
-model ships bundled, and auto-align's per-language models download/cache
-on first use. See [ARCHITECTURE.md](ARCHITECTURE.md#bundled-binaries-and-models-no-external-subprocess-dependencies-left)
-for exactly how all of this (ffmpeg, openh264, ONNX Runtime, the ML
-models) is built/bundled/located, and why - none of it is a *build*-time
-dependency (`cargo build`/`cargo test` need none of it, and make no
-network requests); a `cargo run` dev build instead falls back to a local
-cache directory, downloading into it on first use.
+![MP4 video output](assets/screenshots/abyssal-cdg-example-3.png)
 
-On Linux you'll also need the GTK3 and X11/Wayland development headers that
-`rfd` (file dialogs) and `winit` (windowing) build against, plus ALSA's
-development headers for `rodio`/`cpal` (audio playback) - most desktops
-already have the ALSA *runtime* installed, but the `-dev`/`-devel` package
-(with the `alsa.pc` pkg-config file) is a separate install, and its absence
-is the most common "why won't this build" surprise on a fresh machine or a
-minimal CI container:
+</details>
 
-```bash
-# Debian/Ubuntu
-sudo apt install libgtk-3-dev libxkbcommon-dev libx11-dev libasound2-dev pkg-config
-
-# Fedora
-sudo dnf install gtk3-devel libxkbcommon-devel libX11-devel alsa-lib-devel
-
-# Arch
-sudo pacman -S gtk3 libxkbcommon libx11 alsa-lib
-```
-
-macOS and Windows need no extra system packages - just Xcode Command Line
-Tools / the MSVC build tools that `cargo` already expects.
-
-Then, from this folder:
+## Building from source
 
 ```bash
 cargo build --release
 cargo run --release
 ```
 
-The first build will take a couple of minutes (it's pulling in a GUI
-toolkit and an audio decoder); subsequent builds are fast.
+Needs Rust 1.88+ and, on Linux, a few system packages - see
+**[docs/BUILDING.md](docs/BUILDING.md)**.
 
-### Running the test suite
+## Documentation
 
-The core logic - the CDG packet encoder, the font renderer, and the lyric
-timing math - has unit tests that don't need any GUI/audio setup:
+| Read this | For |
+|---|---|
+| [FEATURES.md](FEATURES.md) | Every feature, how to use it, and known limitations |
+| [docs/INSTALLING.md](docs/INSTALLING.md) | Installing, first-launch warnings, verifying downloads |
+| [docs/BUILDING.md](docs/BUILDING.md) | Building from source and running the tests |
+| [BUILD_TROUBLESHOOTING.md](BUILD_TROUBLESHOOTING.md) | When `cargo build` fails |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How the code is organized and why |
+| [docs/LEARN_THE_CODE.md](docs/LEARN_THE_CODE.md) | A code-level walkthrough of every file (also in the app's Codex) |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Conventions and how to propose changes |
+| [SECURITY.md](SECURITY.md) | Attack surface and reporting a vulnerability |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each version |
+| [DISCLAIMER.md](DISCLAIMER.md) | Your responsibility for the content you use |
+| [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) | Bundled binaries, models and dependency licenses |
 
-```bash
-cargo test
-```
+## Support the project
 
-## More documentation
-
-- [DISCLAIMER.md](DISCLAIMER.md) - your responsibility for the audio/
-  lyrics you use with this tool, separate from the software's own
-  license.
-- [FEATURES.md](FEATURES.md) - the full feature walkthrough, and known
-  limitations/ideas for extending it.
-- [ARCHITECTURE.md](ARCHITECTURE.md) - module layout, data flow, and the
-  design decisions behind the two export pipelines.
-- [docs/LEARN_THE_CODE.md](docs/LEARN_THE_CODE.md) - a longer, code-level
-  walkthrough of how every file actually works, with pointers to real
-  functions/structs, end-to-end deep dives, and practice exercises - also
-  built into the app's own in-app Codex. Start here if `ARCHITECTURE.md`'s
-  overview isn't enough and you want to read or change the source itself.
-- [CONTRIBUTING.md](CONTRIBUTING.md) - dev setup, coding conventions, and
-  how to propose changes (including new lyric-file format support).
-- [SECURITY.md](SECURITY.md) - this app's attack surface and how to report
-  a vulnerability.
-- [CHANGELOG.md](CHANGELOG.md) - notable changes by version.
-- [BUILD_TROUBLESHOOTING.md](BUILD_TROUBLESHOOTING.md) - the most common
-  build failure (an old Rust toolchain) and how to fix it.
-- [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) - every bundled
-  binary/model (ffmpeg, openh264, LAME, ONNX Runtime, the ML models) and
-  their licenses, plus a full Rust dependency license report.
-
-## Support the Project
-
-If you find Abyssal CDG helpful, please consider supporting its development:
-
-[Donate via Ko-fi](https://ko-fi.com/abyssaloath)
+If Abyssal CDG Creator is useful to you, please consider
+[supporting its development on Ko-fi](https://ko-fi.com/abyssaloath).

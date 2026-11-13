@@ -13,7 +13,7 @@
 //! saved bytes for a "your work" file.
 
 use crate::lyrics::{LyricLine, TimingSettings};
-use crate::video::{Background, BackgroundFit, Resolution, VideoCodec};
+use crate::video::{Background, BackgroundFit, Resolution, VideoCodec, VideoStyle};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -102,6 +102,15 @@ pub struct ProjectFile {
     /// this existed, same as a freshly created one.
     #[serde(default)]
     pub video_codec: VideoCodec,
+    /// Video orientation, lyric size, text outline/shadow and audio
+    /// fade-out (see [`VideoStyle`]) - defaults (via `#[serde(default)]`)
+    /// to the look every project saved before these existed already had.
+    #[serde(default)]
+    pub video_style: VideoStyle,
+    /// The outro card (see [`crate::lyrics::OutroSettings`]) - off (via
+    /// `#[serde(default)]`) for every project saved before it existed.
+    #[serde(default)]
+    pub outro: crate::lyrics::OutroSettings,
     /// Whether the video export/preview shows a small credit line under
     /// the title card - on (via `default_true`, not the usual bare
     /// `#[serde(default)]`, which for a `bool` would silently mean *off*)
@@ -290,6 +299,18 @@ mod tests {
             colors: sample_colors(),
             video_resolution: Resolution::Uhd4k,
             video_codec: VideoCodec::H264,
+            outro: crate::lyrics::OutroSettings {
+                enabled: true,
+                text: "Thanks!\nSee you next time".to_string(),
+                show_title: false,
+            },
+            video_style: VideoStyle {
+                orientation: crate::video::Orientation::Portrait,
+                lyric_size_pct: 130,
+                outline: true,
+                shadow: false,
+                fade_out_secs: 4.0,
+            },
             show_credit_line: false,
             background: Some(Background::Image(PathBuf::from("/tmp/cover.png"))),
             background_fit: BackgroundFit::Contain,
@@ -345,6 +366,8 @@ mod tests {
         assert_eq!(loaded.background_dim, 0.0);
         assert_eq!(loaded.timing_settings, TimingSettings::default());
         assert_eq!(loaded.video_codec, VideoCodec::default());
+        assert_eq!(loaded.video_style, VideoStyle::default());
+        assert_eq!(loaded.outro, crate::lyrics::OutroSettings::default());
         assert!(loaded.show_credit_line);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -443,6 +466,8 @@ mod tests {
             colors: sample_colors(),
             video_resolution: Resolution::Hd1080,
             video_codec: VideoCodec::default(),
+            video_style: VideoStyle::default(),
+            outro: crate::lyrics::OutroSettings::default(),
             show_credit_line: true,
             background: None,
             background_fit: BackgroundFit::default(),

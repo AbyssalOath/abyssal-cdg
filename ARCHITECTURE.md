@@ -13,9 +13,26 @@ main.rs      GUI (eframe/egui): loads audio, owns app state, wires buttons/short
              to the modules below, and hosts the live preview and the fine-tuning
              timeline widget. Also owns the undo/redo history (a per-frame diff of
              the undoable subset of app state - see "Undo/redo" below) and the
-             drag-and-drop/recent-files/crash-recovery glue.
+             drag-and-drop/recent-files/crash-recovery glue. The export
+             pipeline itself is a free function, `run_export(ExportInputs,
+             ExportOptions, ...)`, so a song can be exported from the open
+             project or straight from a saved file (`run_batch_export`). Pure,
+             tested helpers for the UI live here too: the step bar
+             (`workflow_status`), status classification (`classify_status`),
+             color readability (`color_warnings`), row status dots
+             (`line_statuses`).
+prefs.rs     Per-machine preferences (`preferences.json` next to the autosave):
+             tap latency, the Tips toggle, the last export folder, UI size -
+             things that follow the person, not the song.
+checks.rs    The export dialog's pre-export checklist: pure checks over the lyric
+             data (lines too long for a `.cdg` row, characters the `.cdg` font
+             can't draw, double-tapped lines, crowded words, estimated word
+             timing, lines past the song's end) returning warnings/notes with
+             optional one-click fixes.
 audio.rs     Audio decode/playback (rodio + symphonia) and the wall-clock
-             play/pause/resume/seek state machine used for tap-to-time.
+             play/pause/resume/seek state machine used for tap-to-time - which
+             advances at the playback speed (0.5x/0.75x/1x), so taps always
+             record real song time.
 waveform.rs  Decodes the loaded audio into coarse min/max peak buckets (background
              thread), drawn behind the timeline's bubbles as a visual aid for
              lining up a bubble against an actual vocal onset.
@@ -33,9 +50,16 @@ lyrics.rs    The data model: LyricLine (raw, user-entered - start, optional expl
              *backing track* (resolve_backing_track), where each line's window is
              independent and may overlap any main line. backing_display_windows
              decides when each backing line holds the single on-screen backing
-             lane, shared by all three renderers.
+             lane, shared by all three renderers. Per-"word" timing is really per
+             *timing unit*: `timing_units` splits words further at the syllable
+             mark (`beau|ti|ful`), `normalize_text` is the displayed text with the
+             marks removed, and `word_char_spans` maps units into it. Also home to
+             the timing edits that must stay all-or-nothing and overlap-checked:
+             live taps (`apply_tap_start`/`apply_tap_end`), `shift_lines`,
+             `split_line`, `copy_timing` (chorus copy) and `find_repeat`.
 formats.rs   Import *and* export for LRC, UltraStar, and KOK lyric files, plus
-             format auto-detection. Import produces LyricLine values, same as
+             format auto-detection, and export-only `.srt` and karaoke `.ass`
+             (`\kf` word wipes) subtitles. Import produces LyricLine values, same as
              manual paste + tap; export is the direct inverse, consuming the same
              `&[TimedLine]` the CDG/video renderers do.
 project.rs   Save/load for `.abyzl` project files (JSON, via serde) - everything
@@ -46,13 +70,23 @@ recent.rs    A small persisted "recently opened" list (separate for projects and
              audio), stored next to the autosave slot.
 cdg.rs       Low-level CD+Graphics packet encoder - the 24-byte packet format, tile
              blocks, CLUT loads, and timing-by-packet-position. No knowledge of
-             lyrics; just a byte-stream writer.
+             lyrics; just a byte-stream writer - but it keeps a shadow of what
+             every tile shows and skips writes that wouldn't change anything,
+             since every packet costs 1/300s of stream time.
+cdg_decode.rs  A CD+G *decoder* with 5-second checkpoints, for the live preview's
+             ".cdg (exact)" mode - it plays back the very bytes export.rs writes.
 font.rs      Renders characters into CDG's 6x12 tile format (and 2x/3x/... scaled
-             variants) from the `font8x8` bitmap font.
+             variants) from the `font8x8` bitmap font, narrowing its 7-pixel
+             glyphs to the 6-pixel tile and falling back (Latin-1 set, hand-drawn
+             glyphs, plain stand-ins for curly quotes/dashes/accents) for
+             characters the basic set lacks.
+zipfile.rs   A minimal PKZIP writer (on flate2/crc32fast) for the MP3+G `.zip`
+             export.
 export.rs    The ".cdg renderer": lays out lines/words/countdown dots on the CDG
              canvas using cdg.rs + font.rs, driven by lyrics.rs's timing. Also owns
              the "paired audio" helper (copying the loaded audio next to a
-             `.cdg`/`.lrc`/UltraStar file under a matching base filename). The
+             `.cdg`/`.lrc`/UltraStar file under a matching base filename) and
+             the outro card's timing (`outro_window`), shared by every renderer. The
              backing track draws on its own row (BACKING_ROW) from a pre-computed,
              time-sorted schedule (BackingLane) that every forward step of the main
              loop flushes first, since CdgWriter::advance_to is
@@ -64,7 +98,9 @@ video.rs     The "video renderer": an independent RGB24 frame renderer (via
              ffmpeg_path.rs), driven by the *same* lyrics.rs timing as export.rs.
              The backing track draws in its own fixed lane near the bottom of the
              frame (BACKING_LANE_Y), smaller, with its own wipe - the live preview
-             mirrors it.
+             mirrors it. `VideoStyle` (16:9 or 9:16, lyric size, outline/shadow,
+             audio fade) is saved per project; sizes scale from the frame's short
+             side so both shapes read the same.
 ffmpeg_path.rs  Locates the bundled ffmpeg binary and the openh264 shared
              library its H.264 encoder needs (two different sourcing stories -
              see the "Bundled binaries and models" section below), the same
@@ -227,12 +263,21 @@ project's content would be nonsensical.
   this model - they never go backwards, so draw calls can be issued slightly out of
   strict chronological order without corrupting the stream, as long as each call's
   target time is monotonically non-decreasing overall.
+  Because drawing itself takes stream time (one tile per packet), each line change is
+  planned first - `band_writes` diffs the new line against what's on screen - and
+  started `writes / 300` seconds *before* the line's start, so it's fully drawn on
+  time; the live preview's ".cdg (exact)" mode decodes this same stream
+  (`cdg_decode.rs`) rather than approximating it.
 - **`.mp4`** (`video.rs`) is a frame-by-frame renderer: for each output frame, it asks
   "what does the screen look like at time `t`?" and renders that from scratch into an
   RGB24 buffer, which it pipes to an `ffmpeg` subprocess over stdin (muxed with the
   loaded audio file, since CDG/raw video have no audio track of their own). This model
   has no "advance" step; each frame is independent, computed straight from `t` and the
   `TimedLine` list.
+
+Subtitles (`.ass`/`.srt`) and LRC/UltraStar (`formats.rs`) are text exporters over the
+same `TimedLine`s. All of them run from one function, `main.rs`'s `run_export`, on a
+background thread - for the open project, or for each file in a batch export.
 
 These are fundamentally different rendering strategies (packet-position-based vs.
 frame-based), which is why they're separate modules rather than one renderer with two
@@ -362,8 +407,9 @@ prior `ort` `download-binaries` approach did, on every build.
 
 ## Testing strategy
 
-`cdg.rs`, `font.rs`, `lyrics.rs`, `formats.rs`, `export.rs`, `video.rs`, `timeline.rs`,
-`project.rs`, `recent.rs`, `waveform.rs`, `align.rs`, `ctc.rs`, `stft.rs`, `mdx.rs`, and
+`cdg.rs`, `cdg_decode.rs`, `font.rs`, `lyrics.rs`, `formats.rs`, `checks.rs`,
+`export.rs`, `video.rs`, `timeline.rs`, `project.rs`, `prefs.rs`, `recent.rs`,
+`zipfile.rs`, `waveform.rs`, `align.rs`, `ctc.rs`, `stft.rs`, `mdx.rs`, and
 `ffmpeg_path.rs` have no GUI dependency and are unit-tested directly (`cargo test`, no
 display or audio device required). `audio.rs`'s `PlaybackClock` (the play/pause/resume/seek math) is
 tested the same way, decoupled from the real `rodio`/`symphonia` calls it wraps.
@@ -390,7 +436,9 @@ suite - all are meant to be verified manually (`align.rs` and `vocals.rs` each h
 `project.rs`/`recent.rs`'s tests use their own throwaway app id/temp directories so they
 never touch a real run's actual autosave or recent-files slot. `waveform.rs`'s actual
 audio decoding isn't exercised either (same reasoning - it needs a real file), just the
-pure peak-lookup math. `main.rs` (GUI wiring, including the timeline widget's
-painting/interaction code and the undo/redo frame-diffing built on top of the modules
-above) has no automated tests - it's a thin layer that calls into the tested modules
-above, verified manually by running the app.
+pure peak-lookup math. The `.cdg` exporter is checked end to end by decoding its
+output (`cdg_decode.rs`) - for example that every line is fully drawn by its start
+time, and that syllable marks are never drawn. In `main.rs`, the pure helpers are
+unit-tested (the step bar, status classification, color readability, row statuses,
+batch export writing real files); the widget/painting code (timeline, timing table,
+dialogs) and the undo/redo frame-diffing are verified manually by running the app.

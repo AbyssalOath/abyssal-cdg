@@ -1,6 +1,6 @@
 [package]
 name = "abyssal-cdg"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 authors = ["LordSodomiser"]
 description = "Turns an audio file and pasted lyrics into a real karaoke .cdg file"
@@ -68,9 +68,15 @@ rubato = "5.0"
 ureq = "3.4"
 # Locates the per-user cache directory for the same fallback path.
 dirs = "6.0"
+# The MP3+G .zip export's minimal zip writer (zipfile.rs) - both were
+# already in the dependency tree (via image/png etc.), so this adds no new
+# code, just makes them direct dependencies instead of a full zip crate.
+flate2 = "1.1.9"
+crc32fast = "1.5.0"
 # NFC normalization for forced-alignment tokenization (ctc.rs) - Korean's
 # syllable-block vocab only matches precomposed text, so input lyric text
-# is normalized before being matched against a language's vocab.
+# is normalized before being matched against a language's vocab. Also NFD
+# accent-stripping fallback for glyphs a font can't draw (font.rs).
 unicode-normalization = "0.1"
 # Pure-Rust bzip2 *decompression* (no compression needed) - Cisco
 # distributes its official openh264 binaries as .bz2 (see ffmpeg_path.rs

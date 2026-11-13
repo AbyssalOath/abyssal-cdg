@@ -19,13 +19,10 @@
 pub const PACKET_SIZE: usize = 24;
 pub const PACKETS_PER_SEC: f64 = 300.0;
 
-#[allow(dead_code)]
 pub const TILE_COLS: u8 = 50;
-#[allow(dead_code)]
 pub const TILE_ROWS: u8 = 18;
 /// Safe visible columns/rows (avoids the outer border tiles some players crop).
 pub const SAFE_COLS: u8 = 48;
-#[allow(dead_code)]
 pub const SAFE_ROWS: u8 = 16;
 pub const SAFE_COL_OFFSET: u8 = 1;
 pub const SAFE_ROW_OFFSET: u8 = 1;
@@ -34,7 +31,7 @@ const INST_MEMORY_PRESET: u8 = 1;
 const INST_BORDER_PRESET: u8 = 2;
 const INST_TILE_BLOCK: u8 = 6;
 #[allow(dead_code)]
-const INST_TILE_BLOCK_XOR: u8 = 20;
+const INST_TILE_BLOCK_XOR: u8 = 38;
 const INST_LOAD_CLUT_LOW: u8 = 30;
 const INST_LOAD_CLUT_HIGH: u8 = 31;
 
@@ -65,13 +62,58 @@ pub const BLANK_TILE: TilePixels = [0u8; 12];
 
 pub struct CdgWriter {
     packets: Vec<[u8; PACKET_SIZE]>,
+    /// What every tile on screen currently shows (in canonical form - see
+    /// [`canonical_tile`]), so [`Self::tile_block`] can skip a write that
+    /// wouldn't change anything. Every packet costs 1/300s of stream time,
+    /// so redundant writes (clearing an already-blank row, redrawing a
+    /// space over blank) directly delay whatever comes next on screen.
+    /// `None` = unknown (before the first memory preset) - always written.
+    screen: Vec<Option<CanonTile>>,
+}
+
+/// A tile's visual content: (background color, foreground color, pixels),
+/// normalized so two writes that look identical compare equal.
+type CanonTile = (u8, u8, TilePixels);
+
+/// Normalizes a tile so visually identical tiles compare equal: a tile
+/// with no set pixels (or the same color for both) is just a solid fill of
+/// one color, regardless of what the unused color or pixel bits were; a
+/// tile with every pixel set is a solid fill of the foreground color.
+fn canonical_tile(color0: u8, color1: u8, pixels: &TilePixels) -> CanonTile {
+    let mut px = [0u8; 12];
+    for (o, p) in px.iter_mut().zip(pixels) {
+        *o = p & 0x3F;
+    }
+    if color0 == color1 || px == [0; 12] {
+        (color0, color0, [0; 12])
+    } else if px == [0x3F; 12] {
+        (color1, color1, [0; 12])
+    } else {
+        (color0, color1, px)
+    }
 }
 
 impl CdgWriter {
     pub fn new() -> Self {
         Self {
             packets: Vec::new(),
+            screen: vec![None; TILE_COLS as usize * TILE_ROWS as usize],
         }
+    }
+
+    /// Whether drawing this tile (safe-area coordinates, like
+    /// [`Self::tile_block`]) would change what's on screen.
+    pub fn tile_differs(
+        &self,
+        row: u8,
+        col: u8,
+        color0: u8,
+        color1: u8,
+        pixels: &TilePixels,
+    ) -> bool {
+        let idx = (row + SAFE_ROW_OFFSET) as usize * TILE_COLS as usize
+            + (col + SAFE_COL_OFFSET) as usize;
+        self.screen.get(idx).copied().flatten() != Some(canonical_tile(color0, color1, pixels))
     }
 
     #[allow(dead_code)]
@@ -114,6 +156,8 @@ impl CdgWriter {
     }
 
     pub fn memory_preset(&mut self, color_index: u8) {
+        let c = color_index & 0x0F;
+        self.screen.fill(Some((c, c, [0; 12])));
         let mut data = [0u8; 16];
         data[0] = color_index & 0x0F;
         // repeat field (data[1]) left at 0; real players ignore preset repeats
@@ -151,10 +195,18 @@ impl CdgWriter {
 
     /// Draw a tile at (row, col) in the *safe* coordinate space (0-based,
     /// 0..SAFE_ROWS / 0..SAFE_COLS) using color0 for unset bits and color1
-    /// for set bits.
+    /// for set bits. Skipped entirely (no packet, no stream time) if the
+    /// tile already shows exactly this - see [`Self::tile_differs`].
     pub fn tile_block(&mut self, row: u8, col: u8, color0: u8, color1: u8, pixels: &TilePixels) {
+        if !self.tile_differs(row, col, color0, color1, pixels) {
+            return;
+        }
         let real_row = row + SAFE_ROW_OFFSET;
         let real_col = col + SAFE_COL_OFFSET;
+        let idx = real_row as usize * TILE_COLS as usize + real_col as usize;
+        if let Some(slot) = self.screen.get_mut(idx) {
+            *slot = Some(canonical_tile(color0 & 0x0F, color1 & 0x0F, pixels));
+        }
         let mut data = [0u8; 16];
         data[0] = color0 & 0x0F;
         data[1] = color1 & 0x0F;
@@ -210,6 +262,30 @@ mod tests {
         let n = w.len_packets();
         w.advance_to(1.0); // earlier than current position
         assert_eq!(w.len_packets(), n); // no change
+    }
+
+    #[test]
+    fn redundant_tile_writes_cost_nothing() {
+        let mut w = CdgWriter::new();
+        let glyph = [0b10_1010; 12];
+        // Before any preset the screen is unknown, so the first write goes out.
+        w.tile_block(0, 0, 0, 1, &glyph);
+        assert_eq!(w.len_packets(), 1);
+        w.tile_block(0, 0, 0, 1, &glyph);
+        assert_eq!(w.len_packets(), 1, "identical redraw skipped");
+        w.memory_preset(0);
+        let n = w.len_packets();
+        // Clearing an already-blank tile, in any equivalent form, is free.
+        w.tile_block(3, 3, 0, 0, &BLANK_TILE);
+        w.tile_block(3, 3, 0, 9, &BLANK_TILE);
+        w.tile_block(3, 3, 5, 0, &[0x3F; 12]);
+        assert_eq!(w.len_packets(), n);
+        // A real change is written, and only once.
+        w.tile_block(3, 3, 0, 2, &glyph);
+        w.tile_block(3, 3, 0, 2, &glyph);
+        assert_eq!(w.len_packets(), n + 1);
+        assert!(!w.tile_differs(3, 3, 0, 2, &glyph));
+        assert!(w.tile_differs(3, 3, 0, 4, &glyph));
     }
 
     #[test]

@@ -300,9 +300,52 @@ pub fn rolling_preview_lines(
 }
 
 fn estimate_sing_duration(text: &str, window: f64, settings: &TimingSettings) -> f64 {
+    // Whole words, not syllables - marking `beau|ti|ful` doesn't make the
+    // line take any longer to sing.
     let word_count = text.split_whitespace().count().max(1);
     let est = (word_count as f64 * settings.seconds_per_word).max(settings.min_sing_duration);
     est.min(window.max(0.0))
+}
+
+/// The project's outro card settings: a closing card shown after the last
+/// line until the song ends (see `export::outro_window`), in the video,
+/// live preview, `.cdg` and subtitle exports. Off by default, so existing
+/// projects don't change.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct OutroSettings {
+    pub enabled: bool,
+    /// The card's own text - one line per line, up to [`MAX_OUTRO_LINES`].
+    pub text: String,
+    /// Also show the song title and "by artist" under the text.
+    pub show_title: bool,
+}
+
+/// How many lines of [`OutroSettings::text`] are shown (the `.cdg` has
+/// room for only a few rows).
+pub const MAX_OUTRO_LINES: usize = 3;
+
+impl Default for OutroSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            text: "Thanks for singing!".to_string(),
+            show_title: true,
+        }
+    }
+}
+
+impl OutroSettings {
+    /// The non-blank lines of the text, trimmed, at most [`MAX_OUTRO_LINES`].
+    pub fn text_lines(&self) -> Vec<String> {
+        self.text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(MAX_OUTRO_LINES)
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -402,7 +445,7 @@ pub struct LyricLine {
 impl LyricLine {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
-        let word_count = text.split_whitespace().count();
+        let word_count = timing_units(&text).len();
         Self {
             text,
             start: None,
@@ -419,8 +462,14 @@ impl LyricLine {
         }
     }
 
+    /// The line's timing units - words, split into syllables wherever
+    /// the text has a [`SYLLABLE_MARK`] (see [`timing_units`]). Per-word
+    /// timing (`word_overrides`, ...) is indexed by these.
     pub fn words(&self) -> Vec<&str> {
-        self.text.split_whitespace().collect()
+        timing_units(&self.text)
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect()
     }
 }
 
@@ -449,7 +498,7 @@ impl BackingVocal {
     #[allow(dead_code)]
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
-        let word_count = text.split_whitespace().count();
+        let word_count = timing_units(&text).len();
         Self {
             text,
             start: None,
@@ -683,15 +732,43 @@ fn merge_edited_line(old: &LyricLine, new: &LyricLine) -> (LyricLine, bool) {
     let new_words: Vec<&str> = new.text.split_whitespace().collect();
     let same_word_count = old_words.len() == new_words.len();
     if same_word_count {
-        for (i, (&ow, &nw)) in old_words.iter().zip(new_words.iter()).enumerate() {
+        // Per-word timing is indexed by timing unit (syllable), so walk
+        // both lines word by word, tracking each word's first unit.
+        let units_in = |w: &str| w.split(SYLLABLE_MARK).filter(|p| !p.is_empty()).count();
+        let (mut oi, mut ni) = (0usize, 0usize);
+        for (&ow, &nw) in old_words.iter().zip(new_words.iter()) {
+            let (on, nn) = (units_in(ow), units_in(nw));
+            let copy = |merged: &mut LyricLine, from: usize, to: usize| {
+                if let Some(slot) = merged.word_overrides.get_mut(to) {
+                    *slot = old.word_overrides.get(from).copied().flatten();
+                }
+            };
+            let copy_end = |merged: &mut LyricLine, from: usize, to: usize| {
+                if let Some(slot) = merged.word_end_overrides.get_mut(to) {
+                    *slot = old.word_end_overrides.get(from).copied().flatten();
+                }
+            };
             if ow == nw {
-                merged.word_overrides[i] = old.word_overrides.get(i).copied().flatten();
-                merged.word_end_overrides[i] = old.word_end_overrides.get(i).copied().flatten();
+                for k in 0..nn {
+                    copy(&mut merged, oi + k, ni + k);
+                    copy_end(&mut merged, oi + k, ni + k);
+                }
+            } else if on > 0
+                && nn > 0
+                && ow.replace(SYLLABLE_MARK, "") == nw.replace(SYLLABLE_MARK, "")
+            {
+                // Same word, only its syllable marks changed: its own
+                // start/end still hold - they now belong to its first/last
+                // syllable, and the syllables in between start out estimated.
+                copy(&mut merged, oi, ni);
+                copy_end(&mut merged, oi + on - 1, ni + nn - 1);
             }
             // A word that itself changed keeps `merged`'s fresh `None` from
             // `new.clone()` above - carrying over a manually-tapped time for
             // a word that no longer exists would silently mistime whatever
             // word replaced it.
+            oi += on;
+            ni += nn;
         }
     }
     // Different word count: nothing above applies, so `merged` keeps the
@@ -918,6 +995,400 @@ pub fn check_end_change(lines: &[LyricLine], idx: usize, new_end: f64) -> Result
         }
     }
     Ok(())
+}
+
+/// Moves every line in `indices` by `delta` seconds - start, explicit end,
+/// and every per-word start/end override together, so each line keeps its
+/// own internal timing exactly. Lines with no start yet are left alone.
+/// All-or-nothing: the shift is checked against the same rules as typing a
+/// time (no negative times, main lines can't overlap their main-line
+/// neighbors) on a copy first, and on any violation nothing changes and
+/// the reason is returned. Returns how many lines actually moved.
+pub fn shift_lines(
+    lines: &mut [LyricLine],
+    indices: &[usize],
+    delta: f64,
+) -> Result<usize, String> {
+    if !delta.is_finite() {
+        return Err("Shift amount must be a number.".to_string());
+    }
+    let mut shifted = lines.to_vec();
+    let shift = |t: &mut Option<f64>| {
+        if let Some(v) = t {
+            *v += delta;
+        }
+    };
+    let mut moved = 0;
+    for &i in indices {
+        let Some(line) = shifted.get_mut(i) else {
+            continue;
+        };
+        if line.start.is_none() {
+            continue;
+        }
+        shift(&mut line.start);
+        shift(&mut line.sing_end_override);
+        line.word_overrides.iter_mut().for_each(shift);
+        line.word_end_overrides.iter_mut().for_each(shift);
+        moved += 1;
+    }
+    if moved == 0 {
+        return Err("None of the selected lines are timed yet - nothing to shift.".to_string());
+    }
+    for i in 0..shifted.len() {
+        let line = &shifted[i];
+        let earliest = line
+            .start
+            .into_iter()
+            .chain(line.word_overrides.iter().flatten().copied())
+            .chain(line.word_end_overrides.iter().flatten().copied())
+            .fold(f64::INFINITY, f64::min);
+        if earliest < 0.0 {
+            return Err(format!(
+                "Can't shift that far - line {} would start before the song does.",
+                i + 1
+            ));
+        }
+        if let Some(start) = line.start {
+            check_start_change(&shifted, i, start).map_err(|e| format!("Line {}: {e}", i + 1))?;
+        }
+        if let Some(end) = shifted[i].sing_end_override {
+            check_end_change(&shifted, i, end).map_err(|e| format!("Line {}: {e}", i + 1))?;
+        }
+    }
+    lines.clone_from_slice(&shifted);
+    Ok(moved)
+}
+
+/// A line's text reduced for "is this the same lyric?" comparisons:
+/// displayed words, lowercase, punctuation dropped - so "Hey!" matches
+/// "hey" and a repeat with different capitalization still counts.
+pub fn comparable_text(text: &str) -> String {
+    normalize_text(text)
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Where the lines at `sources` (sorted, consecutive or not) next repeat
+/// as a run of consecutive lines with the same text (see
+/// [`comparable_text`]) - the first index of that run. Searches after the
+/// last source line first, then from the top (a later chorus may be timed
+/// first), never overlapping the sources.
+pub fn find_repeat(lines: &[LyricLine], sources: &[usize]) -> Option<usize> {
+    let n = sources.len();
+    if n == 0 || n > lines.len() {
+        return None;
+    }
+    let want: Vec<String> = sources
+        .iter()
+        .map(|&i| comparable_text(&lines[i].text))
+        .collect();
+    let last = *sources.iter().max()?;
+    let first = *sources.iter().min()?;
+    let matches_at = |j: usize| (0..n).all(|k| comparable_text(&lines[j + k].text) == want[k]);
+    let overlaps = |j: usize| j <= last && j + n > first;
+    (last + 1..=lines.len() - n)
+        .chain(0..=lines.len() - n)
+        .find(|&j| !overlaps(j) && matches_at(j))
+}
+
+/// Copies the timing of the lines at `sources` (sorted; each must be
+/// timed) onto the `sources.len()` consecutive lines starting at
+/// `first_target`, shifted so the first target starts at `target_start` -
+/// for a repeated chorus/verse sung to the same rhythm. Each target gets
+/// its source's start, explicit end and - where it has the same number of
+/// timing units (words/syllables) - every word's start/end override, all
+/// moved by the same offset; a target whose words differ gets its start
+/// and end only (its word timing reset to the estimate). Voice, backing
+/// status and countdown setting stay the target's own.
+///
+/// All-or-nothing: checked on a copy like a typed time (no overlaps with
+/// neighboring lines, nothing before 0:00), and on any problem nothing
+/// changes and the reason is returned. Returns how many target lines had
+/// different words (so their word timing wasn't copied).
+pub fn copy_timing(
+    lines: &mut [LyricLine],
+    sources: &[usize],
+    first_target: usize,
+    target_start: f64,
+) -> Result<usize, String> {
+    let n = sources.len();
+    if n == 0 {
+        return Err("Select the timed lines to copy from first.".to_string());
+    }
+    if first_target + n > lines.len() {
+        return Err(format!(
+            "There aren't {n} lines from line {} on to copy onto.",
+            first_target + 1
+        ));
+    }
+    let (lo, hi) = (
+        *sources.iter().min().unwrap(),
+        *sources.iter().max().unwrap(),
+    );
+    if first_target <= hi && first_target + n > lo {
+        return Err("The lines to copy onto overlap the lines being copied.".to_string());
+    }
+    if !target_start.is_finite() || target_start < 0.0 {
+        return Err("The repeat's start time can't be negative.".to_string());
+    }
+    let Some(base) = lines[sources[0]].start else {
+        return Err(format!("Line {} isn't timed yet.", sources[0] + 1));
+    };
+    if let Some(&i) = sources.iter().find(|&&i| lines[i].start.is_none()) {
+        return Err(format!(
+            "Line {} isn't timed yet - every copied line must be.",
+            i + 1
+        ));
+    }
+    let offset = target_start - base;
+    let shift = |t: Option<f64>| t.map(|v| v + offset);
+    let mut out = lines.to_vec();
+    let mut differing = 0;
+    for (k, &src) in sources.iter().enumerate() {
+        let from = &lines[src];
+        let to = &mut out[first_target + k];
+        to.start = shift(from.start);
+        to.sing_end_override = shift(from.sing_end_override);
+        to.estimated_sing_duration = from.estimated_sing_duration;
+        let units = timing_units(&to.text).len();
+        if timing_units(&from.text).len() == units {
+            to.word_overrides = from.word_overrides.iter().map(|t| shift(*t)).collect();
+            to.word_end_overrides = from.word_end_overrides.iter().map(|t| shift(*t)).collect();
+            to.word_overrides.resize(units, None);
+            to.word_end_overrides.resize(units, None);
+        } else {
+            to.word_overrides = vec![None; units];
+            to.word_end_overrides = vec![None; units];
+            differing += 1;
+        }
+    }
+    for i in 0..out.len() {
+        let earliest = out[i]
+            .start
+            .into_iter()
+            .chain(out[i].word_overrides.iter().flatten().copied())
+            .fold(f64::INFINITY, f64::min);
+        if earliest < 0.0 {
+            return Err(format!("Line {} would start before the song does.", i + 1));
+        }
+        if let Some(start) = out[i].start {
+            check_start_change(&out, i, start).map_err(|e| format!("Line {}: {e}", i + 1))?;
+        }
+        if let Some(end) = out[i].sing_end_override {
+            check_end_change(&out, i, end).map_err(|e| format!("Line {}: {e}", i + 1))?;
+        }
+    }
+    lines.clone_from_slice(&out);
+    Ok(differing)
+}
+
+/// The word index to split `text` at so the two halves are as close to
+/// equal length (in characters) as possible - the first half gets words
+/// `..k`, the second `k..`. `None` for a single word (nothing to split).
+pub fn best_split_word(text: &str) -> Option<usize> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let len = |ws: &[&str]| {
+        ws.iter().map(|w| w.chars().count()).sum::<usize>() + ws.len().saturating_sub(1)
+    };
+    (1..words.len()).min_by_key(|&k| len(&words[..k]).abs_diff(len(&words[k..])))
+}
+
+/// Splits line `idx` into two lines before whole word `at_word` (see
+/// [`best_split_word`] - a word, never mid-syllable), keeping its timing:
+/// the first half keeps the original start and ends at `split_time`, the
+/// second starts at `split_time` and keeps the original end, and every
+/// per-unit override goes with its syllable. `split_time` should be when
+/// that word's first unit (see [`first_unit_of_word`]) is highlighted
+/// (manual or estimated) - pass `None` for an untimed line.
+/// Voice, custom name, backing-track membership and block grouping carry
+/// over (the second half continues the same verse block).
+///
+/// `raw` (the pasted lyrics text) gets the same split, so the next re-parse
+/// keeps both halves - which needs `raw` to still parse to exactly `lines`'
+/// texts; if it doesn't (edited but not re-parsed), nothing changes and
+/// an error asks the user to re-parse first.
+pub fn split_line(
+    lines: &mut Vec<LyricLine>,
+    raw: &mut String,
+    idx: usize,
+    at_word: usize,
+    split_time: Option<f64>,
+) -> Result<(), String> {
+    let Some(orig) = lines.get(idx).cloned() else {
+        return Err("No such line.".to_string());
+    };
+    let words: Vec<&str> = orig.text.split_whitespace().collect();
+    if at_word == 0 || at_word >= words.len() {
+        return Err("Can't split a line there.".to_string());
+    }
+    let sources = parse_pasted_lyrics_with_sources(raw);
+    let raw_in_sync = sources.len() == lines.len()
+        && sources
+            .iter()
+            .zip(lines.iter())
+            .all(|((p, _), l)| p.text == l.text);
+    if !raw_in_sync {
+        return Err(
+            "The lyrics box has edits that haven't been parsed yet - click Parse lyrics \
+             first, then split."
+                .to_string(),
+        );
+    }
+    let first_text = words[..at_word].join(" ");
+    let second_text = words[at_word..].join(" ");
+    let split_time = split_time.filter(|_| orig.start.is_some());
+    // Overrides are per timing unit (syllable), so split them there.
+    let unit_count = timing_units(&orig.text).len();
+    let at_unit = first_unit_of_word(&orig.text, at_word);
+
+    let mut first = orig.clone();
+    first.text = first_text.clone();
+    first.word_overrides = pad_to(&orig.word_overrides, unit_count)[..at_unit].to_vec();
+    first.word_end_overrides = pad_to(&orig.word_end_overrides, unit_count)[..at_unit].to_vec();
+    first.estimated_sing_duration = None;
+    first.backing_vocal = None;
+    if split_time.is_some() {
+        first.sing_end_override = split_time;
+    }
+
+    let mut second = orig.clone();
+    second.text = second_text.clone();
+    second.word_overrides = pad_to(&orig.word_overrides, unit_count)[at_unit..].to_vec();
+    second.word_end_overrides = pad_to(&orig.word_end_overrides, unit_count)[at_unit..].to_vec();
+    second.estimated_sing_duration = None;
+    second.backing_vocal = None;
+    second.starts_new_block = false;
+    second.countdown_mode = CountdownMode::default();
+    second.start = split_time;
+    if split_time.is_none() {
+        second.start = None;
+        second.sing_end_override = None;
+    }
+
+    lines[idx] = first;
+    lines.insert(idx + 1, second);
+
+    let raw_idx = sources[idx].1;
+    let trailing_newline = raw.ends_with('\n');
+    let mut raw_lines: Vec<String> = raw.lines().map(str::to_string).collect();
+    raw_lines[raw_idx] = first_text;
+    raw_lines.insert(raw_idx + 1, second_text);
+    *raw = raw_lines.join("\n");
+    if trailing_newline {
+        raw.push('\n');
+    }
+    Ok(())
+}
+
+/// `v` padded with `None` (or truncated) to exactly `n` slots - word
+/// override vectors should already match the word count, but a split
+/// shouldn't panic if one somehow doesn't.
+fn pad_to(v: &[Option<f64>], n: usize) -> Vec<Option<f64>> {
+    let mut out = v.to_vec();
+    out.resize(n, None);
+    out
+}
+
+/// Index of the nearest main-track line before `idx` - see [`prev_main_line`].
+fn prev_main_index(lines: &[LyricLine], idx: usize) -> Option<usize> {
+    (0..idx).rev().find(|&i| !lines[i].is_backing)
+}
+
+/// Index of the nearest main-track line after `idx` - see [`next_main_line`].
+fn next_main_index(lines: &[LyricLine], idx: usize) -> Option<usize> {
+    (idx + 1..lines.len()).find(|&i| !lines[i].is_backing)
+}
+
+/// Sets `lines[idx]`'s start from a live tap at `pos`. Unlike typing or
+/// dragging (which go through [`check_start_change`] and are simply
+/// rejected), a live tap can't be retried - the moment has passed - so a
+/// tap landing before the previous main line's explicit end (which only
+/// happens after seeking back, or when re-tapping between already-timed
+/// lines) is kept, and that previous line's end is pulled back to meet it
+/// instead. Returns the index of the line whose end was trimmed, if any.
+/// Still an error if the tap is before the previous line's own *start*
+/// (trimming can't help there) or not before this line's own explicit end.
+pub fn apply_tap_start(
+    lines: &mut [LyricLine],
+    idx: usize,
+    pos: f64,
+) -> Result<Option<usize>, String> {
+    if !pos.is_finite() || pos < 0.0 {
+        return Err("Start time can't be negative.".to_string());
+    }
+    if let Some(end) = lines[idx].sing_end_override {
+        if pos >= end {
+            return Err(format!(
+                "Start ({}) must be before this line's own end ({}).",
+                format_timecode(pos),
+                format_timecode(end)
+            ));
+        }
+    }
+    let mut trimmed = None;
+    if !lines[idx].is_backing {
+        if let Some(p) = prev_main_index(lines, idx) {
+            if lines[p].sing_end_override.is_some_and(|e| pos < e) {
+                if let Some(prev_start) = lines[p].start.filter(|&s| pos <= s) {
+                    return Err(format!(
+                        "Start ({}) can't be before the previous line starts ({}).",
+                        format_timecode(pos),
+                        format_timecode(prev_start)
+                    ));
+                }
+                lines[p].sing_end_override = Some(pos);
+                trimmed = Some(p);
+            }
+        }
+    }
+    lines[idx].start = Some(pos);
+    Ok(trimmed)
+}
+
+/// Sets `lines[idx]`'s end from a live tap at `pos` - the tap-along
+/// counterpart of [`check_end_change`]. A tap landing after the next main
+/// line's already-set start is clamped to that start instead of being
+/// rejected (see [`apply_tap_start`] for why a live tap shouldn't just be
+/// dropped). Returns the end actually set, and whether it was clamped.
+pub fn apply_tap_end(lines: &mut [LyricLine], idx: usize, pos: f64) -> Result<(f64, bool), String> {
+    let Some(start) = lines[idx].start else {
+        return Err("Set this line's start before its end.".to_string());
+    };
+    if !pos.is_finite() || pos <= start {
+        return Err(format!(
+            "End ({}) must be after this line's start ({}).",
+            format_timecode(pos),
+            format_timecode(start)
+        ));
+    }
+    let mut end = pos;
+    let mut clamped = false;
+    if !lines[idx].is_backing {
+        if let Some(next_start) = next_main_index(lines, idx).and_then(|n| lines[n].start) {
+            if pos > next_start {
+                if next_start <= start {
+                    return Err(format!(
+                        "End ({}) can't be after the next line starts ({}).",
+                        format_timecode(pos),
+                        format_timecode(next_start)
+                    ));
+                }
+                end = next_start;
+                clamped = true;
+            }
+        }
+    }
+    lines[idx].sing_end_override = Some(end);
+    Ok((end, clamped))
 }
 
 /// Converts any legacy embedded "Echo" backing vocals (see [`BackingVocal`])
@@ -1263,6 +1734,10 @@ pub struct TimedWord<'a> {
     pub is_manual: bool,
     #[allow(dead_code)]
     pub end_is_manual: bool,
+    /// Whether this unit is the last syllable of its word (always true for
+    /// a word with no [`SYLLABLE_MARK`]s) - exporters that write text per
+    /// unit (LRC2, ASS, UltraStar) put a space after it only when true.
+    pub ends_word: bool,
 }
 
 /// Split a timed line into words, each with a derived highlight start/end
@@ -1290,7 +1765,8 @@ fn resolve_word_timings<'a>(
     word_overrides: &[Option<f64>],
     word_end_overrides: &[Option<f64>],
 ) -> Vec<TimedWord<'a>> {
-    let words: Vec<&str> = text.split_whitespace().collect();
+    let units = timing_units(text);
+    let words: Vec<&str> = units.iter().map(|(u, _)| *u).collect();
     if words.is_empty() {
         return Vec::new();
     }
@@ -1327,28 +1803,99 @@ fn resolve_word_timings<'a>(
             held_until: manual_end.unwrap_or(default_end).max(word_start),
             is_manual: manual_start.is_some(),
             end_is_manual: manual_end.is_some(),
+            ends_word: units[i].1,
         });
     }
     out
 }
 
-/// Re-join words with a single space - this is what's actually measured
-/// and drawn, and what word/char spans are computed against, so they
-/// always agree regardless of whatever whitespace was in the source text.
-pub fn normalize_text(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Marks a syllable break inside a word in the lyrics: `beau|ti|ful` is
+/// one word on screen ("beautiful") but three timing units, each with its
+/// own highlight time, so a long held word can wipe syllable by syllable.
+/// Chosen over `-` (real hyphenated words like "well-known" must keep their
+/// hyphens) and `/` ("and/or"); `|` essentially never appears in lyrics.
+pub const SYLLABLE_MARK: char = '|';
+
+/// The timing units of a line's text, in order: whitespace-separated
+/// words, further split at [`SYLLABLE_MARK`]s. Each unit comes with whether
+/// it ends its word (`false` for every syllable but a word's last). This is
+/// what per-"word" timing (`word_overrides`, tapping, the wipe) is indexed
+/// by - a word with no syllable marks is simply one unit.
+pub fn timing_units(text: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    for word in text.split_whitespace() {
+        let parts: Vec<&str> = word
+            .split(SYLLABLE_MARK)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let n = parts.len();
+        for (k, part) in parts.into_iter().enumerate() {
+            out.push((part, k + 1 == n));
+        }
+    }
+    out
 }
 
-/// (char offset within the normalized text, char length) for each word.
-pub fn word_char_spans(text: &str) -> Vec<(usize, usize)> {
+/// The text as displayed: words re-joined with a single space and
+/// [`SYLLABLE_MARK`]s removed - this is what's actually measured and drawn,
+/// and what [`word_char_spans`] offsets point into, so they always agree
+/// regardless of whatever whitespace was in the source text.
+pub fn normalize_text(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| w.replace(SYLLABLE_MARK, ""))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// (char offset, char length) of each timing unit (see [`timing_units`])
+/// within the *displayed* text ([`normalize_text`] of `raw_text`). Takes
+/// the raw line text, since the displayed text no longer has the syllable
+/// marks needed to find syllable boundaries.
+pub fn word_char_spans(raw_text: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut offset = 0usize;
-    for w in text.split_whitespace() {
-        let len = w.chars().count();
+    for (unit, ends_word) in timing_units(raw_text) {
+        let len = unit.chars().count();
         spans.push((offset, len));
-        offset += len + 1;
+        offset += len + usize::from(ends_word);
     }
     spans
+}
+
+/// Expands per-*word* `(start, end)` times (one per whitespace word of
+/// `text` - e.g. from auto-align, which aligns whole words) into per-unit
+/// times (see [`timing_units`]): a word split into syllables has its span
+/// divided among them in proportion to their letter counts. Returns one
+/// entry per unit; words beyond `word_times` get none (the result is
+/// shorter), the same as a short alignment result.
+pub fn spread_word_timing(text: &str, word_times: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    for (word, &(start, end)) in text.split_whitespace().zip(word_times) {
+        let parts: Vec<usize> = word
+            .split(SYLLABLE_MARK)
+            .filter(|p| !p.is_empty())
+            .map(|p| p.chars().count().max(1))
+            .collect();
+        let total = parts.iter().sum::<usize>().max(1) as f64;
+        let mut acc = 0usize;
+        for len in parts {
+            let a = start + (end - start) * acc as f64 / total;
+            acc += len;
+            let b = start + (end - start) * acc as f64 / total;
+            out.push((a, b));
+        }
+    }
+    out
+}
+
+/// Index of the first timing unit of word `word_idx` (whitespace words),
+/// i.e. how many units the words before it have.
+pub fn first_unit_of_word(text: &str, word_idx: usize) -> usize {
+    text.split_whitespace()
+        .take(word_idx)
+        .map(|w| w.split(SYLLABLE_MARK).filter(|p| !p.is_empty()).count())
+        .sum()
 }
 
 /// A continuous (not stepped) 0.0..=1.0 fraction of the way across the
@@ -1363,13 +1910,14 @@ pub fn word_char_spans(text: &str) -> Vec<(usize, usize)> {
 /// instantaneous (no freeze) for words that don't have a manual end
 /// override, since their `held_until` already *is* the next word's start.
 pub fn current_line_wipe_fraction(line: &TimedLine, t: f64) -> f32 {
-    resolve_wipe_fraction(&normalize_text(&line.text), &word_timings(line), t)
+    resolve_wipe_fraction(&line.text, &word_timings(line), t)
 }
 
-/// The shared math behind [`current_line_wipe_fraction`].
-fn resolve_wipe_fraction(text: &str, words: &[TimedWord], t: f64) -> f32 {
-    let char_count = text.chars().count().max(1) as f32;
-    let spans = word_char_spans(text);
+/// The shared math behind [`current_line_wipe_fraction`]. `raw_text` is
+/// the line's text with any syllable marks (see [`word_char_spans`]).
+fn resolve_wipe_fraction(raw_text: &str, words: &[TimedWord], t: f64) -> f32 {
+    let char_count = normalize_text(raw_text).chars().count().max(1) as f32;
+    let spans = word_char_spans(raw_text);
     if words.is_empty() || spans.is_empty() {
         return 0.0;
     }
@@ -2136,6 +2684,359 @@ mod tests {
         let mut lines = vec![LyricLine::new("a"), LyricLine::new("b")];
         lines[0].start = Some(0.0);
         assert!(check_start_change(&lines, 1, 0.01).is_ok());
+    }
+
+    fn timed(text: &str, start: f64, end: f64) -> LyricLine {
+        let mut l = LyricLine::new(text);
+        l.start = Some(start);
+        l.sing_end_override = Some(end);
+        l
+    }
+
+    #[test]
+    fn syllable_marks_split_timing_units_but_not_the_displayed_word() {
+        let text = "a  beau|ti|ful  day";
+        assert_eq!(
+            timing_units(text),
+            vec![
+                ("a", true),
+                ("beau", false),
+                ("ti", false),
+                ("ful", true),
+                ("day", true)
+            ]
+        );
+        assert_eq!(normalize_text(text), "a beautiful day");
+        // Offsets point into "a beautiful day".
+        assert_eq!(
+            word_char_spans(text),
+            vec![(0, 1), (2, 4), (6, 2), (8, 3), (12, 3)]
+        );
+        assert_eq!(LyricLine::new(text).word_overrides.len(), 5);
+        assert_eq!(first_unit_of_word(text, 2), 4);
+        // Stray marks don't make empty units or double spaces.
+        assert_eq!(timing_units("|x|| y|"), vec![("x", true), ("y", true)]);
+        assert_eq!(normalize_text("| x |"), "x");
+        // A word with no marks is still one unit.
+        assert_eq!(timing_units("well-known"), vec![("well-known", true)]);
+    }
+
+    #[test]
+    fn wipe_moves_through_syllables_at_their_own_times() {
+        let mut line = LyricLine::new("beau|ti|ful");
+        line.word_overrides = vec![Some(0.0), Some(1.0), Some(2.0)];
+        let tl = TimedLine::from_line(&line, 0.0, 3.0);
+        let mut tl = tl;
+        tl.sing_end = 3.0;
+        // "beautiful" = 9 chars: "beau" is 4/9, "ti" ends at 6/9.
+        let at = |t: f64| current_line_wipe_fraction(&tl, t);
+        assert!((at(1.0) - 4.0 / 9.0).abs() < 1e-4, "{}", at(1.0));
+        assert!((at(1.5) - 5.0 / 9.0).abs() < 1e-4, "{}", at(1.5));
+        assert!((at(2.0) - 6.0 / 9.0).abs() < 1e-4, "{}", at(2.0));
+        assert!(word_timings(&tl)
+            .iter()
+            .map(|w| w.ends_word)
+            .eq([false, false, true]));
+    }
+
+    #[test]
+    fn spread_word_timing_divides_a_word_among_its_syllables() {
+        let spread = spread_word_timing("go beau|ti|ful", &[(0.0, 1.0), (1.0, 2.0)]);
+        // "beau"/"ti"/"ful" = 4/2/3 of 9 letters.
+        let expect = [
+            (0.0, 1.0),
+            (1.0, 1.0 + 4.0 / 9.0),
+            (1.0 + 4.0 / 9.0, 1.0 + 6.0 / 9.0),
+            (1.0 + 6.0 / 9.0, 2.0),
+        ];
+        assert_eq!(spread.len(), 4);
+        for (a, b) in spread.iter().zip(expect) {
+            assert!(
+                (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9,
+                "{a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adding_syllable_marks_keeps_the_word_start_and_end() {
+        let mut old = LyricLine::new("so beautiful now");
+        old.word_overrides = vec![Some(1.0), Some(2.0), Some(4.0)];
+        old.word_end_overrides = vec![None, Some(3.5), None];
+        let new = LyricLine::new("so beau|ti|ful now");
+        let (merged, _) = merge_edited_line(&old, &new);
+        assert_eq!(
+            merged.word_overrides,
+            vec![Some(1.0), Some(2.0), None, None, Some(4.0)]
+        );
+        assert_eq!(
+            merged.word_end_overrides,
+            vec![None, None, None, Some(3.5), None]
+        );
+        // And an unchanged syllabified word keeps every syllable's time.
+        let mut old = LyricLine::new("beau|ti|ful day");
+        old.word_overrides = vec![Some(1.0), Some(1.5), Some(2.0), Some(3.0)];
+        let new = LyricLine::new("beau|ti|ful days");
+        let (merged, _) = merge_edited_line(&old, &new);
+        assert_eq!(
+            merged.word_overrides,
+            vec![Some(1.0), Some(1.5), Some(2.0), None]
+        );
+    }
+
+    #[test]
+    fn split_line_splits_syllable_overrides_at_the_word_boundary() {
+        let mut raw = "beau|ti|ful sunny day".to_string();
+        let mut lines = parse_pasted_lyrics(&raw);
+        lines[0].start = Some(1.0);
+        lines[0].word_overrides = vec![Some(1.0), Some(1.5), Some(2.0), Some(3.0), Some(4.0)];
+        split_line(&mut lines, &mut raw, 0, 1, Some(3.0)).unwrap();
+        assert_eq!(lines[0].text, "beau|ti|ful");
+        assert_eq!(
+            lines[0].word_overrides,
+            vec![Some(1.0), Some(1.5), Some(2.0)]
+        );
+        assert_eq!(lines[1].text, "sunny day");
+        assert_eq!(lines[1].word_overrides, vec![Some(3.0), Some(4.0)]);
+        assert_eq!(raw, "beau|ti|ful\nsunny day");
+        // Balancing ignores the marks: "beautiful" (9) | "sunny day" (9).
+        assert_eq!(best_split_word("beau|ti|ful sunny day"), Some(1));
+    }
+
+    fn chorus_song() -> Vec<LyricLine> {
+        let mut lines: Vec<LyricLine> = [
+            "Verse one here",
+            "Hold me now",
+            "Never let go",
+            "Verse two here",
+            "hold me NOW!",
+            "never let go",
+            "outro",
+        ]
+        .iter()
+        .map(|t| LyricLine::new(*t))
+        .collect();
+        // Verse 1 and the first chorus timed.
+        lines[0].start = Some(1.0);
+        lines[0].sing_end_override = Some(4.0);
+        lines[1].start = Some(10.0);
+        lines[1].sing_end_override = Some(12.0);
+        lines[1].word_overrides = vec![Some(10.0), Some(10.8), Some(11.2)];
+        lines[1].word_end_overrides = vec![None, None, Some(11.9)];
+        lines[2].start = Some(12.5);
+        lines[2].sing_end_override = Some(15.0);
+        lines[3].start = Some(20.0);
+        lines[3].sing_end_override = Some(23.0);
+        lines
+    }
+
+    #[test]
+    fn find_repeat_matches_text_ignoring_case_and_punctuation() {
+        let lines = chorus_song();
+        assert_eq!(find_repeat(&lines, &[1, 2]), Some(4));
+        // Searching from a later copy finds the earlier one too.
+        assert_eq!(find_repeat(&lines, &[4, 5]), Some(1));
+        assert_eq!(find_repeat(&lines, &[0]), None);
+        assert_eq!(comparable_text("Hold  me NOW!"), "hold me now");
+    }
+
+    #[test]
+    fn copy_timing_moves_lines_and_words_by_one_offset() {
+        let mut lines = chorus_song();
+        let differing = copy_timing(&mut lines, &[1, 2], 4, 30.0).unwrap();
+        assert_eq!(differing, 0);
+        assert_eq!(lines[4].start, Some(30.0));
+        assert_eq!(lines[4].sing_end_override, Some(32.0));
+        assert_eq!(
+            lines[4].word_overrides,
+            vec![Some(30.0), Some(30.8), Some(31.2)]
+        );
+        assert_eq!(lines[4].word_end_overrides, vec![None, None, Some(31.9)]);
+        assert_eq!(lines[5].start, Some(32.5));
+        assert_eq!(lines[5].sing_end_override, Some(35.0));
+        // Text stays the target's own.
+        assert_eq!(lines[4].text, "hold me NOW!");
+    }
+
+    #[test]
+    fn copy_timing_with_different_words_copies_line_timing_only() {
+        let mut lines = chorus_song();
+        lines[5] = LyricLine::new("never ever let me go");
+        let differing = copy_timing(&mut lines, &[1, 2], 4, 30.0).unwrap();
+        assert_eq!(differing, 1);
+        assert_eq!(lines[5].start, Some(32.5));
+        assert_eq!(lines[5].word_overrides, vec![None; 5]);
+    }
+
+    #[test]
+    fn copy_timing_is_all_or_nothing() {
+        let mut lines = chorus_song();
+        let before = lines.clone();
+        // Would start before verse two (line 3) ends at 23.0.
+        assert!(copy_timing(&mut lines, &[1, 2], 4, 22.0).is_err());
+        // Overlapping source/target, untimed source, out of range.
+        assert!(copy_timing(&mut lines, &[1, 2], 2, 30.0).is_err());
+        assert!(copy_timing(&mut lines, &[5, 6], 1, 30.0).is_err());
+        assert!(copy_timing(&mut lines, &[1, 2], 6, 30.0).is_err());
+        assert_eq!(lines, before);
+    }
+
+    #[test]
+    fn best_split_word_balances_character_counts() {
+        assert_eq!(best_split_word("one"), None);
+        assert_eq!(best_split_word("aa bb"), Some(1));
+        // "I want to hold" (14) | "your hand tonight" (17)
+        assert_eq!(best_split_word("I want to hold your hand tonight"), Some(4));
+    }
+
+    #[test]
+    fn split_line_keeps_timing_words_and_raw_text_in_sync() {
+        let mut raw = "first line\n\nalpha beta gamma delta\nlast\n".to_string();
+        let mut lines = parse_pasted_lyrics(&raw);
+        lines[1].start = Some(10.0);
+        lines[1].sing_end_override = Some(14.0);
+        lines[1].word_overrides = vec![Some(10.0), None, Some(12.0), None];
+        lines[1].word_end_overrides = vec![None, None, None, Some(13.8)];
+        lines[1].singer = Singer::Female;
+        assert!(lines[1].starts_new_block);
+
+        split_line(&mut lines, &mut raw, 1, 2, Some(12.0)).unwrap();
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1].text, "alpha beta");
+        assert_eq!(lines[1].start, Some(10.0));
+        assert_eq!(lines[1].sing_end_override, Some(12.0));
+        assert_eq!(lines[1].word_overrides, vec![Some(10.0), None]);
+        assert!(lines[1].starts_new_block);
+        assert_eq!(lines[2].text, "gamma delta");
+        assert_eq!(lines[2].start, Some(12.0));
+        assert_eq!(lines[2].sing_end_override, Some(14.0));
+        assert_eq!(lines[2].word_overrides, vec![Some(12.0), None]);
+        assert_eq!(lines[2].word_end_overrides, vec![None, Some(13.8)]);
+        assert_eq!(lines[2].singer, Singer::Female);
+        assert!(!lines[2].starts_new_block);
+        // Raw text re-parses to exactly the new lines.
+        assert_eq!(raw, "first line\n\nalpha beta\ngamma delta\nlast\n");
+        let reparsed: Vec<String> = parse_pasted_lyrics(&raw)
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        let now: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
+        assert_eq!(reparsed, now);
+    }
+
+    #[test]
+    fn split_line_untimed_stays_untimed() {
+        let mut raw = "a b c d".to_string();
+        let mut lines = parse_pasted_lyrics(&raw);
+        split_line(&mut lines, &mut raw, 0, 2, Some(5.0)).unwrap();
+        assert_eq!(lines[0].start, None);
+        assert_eq!(lines[0].sing_end_override, None);
+        assert_eq!(lines[1].start, None);
+        assert_eq!(raw, "a b\nc d");
+    }
+
+    #[test]
+    fn split_line_refuses_when_raw_is_out_of_sync() {
+        let mut raw = "a b c d".to_string();
+        let mut lines = parse_pasted_lyrics(&raw);
+        raw.push_str("\nnew unparsed line");
+        let before = (lines.clone(), raw.clone());
+        assert!(split_line(&mut lines, &mut raw, 0, 2, None).is_err());
+        assert_eq!((lines, raw), before);
+    }
+
+    #[test]
+    fn shift_lines_moves_starts_ends_and_word_overrides_together() {
+        let mut lines = vec![timed("a b", 1.0, 3.0), timed("c d", 4.0, 6.0)];
+        lines[1].word_overrides = vec![Some(4.0), Some(5.0)];
+        lines[1].word_end_overrides = vec![None, Some(5.8)];
+        assert_eq!(shift_lines(&mut lines, &[1], 0.5), Ok(1));
+        assert_eq!(lines[1].start, Some(4.5));
+        assert_eq!(lines[1].sing_end_override, Some(6.5));
+        assert_eq!(lines[1].word_overrides, vec![Some(4.5), Some(5.5)]);
+        assert_eq!(lines[1].word_end_overrides, vec![None, Some(6.3)]);
+        // Unselected line untouched.
+        assert_eq!(lines[0].start, Some(1.0));
+    }
+
+    #[test]
+    fn shift_lines_rejects_overlap_and_changes_nothing() {
+        let mut lines = vec![timed("a", 1.0, 3.0), timed("b", 4.0, 6.0)];
+        let before = lines.clone();
+        assert!(shift_lines(&mut lines, &[1], -1.5).is_err());
+        assert_eq!(lines, before);
+        // Shifting both together is fine - they keep their spacing.
+        assert_eq!(shift_lines(&mut lines, &[0, 1], -0.5), Ok(2));
+        assert_eq!(lines[0].start, Some(0.5));
+        assert_eq!(lines[1].start, Some(3.5));
+    }
+
+    #[test]
+    fn shift_lines_rejects_negative_times() {
+        let mut lines = vec![timed("a", 0.2, 3.0)];
+        assert!(shift_lines(&mut lines, &[0], -0.3).is_err());
+        assert_eq!(lines[0].start, Some(0.2));
+    }
+
+    #[test]
+    fn shift_lines_skips_untimed_and_errors_if_nothing_is_timed() {
+        let mut lines = vec![LyricLine::new("a"), timed("b", 4.0, 6.0)];
+        assert!(shift_lines(&mut lines, &[0], 1.0).is_err());
+        assert_eq!(shift_lines(&mut lines, &[0, 1], 1.0), Ok(1));
+        assert_eq!(lines[0].start, None);
+    }
+
+    #[test]
+    fn tap_start_before_previous_end_trims_it_instead_of_failing() {
+        let mut lines = vec![timed("a", 1.0, 5.0), LyricLine::new("b")];
+        assert_eq!(apply_tap_start(&mut lines, 1, 4.2), Ok(Some(0)));
+        assert_eq!(lines[0].sing_end_override, Some(4.2));
+        assert_eq!(lines[1].start, Some(4.2));
+    }
+
+    #[test]
+    fn tap_start_after_previous_end_leaves_it_alone() {
+        let mut lines = vec![timed("a", 1.0, 5.0), LyricLine::new("b")];
+        assert_eq!(apply_tap_start(&mut lines, 1, 5.0), Ok(None));
+        assert_eq!(lines[0].sing_end_override, Some(5.0));
+    }
+
+    #[test]
+    fn tap_start_before_previous_start_is_still_an_error() {
+        let mut lines = vec![timed("a", 3.0, 5.0), LyricLine::new("b")];
+        assert!(apply_tap_start(&mut lines, 1, 2.0).is_err());
+        assert!(apply_tap_start(&mut lines, 1, 3.0).is_err());
+        assert_eq!(lines[0].sing_end_override, Some(5.0));
+        assert_eq!(lines[1].start, None);
+    }
+
+    #[test]
+    fn tap_start_skips_backing_lines_for_the_previous_line() {
+        let mut backing = timed("bg", 2.0, 9.0);
+        backing.is_backing = true;
+        let mut lines = vec![timed("a", 1.0, 5.0), backing, LyricLine::new("b")];
+        assert_eq!(apply_tap_start(&mut lines, 2, 4.0), Ok(Some(0)));
+        // The backing line is free to overlap, so it's untouched.
+        assert_eq!(lines[1].sing_end_override, Some(9.0));
+    }
+
+    #[test]
+    fn tap_end_after_next_start_clamps_to_it() {
+        let mut lines = vec![LyricLine::new("a"), timed("b", 5.0, 8.0)];
+        lines[0].start = Some(1.0);
+        assert_eq!(apply_tap_end(&mut lines, 0, 5.4), Ok((5.0, true)));
+        assert_eq!(lines[0].sing_end_override, Some(5.0));
+        assert_eq!(apply_tap_end(&mut lines, 0, 4.0), Ok((4.0, false)));
+    }
+
+    #[test]
+    fn tap_end_errors_without_a_start_or_before_it() {
+        let mut lines = vec![LyricLine::new("a")];
+        assert!(apply_tap_end(&mut lines, 0, 2.0).is_err());
+        lines[0].start = Some(3.0);
+        assert!(apply_tap_end(&mut lines, 0, 3.0).is_err());
+        assert_eq!(lines[0].sing_end_override, None);
     }
 
     #[test]

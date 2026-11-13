@@ -160,8 +160,9 @@ fn write_wav(stem: &[Vec<f32>; 2], sample_rate: u32, path: &Path) -> Result<()> 
 /// Converts a WAV to another format via `ffmpeg` - this app still shells
 /// out to it for video export (see `video.rs`), so this doesn't add a new
 /// runtime dependency, just reuses the one that's still there until that's
-/// addressed separately.
-fn encode_via_ffmpeg(wav_path: &Path, output_path: &Path, ext: &str) -> Result<()> {
+/// addressed separately. ffmpeg reads any input format, so the MP3+G zip
+/// export also uses this to turn a non-MP3 source song into an `.mp3`.
+pub fn encode_via_ffmpeg(wav_path: &Path, output_path: &Path, ext: &str) -> Result<()> {
     let mut cmd = crate::ffmpeg_path::command()?;
     cmd.args(["-y", "-i"]).arg(wav_path);
     if ext == "mp3" {

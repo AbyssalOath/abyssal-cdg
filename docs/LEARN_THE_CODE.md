@@ -136,6 +136,8 @@ abyssal-cdg/
 │   └── release.yml       Builds and signs installers for all 4 platforms,
 │                         fetches ffmpeg/openh264/ONNX Runtime/ML models
 ├── docs/
+│   ├── BUILDING.md       Building from source and running the tests
+│   ├── INSTALLING.md     Installing a release, first-launch warnings
 │   └── LEARN_THE_CODE.md This file
 ├── build.rs              Windows-only: embeds the app icon + version info
 │                         into the compiled .exe's own PE resources
@@ -166,9 +168,13 @@ abyssal-cdg/
 | `project.rs` | Save/load for `.abyzl` project files, plus the crash-recovery autosave slot |
 | `recent.rs` | Persisted "recently opened" files list |
 | `onboarding.rs` | The one-time first-run disclaimer flag |
+| `prefs.rs` | Per-machine user preferences (tap latency, Tips toggle, last export folder, UI size) |
 | `audio.rs` | Audio decode/playback and the play/pause/seek state machine used for tap-to-time |
 | `waveform.rs` | Decodes audio into coarse peaks, drawn behind the timeline as a visual aid |
 | `ffmpeg_path.rs` | Locates the bundled `ffmpeg` binary and the `openh264` shared library it needs |
+| `checks.rs` | The export dialog's pre-export checklist - pure checks over the lyric data returning warnings/notes with optional one-click fixes |
+| `cdg_decode.rs` | CD+G *decoder* for the preview's ".cdg (exact)" mode - plays back the real exported bytes, with 5-second decoder checkpoints for instant seeking |
+| `zipfile.rs` | Minimal PKZIP 2.0 writer (deflate/stored, UTF-8 names) for the MP3+G `.zip` export, on `flate2` + `crc32fast` |
 | `cdg.rs` | Low-level CD+Graphics packet encoder - no knowledge of lyrics, just a byte-stream writer |
 | `font.rs` | Renders characters into CDG's 6x12 tile bitmap format |
 | `export.rs` | The `.cdg` renderer: lays out lines/words/countdown dots on the CDG canvas |
@@ -511,6 +517,17 @@ seeing concretely once:
 the two most involved examples - both report one combined progress value
 across multiple internal phases, and both let individual outputs/lines
 fail independently without aborting the rest of the run.
+
+The export work itself is a free function, `run_export(inputs, options,
+folder, base, progress)`, not a `KaraokeApp` method: `ExportInputs` is
+everything about one song (lines, colors as `ExportColors`, video/timing
+settings, font bytes, audio path/length) and `ExportOptions` is the export
+dialog's checkboxes. `start_combined_export` builds the inputs from the
+open project (`export_inputs`); batch export (`run_batch_export`) builds
+them straight from each `.abyzl` file (`ExportInputs::from_project`, which
+also runs the legacy-backing migration) without loading it into the app,
+so the open project is never touched. `ExportColors::from_project` holds
+the project-file color fallbacks, shared with `apply_project_file`.
 
 ### Non-obvious design decisions, invariants, and gotchas
 
@@ -935,6 +952,36 @@ crate.
 **Gotchas:** errors writing the list back to disk are silently swallowed
 - worth doing best-effort, never worth interrupting the user's actual
 save/load over a convenience feature failing to persist.
+
+### Timing units and syllables (`lyrics.rs`)
+
+Per-"word" timing (`word_overrides`, `word_end_overrides`, tapping, the
+wipe) is indexed by **timing unit**, not whitespace word:
+`lyrics::timing_units(text)` splits words further at `SYLLABLE_MARK`
+(`|`), returning `(unit, ends_word)`. `normalize_text` is the *displayed*
+text (single spaces, marks removed) and `word_char_spans(raw_text)` maps
+each unit to its char span inside that displayed text - it takes the raw
+text because the marks are gone after normalizing. `TimedWord::ends_word`
+tells per-unit exporters (LRC2/ASS/UltraStar) where real spaces go.
+`first_unit_of_word` / `spread_word_timing` convert between whole words
+(what line splitting and auto-align work in) and units.
+
+### `prefs.rs` - per-machine preferences
+
+**Purpose.** A small `preferences.json` in eframe's per-app storage dir,
+for settings that belong to the person and their setup rather than a
+song: `tap_latency_ms` (the tap latency compensation `main.rs`'s
+`compensate_tap` subtracts from every live tap - reaction time and
+audio-output delay, e.g. Bluetooth, follow the user from song to song),
+`show_tips` (the "💡 Tips" toggle, see `help_text`), `export_folder` (the
+last folder chosen in the export dialog) and `ui_zoom` (the UI size, see
+`sync_ui_style`). Every field has a serde default, so an older file -
+or one from before a field existed - still loads.
+
+**Key items:** `Prefs`, `load(app_id)` (missing/corrupt file -> defaults;
+latency clamped to `0..=MAX_TAP_LATENCY_MS`, UI size to
+`MIN_UI_ZOOM..=MAX_UI_ZOOM`), `save(app_id, &prefs)`
+(best-effort, errors swallowed - same as `onboarding.rs`).
 
 ### `onboarding.rs` - first-run disclaimer flag
 
@@ -1449,6 +1496,15 @@ all already defined in the Glossary.
 writer with zero knowledge of lyrics, singers, or timing logic - just
 "write this instruction, consuming this many packets' worth of time."
 
+**Tile shadow.** `CdgWriter` remembers what every tile on screen shows
+(normalized by `canonical_tile`, so e.g. any all-blank tile in one color
+compares equal) and `tile_block` silently skips a write that wouldn't
+change anything - no packet, no stream time. `tile_differs` exposes the
+same check, which `export.rs`'s `band_writes` uses to compute exactly
+which tiles a line change needs *before* writing them, so the exporter
+can start that many packets ahead of `line.start` and have the line fully
+on screen when it's due.
+
 **Key items:** `PACKET_SIZE` (24 bytes), `PACKETS_PER_SEC` (300.0 - *the*
 fact that makes CD+G timing work: there's no separate timestamp field in
 the format, so timing is purely "how many packets precede this
@@ -1483,12 +1539,23 @@ crate - genuinely a leaf module, the lowest layer in the whole project.
 ### `font.rs` - CDG bitmap glyphs
 
 **Purpose.** Renders a character into CD+G's native 6×12-pixel tile
-format, sourced from the `font8x8` crate's 8×8 bitmap glyphs (the
-left-most 6 of each row's 8 columns are used; the font's own rightmost 2
-columns are unused padding).
+format, sourced from the `font8x8` crate's 8×8 bitmap glyphs. Many of
+those glyphs are 7 pixels wide, so `fit_to_six_columns` narrows each one
+to the tile's 6 columns (dropping empty edge columns first, otherwise
+merging the most similar adjacent pair - font8x8's 2px-thick strokes
+usually make that lossless).
 
-**Key items:** `glyph_tile(ch) -> TilePixels` (an unsupported character
-renders blank, same as a space - never a panic or a placeholder glyph).
+**Key items:** `cdg_glyph_rows(ch)` - the fallback chain: font8x8's ASCII
+set, then its Latin-1 set (é, ñ, ü, ...), then hand-drawn extras (`…`),
+then `fallback_char`'s single-character stand-in (curly quotes -> straight,
+dashes -> `-`, other accented letters -> base letter via NFD) looked up the
+same way. Substitution is draw-time and one-for-one, so lyric text, char
+offsets and word spans are never changed. `fallback_char` is also used by
+`video.rs` when the chosen lyric font lacks a glyph.
+`cdg_unsupported_chars(text)` lists what still can't be drawn, for the
+export dialog's warning. `glyph_tile(ch) -> TilePixels` (a character with
+no glyph even after fallback renders blank, same as a space - never a
+panic or a placeholder glyph).
 `glyph_tile_scaled(ch, scale) -> Vec<Vec<TilePixels>>` - pixel-doubles the
 base glyph into a `scale × scale` grid of real tiles, which is how the
 current line renders bigger/more legible (2x) when it fits (see
@@ -1498,7 +1565,7 @@ flips a 6-bit row between the two conventions, and is its own
 involution: `reverse6(reverse6(b)) == b` for every possible byte, checked
 directly by a dedicated test).
 
-**Callers/callees.** Used only by `export.rs`. Calls `font8x8` directly.
+**Callers/callees.** Used by `export.rs` (tiles), `video.rs` (`fallback_char`) and `main.rs` (export-dialog warning). Calls `font8x8` and `unicode-normalization` directly.
 
 **Gotchas:** this is a *fixed* 1-bit bitmap font with no scalable-font
 machinery at all - there's no reasonable way to downsample an arbitrary
@@ -1838,31 +1905,35 @@ work and the UI stay in sync.
 
 ### The dependency graph
 
-`main.rs` depends on all 22 other modules (it declares every one of them
+`main.rs` depends on all 26 other modules (it declares every one of them
 as `mod ...;`). Everything *below* `main.rs` forms a clean, acyclic,
-6-layer graph - no module ever depends on one above it:
+6-layer graph - no module ever depends on one above it. (Doc-comment
+links like ``[`crate::export::Palette`]`` aren't dependencies and aren't
+counted.)
 
 ```
 Layer 0 (zero dependencies on anything else in this crate):
-  audio  cdg  codex  ctc  fonts  lyrics  model_assets
-  onboarding  recent  stft  timeline  waveform
+  audio  cdg  codex  ctc  fonts  lyrics  model_assets  onboarding
+  prefs  recent  stft  timeline  waveform  zipfile
 
 Layer 1 (depend only on Layer 0):
+  cdg_decode   -> cdg
   font         -> cdg
-  formats      -> lyrics
   ffmpeg_path  -> model_assets
   onnxrt       -> model_assets
 
 Layer 2 (depend only on Layers 0-1):
-  mdx     -> stft, onnxrt
-  export  -> cdg, font, lyrics
   align   -> ctc, model_assets, onnxrt
+  checks  -> cdg, font, lyrics
+  export  -> cdg, font, lyrics
+  mdx     -> onnxrt, stft
 
 Layer 3 (depend only on Layers 0-2):
-  vocals  -> mdx, model_assets, ffmpeg_path
-  video   -> lyrics, export, ffmpeg_path
+  video   -> export, ffmpeg_path, font, lyrics
+  vocals  -> ffmpeg_path, mdx, model_assets
 
 Layer 4:
+  formats -> export, lyrics, video
   project -> lyrics, video
 
 Layer 5:
@@ -1887,6 +1958,16 @@ to miss just from reading each file's own module doc:
   `BackgroundFit`, `Resolution`, `VideoCodec`), which happen to be defined
   there because that's the module they're most relevant to, not because
   `project.rs` needs any of `video.rs`'s actual rendering logic.
+- **`formats.rs` sits near the top, not the bottom.** It used to depend
+  only on `lyrics.rs`, but its subtitle exporters reuse the video's voice
+  colors (`video::VideoPalette`) for the `.ass` styles and the outro card
+  (`export::Outro`) for both subtitle formats - so it's now a Layer 4
+  module alongside `project.rs`.
+- **`video.rs` depends on `font.rs`** - not for drawing (video text is
+  real TrueType via `ab_glyph`), only for `font::fallback_char`, the same
+  plain stand-ins (curly quote -> straight quote, accented letter -> base
+  letter) the `.cdg` font uses, applied when the chosen lyric font lacks a
+  glyph.
 - **`timeline.rs`'s production code has zero crate-internal
   dependencies** - the one `use crate::lyrics::...` in that file is
   inside its own `#[cfg(test)]` module (a regression test building a
