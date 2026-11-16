@@ -2,42 +2,36 @@
 
 ## macOS: `objc2` fails with "is not an iterator" (Rust 1.100+)
 
-On macOS, **Rust 1.100 and newer can't compile `objc2` 0.4.1**, an old
-macOS-only dependency pulled in by `eframe` 0.28 (via `winit` 0.29 /
-`glutin` 0.31) - the build stops inside `objc2`'s
-`ivar_forwarding_impls.rs` with `error[E0277]: ... is not an iterator`.
-It's not a bug in this project's code, and Linux/Windows builds aren't
-affected. Build with Rust 1.99 until `eframe`/`egui` are upgraded (newer
-`winit` uses `objc2` 0.5+):
-
-```bash
-rustup toolchain install 1.99.0
-cargo +1.99.0 build --release
-```
-
-CI and the release workflow are pinned to 1.99.0 for the same reason (see
-the comment on their "Install Rust" step).
+Only affects checkouts from before v0.2.6: `eframe` 0.28 pulled in `objc2`
+0.4.1, which Rust 1.100+ can't compile on macOS
+(`error[E0277]: ... is not an iterator` in `ivar_forwarding_impls.rs`).
+Since v0.2.6 the app uses `eframe` 0.37 (`objc2` 0.5/0.6), which builds on
+current stable. On an older checkout, build with `cargo +1.99.0 build
+--release`.
 
 ## "It fails to compile" / dependency resolution errors
 
 This project, as configured (via the committed `Cargo.lock`), **will fail to compile on
-any Rust toolchain older than 1.88** - this is a dependency issue, not a bug in this
+any Rust toolchain older than 1.95** - this is a dependency issue, not a bug in this
 project's own code. That floor is the strictest `rust-version` declared by any locked
-dependency (`image`/`libloading`, both 1.88 - re-check with `cargo metadata --format-version
-1 | jq -r '.packages[] | select(.rust_version) | "\(.rust_version) \(.name)"' | sort -rV |
-head` if a future dependency bump changes it) - a toolchain below that fails outright
-with an error like:
+dependency (`egui`/`eframe` 0.37 and their `emath`/`epaint`/`egui_glow` crates, all
+1.95 - re-check with `cargo metadata --format-version 1 | jq -r '.packages[] |
+select(.rust_version) | "\(.rust_version) \(.name)"' | sort -rV | head` if a future
+dependency bump changes it), and `Cargo.toml` declares it as `rust-version`, so a
+toolchain below that fails outright with an error like:
 
 ```
-error: package `image v0.25.10` cannot be built because it requires rustc 1.88.0 or newer,
-while the currently active rustc version is 1.85.0
+error: rustc 1.93.0 is not supported by the following packages:
+  abyssal-cdg@0.2.6 requires rustc 1.95
+  ecolor@0.37.0 requires rustc 1.95
+  eframe@0.37.0 requires rustc 1.95
+  ...
 ```
 
-**If your toolchain is even older (below 1.85, released Feb 2025)**, you'll hit a
-different, more confusing error first: `eframe`/`egui` 0.28 pull in `egui-winit`, which
-unconditionally depends on `smithay-clipboard` -> `smithay-client-toolkit ^0.20` ->
-`wayland-protocols`. The published patch of `wayland-protocols` in that range requires
-Cargo's `edition2024` feature, which only stabilized in Rust 1.85:
+**If your toolchain is even older (below 1.85, released Feb 2025)**, you may hit a
+different, more confusing error first, while Cargo is still reading dependency
+manifests: some published dependencies require Cargo's `edition2024` feature, which
+only stabilized in Rust 1.85:
 
 ```
 error: failed to download replaced source registry `crates-io`
@@ -51,7 +45,7 @@ Either way, the fix is the same:
 
 ```bash
 rustup update stable
-rustc --version   # confirm 1.88 or newer
+rustc --version   # confirm 1.95 or newer
 cargo build --release
 ```
 

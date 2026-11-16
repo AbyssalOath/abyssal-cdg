@@ -248,8 +248,8 @@ mod tests {
             frame(&mut marked, 12.5) == frame(&mut plain, 12.5),
             "a syllable mark was drawn"
         );
-        // In between, "beautiful" is already fully lit but the syllabified
-        // one has only lit "beau", then "beau"+"ti".
+        // In between, the syllabified one wipes "beau", then "ti", then
+        // "ful" in their own windows.
         let lit = |pb: &mut CdgPlayback, t: f64, full: &[u8]| {
             frame(pb, t)
                 .chunks(4)
@@ -261,16 +261,25 @@ mod tests {
         let (a, b, c) = (
             lit(&mut marked, 9.3, &full),
             lit(&mut marked, 10.3, &full),
-            lit(&mut marked, 11.3, &full),
+            lit(&mut marked, 11.6, &full),
         );
         assert!(a < b && b < c && c == full.len() / 4, "{a} {b} {c}");
-        assert_eq!(lit(&mut plain, 9.3, &full), full.len() / 4);
+        // The plain word wipes across its whole 8.0-11.5 window instead of
+        // lighting all at once.
+        let (p1, p2, p3) = (
+            lit(&mut plain, 9.0, &full),
+            lit(&mut plain, 10.0, &full),
+            lit(&mut plain, 11.0, &full),
+        );
+        assert!(p1 < p2 && p2 < p3 && p3 < full.len() / 4, "{p1} {p2} {p3}");
     }
 
     /// Regression for lines landing ~0.65s late: each line must be fully
-    /// drawn by its start time, and its first word lit (with the preview
-    /// row drawn too) within 0.2s - after which nothing changes until the
-    /// second word, a second later.
+    /// drawn by its start time, and its first word start lighting within
+    /// 0.2s. The first word (a second long) then wipes across - its last
+    /// tile column lights ~0.94s in - and nothing changes after that until
+    /// the second word at 1.0s; drawing that ran late would still be
+    /// changing the screen in that gap.
     #[test]
     fn lines_are_drawn_by_their_start_and_first_word_lights_promptly() {
         use crate::export::{render_cdg, Palette};
@@ -326,7 +335,9 @@ mod tests {
             let before = frame(start - 0.6);
             let at_start = frame(start - 0.001);
             let first_word_lit = frame(start + 0.2);
-            let just_before_second = frame(start + 0.95);
+            let mid_wipe = frame(start + 0.6);
+            let wipe_done = frame(start + 0.96);
+            let just_before_second = frame(start + 0.995);
             assert!(
                 diff(&before, &at_start) > 300,
                 "{name}: line not drawn by its start"
@@ -335,8 +346,12 @@ mod tests {
                 diff(&at_start, &first_word_lit) > 0,
                 "{name}: first word didn't light"
             );
+            assert!(
+                diff(&first_word_lit, &mid_wipe) > 0,
+                "{name}: first word lit all at once instead of wiping"
+            );
             assert_eq!(
-                diff(&first_word_lit, &just_before_second),
+                diff(&wipe_done, &just_before_second),
                 0,
                 "{name}: screen still changing after the first word - drawing ran late"
             );

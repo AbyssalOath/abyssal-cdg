@@ -1354,6 +1354,226 @@ pub fn apply_tap_start(
     Ok(trimmed)
 }
 
+/// Word tap mode: a key held for less than this is a quick *tap*, not a
+/// held note - its release doesn't pin the unit's end, so the wipe keeps
+/// running straight on into the next unit instead of finishing in a flash
+/// and freezing. (The line's last unit always records its release as the
+/// line's end, floored at this much after its press.)
+pub const WORD_TAP_MIN_HOLD: f64 = 0.1;
+
+/// Where word tap mode is up to: the next timing unit (see
+/// [`timing_units`]) to press for, on main-track line `line`.
+/// `line == lines.len()` means every line has been tapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct WordCursor {
+    pub line: usize,
+    pub unit: usize,
+}
+
+/// What a word-tap press/release did to lines other than the one tapped,
+/// so the caller can say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct WordTapEffects {
+    /// The previous main line's end was pulled back to meet this line's
+    /// new start (see [`apply_tap_start`]).
+    pub trimmed_prev: Option<usize>,
+    /// The next main line's old timing was cleared, because this line is
+    /// demonstrably still being sung past where it said it started - it's
+    /// the next line to word-tap anyway.
+    pub cleared_next: Option<usize>,
+}
+
+/// True if a main line still needs a word tap pass: no start or end yet,
+/// or any unit after the first without its own start. (Unit 0's start is
+/// the line's start, so it never needs a separate override.)
+pub fn needs_word_taps(line: &LyricLine) -> bool {
+    if line.is_backing {
+        return false;
+    }
+    let units = timing_units(&line.text).len();
+    line.start.is_none()
+        || line.sing_end_override.is_none()
+        || (1..units).any(|u| line.word_overrides.get(u).copied().flatten().is_none())
+}
+
+/// Where a word tap pass should pick up: the first main line that
+/// [`needs_word_taps`], unit 0 (or `lines.len()` if none do).
+pub fn first_word_tap_cursor(lines: &[LyricLine]) -> WordCursor {
+    WordCursor {
+        line: lines
+            .iter()
+            .position(|l| needs_word_taps(l) && !timing_units(&l.text).is_empty())
+            .unwrap_or(lines.len()),
+        unit: 0,
+    }
+}
+
+/// The cursor after `cursor`'s unit has been released: the next unit of
+/// the same line, else unit 0 of the next main line with any units (or
+/// `lines.len()` when the song is done).
+pub fn advance_word_cursor(lines: &[LyricLine], cursor: WordCursor) -> WordCursor {
+    let units = lines
+        .get(cursor.line)
+        .map_or(0, |l| timing_units(&l.text).len());
+    if cursor.unit + 1 < units {
+        return WordCursor {
+            line: cursor.line,
+            unit: cursor.unit + 1,
+        };
+    }
+    let next = (cursor.line + 1..lines.len())
+        .find(|&i| !lines[i].is_backing && !timing_units(&lines[i].text).is_empty())
+        .unwrap_or(lines.len());
+    WordCursor {
+        line: next,
+        unit: 0,
+    }
+}
+
+/// Clears all of `lines[idx]`'s timing (start, end, per-unit overrides).
+fn clear_line_timing(line: &mut LyricLine) {
+    let n = timing_units(&line.text).len();
+    line.start = None;
+    line.sing_end_override = None;
+    line.estimated_sing_duration = None;
+    line.word_overrides = vec![None; n];
+    line.word_end_overrides = vec![None; n];
+}
+
+/// If the next main line after `idx` claims to start before `pos` - while
+/// `idx` is evidently still being sung at `pos` - clears its timing (it's
+/// the next line a word tap pass reaches, so it's re-tapped right away).
+fn clear_next_if_overlapped(lines: &mut [LyricLine], idx: usize, pos: f64) -> Option<usize> {
+    let n = next_main_index(lines, idx)?;
+    if lines[n].start.is_some_and(|s| s < pos) {
+        clear_line_timing(&mut lines[n]);
+        return Some(n);
+    }
+    None
+}
+
+/// Word tap mode, key *down* at `pos` for `cursor`: sets that unit's start.
+/// Unit 0 (re)starts the whole line - its old end and every per-unit time
+/// are cleared, since a word tap pass re-times the line from scratch - and
+/// follows [`apply_tap_start`]'s live-tap rule for the previous line.
+pub fn word_tap_down(
+    lines: &mut [LyricLine],
+    cursor: WordCursor,
+    pos: f64,
+) -> Result<WordTapEffects, String> {
+    let idx = cursor.line;
+    let Some(line) = lines.get(idx) else {
+        return Err("Every line is already word-tapped.".to_string());
+    };
+    if line.is_backing {
+        return Err("Backing lines are tapped separately, not in word mode.".to_string());
+    }
+    let units = timing_units(&line.text).len();
+    if cursor.unit >= units {
+        return Err("That word isn't on this line any more.".to_string());
+    }
+    if !pos.is_finite() || pos < 0.0 {
+        return Err("Start time can't be negative.".to_string());
+    }
+    let mut effects = WordTapEffects::default();
+    if cursor.unit == 0 {
+        if let Some(p) = prev_main_index(lines, idx) {
+            if let Some(prev_start) = lines[p].start.filter(|&s| pos <= s) {
+                return Err(format!(
+                    "Line {} can't start ({}) before the previous line starts ({}).",
+                    idx + 1,
+                    format_timecode(pos),
+                    format_timecode(prev_start)
+                ));
+            }
+            let prev = &mut lines[p];
+            if prev.sing_end_override.is_some_and(|e| pos < e) {
+                prev.sing_end_override = Some(pos);
+                effects.trimmed_prev = Some(p);
+            }
+            // Keep the previous line's word ends inside its (new) end.
+            for e in prev.word_end_overrides.iter_mut().flatten() {
+                if *e > pos {
+                    *e = pos;
+                }
+            }
+        }
+        let line = &mut lines[idx];
+        clear_line_timing(line);
+        line.start = Some(pos);
+        line.word_overrides[0] = Some(pos);
+    } else {
+        let line = &lines[idx];
+        let Some(start) = line.start else {
+            return Err(format!(
+                "Line {} has no start yet - word-tap it from its opening word.",
+                idx + 1
+            ));
+        };
+        let prev_unit_start = line
+            .word_overrides
+            .get(cursor.unit - 1)
+            .copied()
+            .flatten()
+            .unwrap_or(start);
+        if pos <= prev_unit_start {
+            return Err(format!(
+                "Word {} must come after the word before it ({}).",
+                cursor.unit + 1,
+                format_timecode(prev_unit_start)
+            ));
+        }
+        let line = &mut lines[idx];
+        line.word_overrides.resize(units, None);
+        line.word_end_overrides.resize(units, None);
+        line.word_overrides[cursor.unit] = Some(pos);
+        // A stale end from an earlier pass must not cut this word off.
+        if line.sing_end_override.is_some_and(|e| e <= pos) {
+            line.sing_end_override = None;
+        }
+    }
+    effects.cleared_next = clear_next_if_overlapped(lines, idx, pos);
+    Ok(effects)
+}
+
+/// Word tap mode, key *up* at `pos` for `cursor` (pressed at `down_pos`).
+/// Held at least [`WORD_TAP_MIN_HOLD`]: pins the unit's end there. The
+/// line's last unit always ends the line (floored at `down_pos +`
+/// [`WORD_TAP_MIN_HOLD`]). Returns the end set, if any.
+pub fn word_tap_up(
+    lines: &mut [LyricLine],
+    cursor: WordCursor,
+    down_pos: f64,
+    pos: f64,
+) -> Result<(Option<f64>, WordTapEffects), String> {
+    let idx = cursor.line;
+    let Some(line) = lines.get(idx) else {
+        return Err("Every line is already word-tapped.".to_string());
+    };
+    let units = timing_units(&line.text).len();
+    if cursor.unit >= units || line.start.is_none() {
+        return Err("That word isn't on this line any more.".to_string());
+    }
+    let is_last = cursor.unit + 1 == units;
+    let held = pos - down_pos;
+    let mut effects = WordTapEffects::default();
+    let end = if is_last {
+        pos.max(down_pos + WORD_TAP_MIN_HOLD)
+    } else if held >= WORD_TAP_MIN_HOLD {
+        pos
+    } else {
+        return Ok((None, effects));
+    };
+    let line = &mut lines[idx];
+    line.word_end_overrides.resize(units, None);
+    line.word_end_overrides[cursor.unit] = Some(end);
+    if is_last {
+        line.sing_end_override = Some(end);
+        effects.cleared_next = clear_next_if_overlapped(lines, idx, end);
+    }
+    Ok((Some(end), effects))
+}
+
 /// Sets `lines[idx]`'s end from a live tap at `pos` - the tap-along
 /// counterpart of [`check_end_change`]. A tap landing after the next main
 /// line's already-set start is clamped to that start instead of being
@@ -2985,6 +3205,140 @@ mod tests {
         assert!(shift_lines(&mut lines, &[0], 1.0).is_err());
         assert_eq!(shift_lines(&mut lines, &[0, 1], 1.0), Ok(1));
         assert_eq!(lines[0].start, None);
+    }
+
+    /// Taps a whole line in word mode: (down, up) per unit, in order.
+    fn word_tap_line(lines: &mut [LyricLine], line: usize, taps: &[(f64, f64)]) {
+        let mut cursor = WordCursor { line, unit: 0 };
+        for &(down, up) in taps {
+            assert_eq!(cursor.line, line, "ran off the line early");
+            word_tap_down(lines, cursor, down).unwrap();
+            word_tap_up(lines, cursor, down, up).unwrap();
+            cursor = advance_word_cursor(lines, cursor);
+        }
+        assert_ne!(cursor.line, line, "line still has units left");
+    }
+
+    #[test]
+    fn word_tap_times_every_unit_and_the_line_in_one_pass() {
+        let mut lines = vec![LyricLine::new("so beau|ti|ful")];
+        word_tap_line(
+            &mut lines,
+            0,
+            &[(1.0, 1.4), (1.5, 1.55), (1.6, 1.9), (2.0, 3.0)],
+        );
+        let l = &lines[0];
+        assert_eq!(l.start, Some(1.0));
+        assert_eq!(l.sing_end_override, Some(3.0));
+        assert_eq!(
+            l.word_overrides,
+            vec![Some(1.0), Some(1.5), Some(1.6), Some(2.0)]
+        );
+        // "ti" was a quick tap (0.05s): no pinned end, wipe runs on.
+        assert_eq!(
+            l.word_end_overrides,
+            vec![Some(1.4), None, Some(1.9), Some(3.0)]
+        );
+        assert!(!needs_word_taps(l));
+    }
+
+    #[test]
+    fn word_tap_last_unit_quick_tap_still_ends_the_line() {
+        let mut lines = vec![LyricLine::new("hey you")];
+        word_tap_line(&mut lines, 0, &[(1.0, 1.3), (2.0, 2.02)]);
+        assert_eq!(lines[0].sing_end_override, Some(2.0 + WORD_TAP_MIN_HOLD));
+    }
+
+    #[test]
+    fn word_tap_cursor_skips_backing_lines_and_finishes() {
+        let mut backing = LyricLine::new("ooh");
+        backing.is_backing = true;
+        let lines = vec![LyricLine::new("a b"), backing, LyricLine::new("c")];
+        let c = WordCursor { line: 0, unit: 0 };
+        let c = advance_word_cursor(&lines, c);
+        assert_eq!(c, WordCursor { line: 0, unit: 1 });
+        let c = advance_word_cursor(&lines, c);
+        assert_eq!(c, WordCursor { line: 2, unit: 0 });
+        let c = advance_word_cursor(&lines, c);
+        assert_eq!(c.line, lines.len());
+    }
+
+    #[test]
+    fn first_word_tap_cursor_finds_lines_with_untapped_words() {
+        // Line-tapped only (start + end, words estimated) still needs words.
+        let mut lines = vec![LyricLine::new("one"), timed("two three", 5.0, 7.0)];
+        word_tap_line(&mut lines, 0, &[(1.0, 2.0)]);
+        assert_eq!(
+            first_word_tap_cursor(&lines),
+            WordCursor { line: 1, unit: 0 }
+        );
+        word_tap_line(&mut lines, 1, &[(5.0, 5.5), (6.0, 7.0)]);
+        assert_eq!(first_word_tap_cursor(&lines).line, 2);
+    }
+
+    #[test]
+    fn word_tap_restarting_a_line_clears_its_old_timing() {
+        let mut lines = vec![LyricLine::new("a b c")];
+        word_tap_line(&mut lines, 0, &[(1.0, 1.5), (2.0, 2.5), (3.0, 3.5)]);
+        word_tap_down(&mut lines, WordCursor { line: 0, unit: 0 }, 1.2).unwrap();
+        let l = &lines[0];
+        assert_eq!(l.start, Some(1.2));
+        assert_eq!(l.sing_end_override, None);
+        assert_eq!(l.word_overrides, vec![Some(1.2), None, None]);
+        assert_eq!(l.word_end_overrides, vec![None, None, None]);
+    }
+
+    #[test]
+    fn word_tap_start_trims_previous_line_and_its_word_ends() {
+        let mut lines = vec![LyricLine::new("a b"), LyricLine::new("c")];
+        word_tap_line(&mut lines, 0, &[(1.0, 2.0), (2.5, 4.0)]);
+        let fx = word_tap_down(&mut lines, WordCursor { line: 1, unit: 0 }, 3.5).unwrap();
+        assert_eq!(fx.trimmed_prev, Some(0));
+        assert_eq!(lines[0].sing_end_override, Some(3.5));
+        assert_eq!(lines[0].word_end_overrides, vec![Some(2.0), Some(3.5)]);
+        // Before the previous line even started: refused.
+        assert!(word_tap_down(&mut lines, WordCursor { line: 1, unit: 0 }, 0.5).is_err());
+    }
+
+    #[test]
+    fn word_tap_past_next_lines_old_start_clears_it() {
+        let mut lines = vec![LyricLine::new("a b"), timed("c", 2.0, 3.0)];
+        let c0 = WordCursor { line: 0, unit: 0 };
+        word_tap_down(&mut lines, c0, 1.0).unwrap();
+        word_tap_up(&mut lines, c0, 1.0, 1.5).unwrap();
+        let c1 = WordCursor { line: 0, unit: 1 };
+        let fx = word_tap_down(&mut lines, c1, 2.4).unwrap();
+        assert_eq!(fx.cleared_next, Some(1));
+        assert_eq!(lines[1].start, None);
+        assert_eq!(lines[1].sing_end_override, None);
+        // ...and a next line that starts later is left alone.
+        let mut lines = vec![LyricLine::new("a"), timed("c", 9.0, 10.0)];
+        word_tap_line(&mut lines, 0, &[(1.0, 2.0)]);
+        assert_eq!(lines[1].start, Some(9.0));
+    }
+
+    #[test]
+    fn word_tap_rejects_out_of_order_and_unstarted_words() {
+        let mut lines = vec![LyricLine::new("a b")];
+        // Unit 1 before the line has a start.
+        assert!(word_tap_down(&mut lines, WordCursor { line: 0, unit: 1 }, 1.0).is_err());
+        word_tap_down(&mut lines, WordCursor { line: 0, unit: 0 }, 2.0).unwrap();
+        // Unit 1 at or before unit 0.
+        assert!(word_tap_down(&mut lines, WordCursor { line: 0, unit: 1 }, 2.0).is_err());
+        assert_eq!(lines[0].word_overrides, vec![Some(2.0), None]);
+    }
+
+    #[test]
+    fn word_tapped_line_resolves_to_the_tapped_times() {
+        let mut lines = vec![LyricLine::new("hello world")];
+        word_tap_line(&mut lines, 0, &[(1.0, 1.6), (2.0, 2.8)]);
+        let timed = resolve_timing(&lines, Some(10.0));
+        let words = word_timings(&timed[0]);
+        assert_eq!(words[0].highlight_at, 1.0);
+        assert_eq!(words[0].held_until, 1.6);
+        assert_eq!(words[1].highlight_at, 2.0);
+        assert_eq!(words[1].held_until, 2.8);
+        assert_eq!(timed[0].sing_end, 2.8);
     }
 
     #[test]

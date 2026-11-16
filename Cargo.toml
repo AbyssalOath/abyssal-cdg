@@ -1,19 +1,25 @@
 [package]
 name = "abyssal-cdg"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
+# Strictest MSRV among dependencies (egui/eframe 0.37) - see
+# BUILD_TROUBLESHOOTING.md.
+rust-version = "1.95"
 authors = ["LordSodomiser"]
 description = "Turns an audio file and pasted lyrics into a real karaoke .cdg file"
 license-file = "LICENSE"
 
 [dependencies]
-eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "persistence", "wayland", "x11"] }
-egui = "0.28"
-# Renders the in-app "Codex" documentation browser (see codex.rs) - 0.17 is
-# the exact version pinned to `egui ^0.28` (confirmed directly against its
-# own published Cargo.toml before picking it, not assumed); later versions
-# require a newer egui than this app currently uses.
-egui_commonmark = "0.17"
+# 0.37 (from 0.28): eframe 0.28's winit 0.29 / glutin 0.31 pulled in
+# objc2 0.4.1, which no longer compiles on Rust 1.100+ (macOS). "clipboard"
+# and "links" are listed explicitly because eframe 0.28 always enabled them
+# (via egui-winit) but 0.37 makes them opt-in eframe features - without
+# "clipboard", pasting lyrics would silently stop working. Needs Rust 1.95+.
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "wayland", "x11", "clipboard", "links"] }
+egui = "0.37"
+# Renders the in-app "Codex" documentation browser (see codex.rs) - must
+# track egui's version: 0.26 is the release built against egui 0.37.
+egui_commonmark = "0.26"
 rfd = "0.14"
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
 symphonia = { version = "0.5", features = ["all"] }

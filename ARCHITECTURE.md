@@ -22,8 +22,9 @@ main.rs      GUI (eframe/egui): loads audio, owns app state, wires buttons/short
              color readability (`color_warnings`), row status dots
              (`line_statuses`).
 prefs.rs     Per-machine preferences (`preferences.json` next to the autosave):
-             tap latency, the Tips toggle, the last export folder, UI size -
-             things that follow the person, not the song.
+             tap latency, the Tips toggle, the last export folder, UI size,
+             Lines/Words tap mode, timeline onset snapping - things that
+             follow the person, not the song.
 checks.rs    The export dialog's pre-export checklist: pure checks over the lyric
              data (lines too long for a `.cdg` row, characters the `.cdg` font
              can't draw, double-tapped lines, crowded words, estimated word
@@ -35,13 +36,16 @@ audio.rs     Audio decode/playback (rodio + symphonia) and the wall-clock
              record real song time.
 waveform.rs  Decodes the loaded audio into coarse min/max peak buckets (background
              thread), drawn behind the timeline's bubbles as a visual aid for
-             lining up a bubble against an actual vocal onset.
+             lining up a bubble against an actual vocal onset. The same decode
+             pass runs `OnsetDetector` (band-limited spectral flux, 10 ms hop)
+             to find onsets, which timeline drags snap a bubble's start to.
 lyrics.rs    The data model: LyricLine (raw, user-entered - start, optional explicit
              end, per-word start/end overrides) and TimedLine (resolved
              start/end/sing_end window). Word-highlight timing, countdown-window
              math, timecode format/parse, and start/end overlap validation all live
              here, shared by every renderer and by main.rs's tap/timeline/manual-entry
-             code paths. Also strips Genius-style `[Verse 1]`/`[Chorus]` section
+             code paths - including Words tap mode's press/release logic
+             (`WordCursor`, `word_tap_down`/`word_tap_up`). Also strips Genius-style `[Verse 1]`/`[Chorus]` section
              markers when parsing pasted lyrics. A line flagged `is_backing`
              (a second vocalist singing different lyrics over the lead) stays an
              ordinary entry in the line list - so re-parsing handles it like any
@@ -91,7 +95,9 @@ export.rs    The ".cdg renderer": lays out lines/words/countdown dots on the CDG
              time-sorted schedule (BackingLane) that every forward step of the main
              loop flushes first, since CdgWriter::advance_to is
              monotonic-only-forward and backing lines start/end independently of
-             the main lines.
+             the main lines. Each word wipes left to right one tile column at a
+             time across its sung window (`unit_wipe_columns`) - half a letter
+             per step at 2x - rather than changing color all at once.
 video.rs     The "video renderer": an independent RGB24 frame renderer (via
              `ab_glyph` for anti-aliased text) piped into an `ffmpeg` subprocess
              (this project's own bundled LGPL build, not a system install - see
@@ -106,7 +112,8 @@ ffmpeg_path.rs  Locates the bundled ffmpeg binary and the openh264 shared
              see the "Bundled binaries and models" section below), the same
              bundled-resource-or-cache pattern model_assets.rs/onnxrt.rs use.
 timeline.rs  Pure time<->pixel mapping, zoom/drag bounds, and drag-mode
-             classification for the fine-tuning timeline - no egui dependency, so
+             classification for the fine-tuning timeline (plus onset snapping,
+             `DragSession::resolve_snapped`) - no egui dependency, so
              it's unit-tested directly; main.rs owns the actual widget/painting/
              interaction glue built on top of it.
 vocals.rs    Runs an MDX-Net separation model natively (via `ort`/ONNX Runtime -
@@ -176,7 +183,9 @@ ctc.rs       The CTC forced-alignment trellis algorithm and vocab/tokenization
 2. The user can fill in `start`/`sing_end_override` three ways, all converging on the
    same fields so they stay interchangeable: tapping along with playback (`main.rs`
    fills them in from `AudioPlayer::position()`, alternating start then end per line -
-   see `TapPhase`), dragging a bubble/edge on the fine-tuning timeline (`timeline.rs`'s
+   see `TapPhase` - or, in Words tap mode, from one held key per word: press = word
+   start, release = word end, with the line's start/end taken from its first/last
+   word), dragging a bubble/edge on the fine-tuning timeline (`timeline.rs`'s
    drag math resolves to a `(start, end)` pair main.rs writes back), or typing a
    `MM:SS.CC` timecode directly into the timing table. All three routes validate
    through `lyrics::check_start_change`/`check_end_change` first (a start/end can't
@@ -187,8 +196,9 @@ ctc.rs       The CTC forced-alignment trellis algorithm and vocab/tokenization
    the edited point for immediate audible feedback.
 
    `word_overrides`/`word_end_overrides` (the *word*-level equivalent) fill in
-   similarly - clicking a word in the fine-tune panel, dragging a word bubble on the
-   timeline, or (new) `align.rs`'s forced alignment, which sets every word in an
+   similarly - Words tap mode, clicking a word in the fine-tune panel, dragging a
+   word bubble on the timeline (optionally snapped to an audio onset), or
+   `align.rs`'s forced alignment, which sets every word in an
    already-timed line at once from real audio analysis instead of one click/drag per
    word. All of these write the exact same two fields, so which route produced a
    given word's timing is not itself tracked anywhere.
@@ -242,11 +252,11 @@ should survive a clean exit.
 Undo/redo (`KaraokeApp::undo_stack`/`redo_stack`, both `VecDeque<UndoSnapshot>`)
 takes a different approach from typical command-pattern undo: rather than every
 tap/drag/nudge/parse call site explicitly pushing an undo step, `track_undo_history`
-runs once per frame (at the end of `update()`) and diffs the current
+runs once per frame (at the end of `ui()`, eframe's per-frame `App` method) and diffs the current
 `UndoSnapshot` (lyrics text, lines, title, artist - a narrower subset than
 `ProjectFile`, deliberately excluding colors/resolution) against what was
 observed last frame. A continuous gesture (a timeline drag, or any focused text
-field) is tracked via a `gesture_active` flag so a whole drag or typing session
+field, or a line partway through Words tap mode) is tracked via a `gesture_active` flag so a whole drag or typing session
 collapses into one undo step instead of one per frame/keystroke, only finalized
 once the gesture ends. This means no individual mutation site in `main.rs` needs
 to know undo/redo exists at all - a new way to edit `self.lines` gets undo support
@@ -288,7 +298,7 @@ output formats - but both are *fed* by the same timing data, per the section abo
 The GUI runs on the main thread (`eframe`'s event loop). Every long-running
 operation follows the same shape: a background thread reports progress through an
 `Arc<AtomicU32>` (0..=1000, tenths of a percent) and its final result through an
-`Arc<Mutex<Option<T>>>`, both polled from `update()` each frame by a `poll_*`
+`Arc<Mutex<Option<T>>>`, both polled from `ui()` each frame by a `poll_*`
 method that applies the result to `self` once it's ready and returns `true` while
 still in progress (so the caller knows to keep calling `ctx.request_repaint()`).
 
@@ -310,7 +320,7 @@ still in progress (so the caller knows to keep calling `ctx.request_repaint()`).
 - **Waveform extraction** (`start_waveform_job` / `WaveformJob` /
   `poll_waveform_job`) decodes the loaded audio into peaks on its own background
   thread whenever a new file is loaded (manually, via drag-and-drop, or via
-  project load/recovery).
+  project load/recovery), finding onsets for timeline snapping in the same pass.
 - **Auto-align** (`start_word_alignment` / `AlignJob` / `poll_align_job`) runs
   entirely on a single background thread, in two phases against one shared
   progress value (0-500 = separation, 500-1000 = alignment): first isolates

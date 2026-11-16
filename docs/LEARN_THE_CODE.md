@@ -323,10 +323,12 @@ this way, but it clusters similarly):
   flag, and kicks off the one-time background font enumeration
   (`start_font_list_job`). Called both by `main()` on real startup *and*
   by `start_new_project()` to reset everything at once (see Gotchas).
-- **`update(&mut self, ctx, _frame)`** (the `eframe::App` trait's one
-  required method) - runs once per frame. ~1,700 lines, almost entirely
+- **`ui(&mut self, ui, _frame)`** (the `eframe::App` trait's one
+  required method - called `update` before egui 0.37, with a `ctx` instead
+  of a root `ui`; it still grabs `ctx` from `ui.ctx()` first thing, and
+  only the panels are shown inside `ui`) - runs once per frame. ~1,700 lines, almost entirely
   inline UI layout rather than factored into helper methods (see "Why
-  `update` is so long" below). Its rough shape, top to bottom:
+  `ui` is so long" below). Its rough shape, top to bottom:
   1. **Early-exit modal states** - if `pending_recovery`/`show_quit_confirm`/
      `pending_unsaved_action` is set, draw *only* that prompt and `return`
      immediately - nothing else in the frame runs until it's resolved.
@@ -419,7 +421,20 @@ this way, but it clusters similarly):
   `tap_phase`) from the live playback position, validated through
   `lyrics::check_start_change`/`check_end_change` first. Once every line
   has both, Space switches to driving playback instead
-  (`toggle_play_pause`) - checked in `update`, not in `tap_next` itself.
+  (`toggle_play_pause`) - checked in `ui`, not in `tap_next` itself.
+- **Words tap mode** (`prefs.word_tap_mode`) replaces that alternation
+  with one held key per timing unit: `word_pass_press` (fresh Space press
+  or the big button going down) calls `lyrics::word_tap_down` for
+  `word_pass_cursor`, and the release - Space no longer down *in the
+  window it was pressed in* (`word_pass_held` remembers the viewport) and
+  the button not held - calls `word_pass_release` ->
+  `lyrics::word_tap_up` + `advance_word_cursor`. `word_pass_mid_line`
+  keeps a half-tapped line as one undo gesture; `redo_word_pass_line`
+  (Enter) restarts the line and seeks 2s before it.
+- **`fresh_press(events, key)`** - every one-shot shortcut (Space, Enter,
+  L, M/F/D/S/B, ?, F1, Ctrl+S/E) checks this instead of egui's
+  `key_pressed`, which also counts the OS's auto-repeat presses of a
+  held key - holding Space used to fire extra taps.
 - **`recompute_next_untimed()`** - finds the first line still missing a
   start, called after *any* operation that could change which lines are
   timed (parsing, importing, undo/redo, loading a project).
@@ -429,15 +444,15 @@ this way, but it clusters similarly):
   hear whether it landed right.
 - **`assign_singer_to_current_line(singer)`** - the M/F/D/S shortcut
   handler.
-- The per-word fine-tune strip (inline in `update`'s central panel, not
+- The per-word fine-tune strip (inline in `ui`'s central panel, not
   its own function) shows one clickable button per word of
   `self.lines[word_tap_line]`, colored green/blue/teal for manual
   start/end/both - clicking calls `tap_word_start`/`tap_word_end`.
 
 ### The timing table
 
-Also inline in `update`'s central panel (there is no `draw_timing_table`
-function - see "Why `update` is so long"), built from **two
+Also inline in `ui`'s central panel (there is no `draw_timing_table`
+function - see "Why `ui` is so long"), built from **two
 side-by-side `egui::Grid`s sharing one vertical `ScrollArea`**:
 `lines_grid_sticky` (just the row-selection checkboxes, in their own
 fixed-width column) and `lines_grid_rest` (Start/Lyric/End/Singer/
@@ -504,7 +519,7 @@ seeing concretely once:
    percent) the thread stores into and the main thread reads every frame.
 3. The final result reports through an `Arc<Mutex<Option<T>>>` - `None`
    while running, `Some` exactly once when done.
-4. A `poll_*` method, called every frame from `update`, locks the mutex,
+4. A `poll_*` method, called every frame from `ui`, locks the mutex,
    `.take()`s the result if present (applying it to `self` and clearing
    the job), and returns `true` while still in progress so the caller
    knows to `ctx.request_repaint()` (otherwise the UI would only update on
@@ -531,11 +546,11 @@ the project-file color fallbacks, shared with `apply_project_file`.
 
 ### Non-obvious design decisions, invariants, and gotchas
 
-- **Why `update` is so long.** Unlike the small, well-factored `draw_*`
+- **Why `ui` is so long.** Unlike the small, well-factored `draw_*`
   helpers for self-contained *windows* (`draw_export_dialog`,
   `draw_codex`, the three confirmation prompts), the timing table, the
   color grid, the background/font panels, and the per-word strip are all
-  written directly inline inside `update`'s panel closures rather than
+  written directly inline inside `ui`'s panel closures rather than
   pulled into their own methods - there's no `draw_timing_table` or
   `draw_color_panel`. This isn't an oversight to "fix": each of those
   pieces reads and writes many `self` fields interleaved with the layout
@@ -561,7 +576,7 @@ the project-file color fallbacks, shared with `apply_project_file`.
   resolving from a fixed origin can't drift, by construction.
 - **`drag_started()`, not `interact_pointer_pos()`, when starting a
   timeline drag.** egui only recognizes a drag once the pointer has moved
-  past its own click-vs-drag threshold (6px as of egui 0.28) - by the
+  past its own click-vs-drag threshold (6px, egui 0.28 through 0.37) - by the
   time `drag_started()` fires, `interact_pointer_pos()` already reflects
   a position shifted a few pixels from where the drag *actually* began.
   `draw_timeline` captures the position at `drag_started()` time via a
@@ -849,6 +864,11 @@ actual widget: painting, hit-testing, and wiring drag results back into
   back fields that actually changed). Works identically whether the
   bubble represents a whole line (`start`/`sing_end`) or a single word
   (`highlight_at`/`held_until`) - the caller decides which.
+- `DragSession::resolve_snapped(pointer_x, px_per_sec, snap)` - `resolve`,
+  then for body and left-edge drags pulls the start onto `snap(start)`
+  (the nearest onset within `TIMELINE_SNAP_PX`, from `waveform.rs`) - but
+  only if the drag bounds don't clamp it short of the onset. Right edges
+  never snap: onsets mark where sound starts, not where it stops.
 
 **Callers/callees.** Called only by `main.rs`'s `draw_timeline`/
 `TimelineDrag`. Calls nothing else in this crate.
@@ -904,7 +924,7 @@ back at startup.
 
 **Callers/callees.** Called extensively by `main.rs` (`to_project_file`/
 `apply_project_file`, `write_project_to`, `load_project_file`, the
-periodic-autosave check in `update`, `on_exit`). Depends on `lyrics.rs`
+periodic-autosave check in `ui`, `on_exit`). Depends on `lyrics.rs`
 (`LyricLine`, `TimingSettings`) and `video.rs` (`Background`,
 `BackgroundFit`, `Resolution`, `VideoCodec`).
 
@@ -966,6 +986,18 @@ tells per-unit exporters (LRC2/ASS/UltraStar) where real spaces go.
 `first_unit_of_word` / `spread_word_timing` convert between whole words
 (what line splitting and auto-align work in) and units.
 
+Words tap mode works in units too: `WordCursor { line, unit }` is the
+next unit to hold a key for. `word_tap_down` sets that unit's start -
+unit 0 re-times the whole line from scratch (clears its old end and
+per-unit times, trims the previous line's end as `apply_tap_start` does)
+- and `word_tap_up` pins the unit's end only if it was held at least
+`WORD_TAP_MIN_HOLD` (0.1s; a quick tap leaves the wipe running on into
+the next unit), with the last unit always setting the line's end. A press
+or release past the *next* line's old start clears that line's timing
+(it's evidently stale, and it's the next one tapped). `needs_word_taps` /
+`first_word_tap_cursor` / `advance_word_cursor` pick where a pass resumes
+and moves on, skipping backing lines.
+
 ### `prefs.rs` - per-machine preferences
 
 **Purpose.** A small `preferences.json` in eframe's per-app storage dir,
@@ -974,8 +1006,9 @@ song: `tap_latency_ms` (the tap latency compensation `main.rs`'s
 `compensate_tap` subtracts from every live tap - reaction time and
 audio-output delay, e.g. Bluetooth, follow the user from song to song),
 `show_tips` (the "💡 Tips" toggle, see `help_text`), `export_folder` (the
-last folder chosen in the export dialog) and `ui_zoom` (the UI size, see
-`sync_ui_style`). Every field has a serde default, so an older file -
+last folder chosen in the export dialog), `ui_zoom` (the UI size, see
+`sync_ui_style`), `word_tap_mode` (Lines vs Words tap-along) and
+`snap_to_onsets` (the timeline's 🧲 Snap, default on). Every field has a serde default, so an older file -
 or one from before a field existed - still loads.
 
 **Key items:** `Prefs`, `load(app_id)` (missing/corrupt file -> defaults;
@@ -1089,12 +1122,13 @@ Calls `rodio`/`symphonia` directly; nothing else in this crate.
   still effectively instant (decoding runs many times faster than real
   time).
 
-### `waveform.rs` - timeline backdrop
+### `waveform.rs` - timeline backdrop and onsets
 
 **Purpose.** Decodes the loaded audio once into coarse min/max amplitude
 buckets, cheap enough to redraw every frame even zoomed out over a whole
-song - purely a visual aid so dragging a timeline bubble can be lined up
-against an actual vocal onset instead of guessing blind.
+song - a visual aid so dragging a timeline bubble can be lined up
+against an actual vocal onset instead of guessing blind. The same decode
+pass also *finds* those onsets, so drags can snap to them.
 
 **Key items:** `Waveform` (`bucket_duration_secs`, `peaks: Vec<(f32,
 f32)>`), `build_waveform(path)` (mixes down to mono by averaging each
@@ -1102,6 +1136,18 @@ interleaved frame, buckets at a fixed `BUCKETS_PER_SEC` = 800.0 regardless
 of the source's own sample rate/channel count), `peak_in_range(start,
 end)` (aggregates every bucket touching a range - a single bucket at high
 zoom, potentially thousands collapsed together at low zoom).
+`OnsetDetector` - fed each mono sample during that same decode: every
+10 ms it FFTs a ~46 ms Hann window (`realfft`), takes log-compressed
+magnitudes over 200-4000 Hz (`ONSET_BAND_HZ` - where voices sit, leaving
+out most kick drum and hi-hats), and sums how much each bin *rose*
+against the loudest nearby bin of the previous frame (a SuperFlux-style
+max filter, so a note leaving the window or wobbling in pitch doesn't
+count as new sound). `finish()` picks local maxima that stand above the
+local mean, normalized by max(98th percentile, a quarter of the max) so a
+sparse track's noise floor isn't scaled up into fake onsets.
+`onsets_in(from, to)` / `nearest_onset(t, max_dist)` serve the timeline.
+It runs on the full mix, so drum hits in the vocal band can still show
+up - it's a snapping aid, not a transcription.
 
 **Callers/callees.** `main.rs`'s `start_waveform_job`/`poll_waveform_job`
 (on a background thread - decoding a multi-minute file takes a real
@@ -1593,7 +1639,14 @@ tall for 2x scale), `BACKING_ROW` (8), `PREVIEW_ROW` (10), `COUNTDOWN_ROW`
 starts clipping" logic: tries `PREFERRED_SCALE` (2x), automatically falls
 back to 1x if the text wouldn't fit the 48-column safe width, and clips
 as an absolute last resort even at 1x. `BackingLane` - the backing
-track's own pre-computed, time-sorted draw schedule (see Gotchas). `title_card_end(timed_lines)`,
+track's own pre-computed, time-sorted draw schedule (see Gotchas).
+`unit_wipe_columns(start, end, offset, len, scale)` - the wipe: each
+timing unit's characters light one *tile column* at a time (a 2x letter
+is two columns, so half a letter per step) spread across the unit's
+`highlight_at..held_until`, the first column exactly at its start;
+`draw_char_column_at` draws one such column. Each tile is still drawn
+once, so a wipe costs no more packets than lighting the word at once.
+`title_card_end(timed_lines)`,
 `paired_audio_path`/`copy_paired_audio` (the "MP3+G" convention - copying
 the loaded audio next to the export under a matching base filename).
 `render_cdg_with_settings` - the actual top-to-bottom renderer.
@@ -2108,11 +2161,11 @@ actually drives this machinery: it loads both CLUT halves once at the
 very start, draws the title card (if any) and advances to when it
 should disappear, then for each timed line in order - advance to its
 start, clear the relevant rows, draw the line's/preview line's base
-(unsung) text, then advance through every word's own
-highlight time, redrawing just that one character's tile in the
-highlight color via `draw_char_at`. The color-wipe effect you actually
-see on a real player is nothing more than a sequence of single-character
-tile redraws, each scheduled at a precise packet position.
+(unsung) text, then advance through every word's wipe - each tile column
+of each character at its own time (`unit_wipe_columns`), redrawn in the
+highlight color via `draw_char_column_at`. The color-wipe effect you
+actually see on a real player is nothing more than a sequence of single
+tile-column redraws, each scheduled at a precise packet position.
 
 ### Audio decoding and `ffmpeg` handling, end to end
 
@@ -2297,7 +2350,7 @@ rather than an abstract explanation.
   `ctc.rs`/`align.rs`'s `anyhow::ensure!(...)` guards.
 - **Traits implemented, not just consumed.** This crate defines no
   custom traits of its own - it implements two from other crates:
-  `eframe::App` (`main.rs`'s `update`/`on_exit` - the entire GUI's single
+  `eframe::App` (`main.rs`'s `ui`/`on_exit` - the entire GUI's single
   entry point) and, in tests, nothing further needed. Manual `impl
   Default for X` (as opposed to `#[derive(Default)]`) shows up wherever
   the right default isn't "all fields zeroed" - `CdgWriter::default()`,
@@ -2409,7 +2462,7 @@ you've read the relevant chapters above.
 1. Add the field to `KaraokeApp` in `main.rs`.
 2. Add the widget - inline in `update()`'s relevant panel closure if it
    belongs with existing content there (most of this app's UI works this
-   way - see the `main.rs` chapter's "Why `update` is so long"), or a new
+   way - see the `main.rs` chapter's "Why `ui` is so long"), or a new
    `draw_*` method only if it's a genuinely self-contained window/dialog.
 3. **Decide if it should persist per-project.** If yes: add it to
    `project::ProjectFile`, with `#[serde(default)]` (or a named default
@@ -2521,7 +2574,8 @@ prerequisites and `CONTRIBUTING.md`'s "Before opening a PR" checklist
 unit test for anything touched in the pure-logic modules, a `CHANGELOG.md`
 entry). If the build fails outright, `BUILD_TROUBLESHOOTING.md`'s first
 guess is almost always right: this project's committed `Cargo.lock`
-needs Rust 1.88+ (the strictest `rust-version` of any locked dependency),
+needs Rust 1.95+ (the strictest `rust-version` of any locked dependency -
+egui/eframe 0.37 - and declared as `rust-version` in `Cargo.toml`),
 and an OS-packaged `rustc` is frequently older than that - switch to
 `rustup` rather than chasing the error further. `cargo build`/`cargo
 test` need none of `ffmpeg`, `openh264`, or any ONNX model file - those

@@ -320,12 +320,45 @@ struct LineLayout {
     scale: u8,
 }
 
-/// One character's scheduled highlight redraw on the current line's row.
+/// One tile column of one character's scheduled highlight redraw on the
+/// current line's row (a 2x character has two, so the wipe moves through it
+/// in two steps - see [`unit_wipe_columns`]).
 struct HighlightEvent {
     at: f64,
     char_idx: usize,
     ch: char,
+    /// Tile column within the character (`0..layout.scale`).
+    tc: u8,
     highlight_idx: u8,
+}
+
+/// The color wipe through one timing unit: `(at, char_idx, tile column)`
+/// for each tile column of its characters, left to right, with column `j`
+/// of `n` lighting at `start + (end - start) * j / n` - so the first column
+/// lights exactly when the unit starts and the wipe crosses the unit over
+/// `[start, end)` (its `highlight_at`..`held_until`, the same window the
+/// video's continuous wipe uses), instead of the whole word changing color
+/// at once. Each tile is still drawn exactly once - the packet count is
+/// the same as lighting the word in one go, just spread over its duration.
+fn unit_wipe_columns(
+    start: f64,
+    end: f64,
+    char_offset: usize,
+    char_len: usize,
+    scale: u8,
+) -> Vec<(f64, usize, u8)> {
+    let scale = scale.max(1);
+    let n = char_len * scale as usize;
+    let dur = (end - start).max(0.0);
+    (0..n)
+        .map(|j| {
+            (
+                start + dur * j as f64 / n as f64,
+                char_offset + j / scale as usize,
+                (j % scale as usize) as u8,
+            )
+        })
+        .collect()
 }
 
 /// Something the backing lane (see [`BACKING_ROW`]) needs to do at a given
@@ -333,11 +366,12 @@ struct HighlightEvent {
 enum BackingOp {
     /// Draw backing line `k`'s whole text in its unsung color.
     Show(usize),
-    /// Highlight one character of backing line `k`.
+    /// Highlight one tile column of one character of backing line `k`.
     Highlight {
         k: usize,
         char_idx: usize,
         ch: char,
+        tc: u8,
         color: u8,
     },
     Clear,
@@ -374,23 +408,25 @@ impl BackingLane {
                 // Per timing unit (syllables of `beau|ti|ful` separately).
                 let spans = crate::lyrics::word_char_spans(&line.text);
                 for (tw, &(offset, len)) in word_timings(line).iter().zip(spans.iter()) {
-                    // A word that would only light up after this line has
-                    // already lost the lane (cut short by the next backing
-                    // line) must not draw over that next line's text.
-                    if tw.highlight_at >= hide {
-                        continue;
-                    }
-                    for c in 0..len {
-                        let char_idx = offset + c;
+                    for (at, char_idx, tc) in
+                        unit_wipe_columns(tw.highlight_at, tw.held_until, offset, len, layout.scale)
+                    {
+                        // Wipe steps that would only land after this line
+                        // has already lost the lane (cut short by the next
+                        // backing line) must not draw over that line's text.
+                        if at >= hide {
+                            continue;
+                        }
                         if char_idx >= chars.len() {
                             break; // clipped off the end of a too-long line
                         }
                         ops.push((
-                            tw.highlight_at.max(show),
+                            at.max(show),
                             BackingOp::Highlight {
                                 k,
                                 char_idx,
                                 ch: chars.get(char_idx).copied().unwrap_or(' '),
+                                tc,
                                 color: highlight_idx,
                             },
                         ));
@@ -437,9 +473,19 @@ impl BackingLane {
                     k,
                     char_idx,
                     ch,
+                    tc,
                     color,
                 } => {
-                    draw_char_at(w, BACKING_ROW, &self.layouts[k], char_idx, ch, BG, color);
+                    draw_char_column_at(
+                        w,
+                        BACKING_ROW,
+                        &self.layouts[k],
+                        char_idx,
+                        ch,
+                        tc,
+                        BG,
+                        color,
+                    );
                 }
                 BackingOp::Clear => clear_row(w, BACKING_ROW),
             }
@@ -522,6 +568,38 @@ fn draw_char_at(
     for (tr, tile_row) in tiles.iter().enumerate() {
         for (tc, tile) in tile_row.iter().enumerate() {
             w.tile_block(band_row + tr as u8, (col + tc) as u8, color0, color1, tile);
+        }
+    }
+}
+
+/// Like [`draw_char_at`], but only tile column `tc` of the character (of
+/// `layout.scale` columns) - one step of the wipe through a 2x character.
+#[allow(clippy::too_many_arguments)]
+fn draw_char_column_at(
+    w: &mut CdgWriter,
+    band_row: u8,
+    layout: &LineLayout,
+    char_idx: usize,
+    ch: char,
+    tc: u8,
+    color0: u8,
+    color1: u8,
+) {
+    let scale = layout.scale as usize;
+    let col = layout.start_col as usize + char_idx * scale;
+    if col + scale > SAFE_COLS as usize {
+        return;
+    }
+    let tiles = font::glyph_tile_scaled(ch, layout.scale);
+    for (tr, tile_row) in tiles.iter().enumerate() {
+        if let Some(tile) = tile_row.get(tc as usize) {
+            w.tile_block(
+                band_row + tr as u8,
+                (col + tc as usize) as u8,
+                color0,
+                color1,
+                tile,
+            );
         }
     }
 }
@@ -977,15 +1055,17 @@ pub fn render_cdg_with_settings(
         let chars: Vec<char> = layout.text.chars().collect();
         let mut events: Vec<HighlightEvent> = Vec::new();
         for (tw, &(offset, len)) in words.iter().zip(spans.iter()) {
-            for k in 0..len {
-                let char_idx = offset + k;
+            for (at, char_idx, tc) in
+                unit_wipe_columns(tw.highlight_at, tw.held_until, offset, len, layout.scale)
+            {
                 if char_idx >= chars.len() {
                     break; // clipped off the end of a too-long line
                 }
                 events.push(HighlightEvent {
-                    at: tw.highlight_at,
+                    at,
                     char_idx,
                     ch: chars.get(char_idx).copied().unwrap_or(' '),
+                    tc,
                     highlight_idx,
                 });
             }
@@ -1001,12 +1081,13 @@ pub fn render_cdg_with_settings(
                 preview_drawn = true;
             }
             lane.advance(&mut w, ev.at);
-            draw_char_at(
+            draw_char_column_at(
                 &mut w,
                 CURRENT_ROW,
                 &layout,
                 ev.char_idx,
                 ev.ch,
+                ev.tc,
                 BG,
                 ev.highlight_idx,
             );
@@ -1362,6 +1443,26 @@ mod tests {
                 luma(highlight)
             );
         }
+    }
+
+    #[test]
+    fn unit_wipe_columns_spread_across_the_unit() {
+        // "ab" at 2x over 8.0..9.0: 4 tile columns, a quarter second apart,
+        // the first exactly at the unit's start.
+        let cols = unit_wipe_columns(8.0, 9.0, 3, 2, 2);
+        assert_eq!(
+            cols,
+            vec![(8.0, 3, 0), (8.25, 3, 1), (8.5, 4, 0), (8.75, 4, 1)]
+        );
+        // 1x: one step per character.
+        assert_eq!(
+            unit_wipe_columns(1.0, 2.0, 0, 2, 1),
+            vec![(1.0, 0, 0), (1.5, 1, 0)]
+        );
+        // Zero-length unit lights all at once, never before its start.
+        assert!(unit_wipe_columns(5.0, 4.0, 0, 3, 2)
+            .iter()
+            .all(|&(at, _, _)| at == 5.0));
     }
 
     #[test]

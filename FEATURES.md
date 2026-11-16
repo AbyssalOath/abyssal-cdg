@@ -19,6 +19,7 @@ create afterward.
 - [What it does](#what-it-does) - the whole workflow, step by step
 - [Two very different export formats](#two-very-different-export-formats)
 - [The "get ready" countdown](#the-get-ready-countdown)
+- [Word tap mode](#word-tap-mode) - time every word in one pass
 - [The fine-tuning timeline](#the-fine-tuning-timeline)
 - [Removing vocals](#removing-vocals)
 - [Auto-aligning word timing](#auto-aligning-word-timing)
@@ -66,10 +67,13 @@ Press **F1** or **?** (or click **⌨ Shortcuts**
 in the top panel) for the full list. Beyond tapping (Space, Shift+Space,
 M/F/D/S/B): **, / .** nudge the current line's start by 0.1s
 (**Shift+, / Shift+.** shift the selected lines instead), **Enter**
-re-taps the current line, **Delete** clears its timing, **Home** jumps to
+re-taps the current line (in Words tap mode: redoes the line from just
+before it), **Delete** clears its timing, **Home** jumps to
 the start, **L** loops the line, **Ctrl+E** opens Export. "Current line"
 is the one open in the fine-tune panel, otherwise the one you tapped
-last. Single-key shortcuts never fire while you're typing in a text box.
+last. Single-key shortcuts never fire while you're typing in a text box,
+and holding a key down acts once - except where repeating is useful
+(← / →, `,` / `.`, Ctrl+Z / Ctrl+Y, Delete, Home).
 
 ### Messages and toasts
 The status line at the bottom of the top
@@ -90,6 +94,9 @@ Ctrl+= / Ctrl+- / Ctrl+0) scales the whole window - handy on a 4K
 screen - and is remembered on this computer. The app's purple accent marks
 the main actions (Play, Tap, Export, the step bar's current step) and
 selections throughout.
+
+The **Lines / Words** tap mode and the timeline's **🧲 Snap** setting are
+remembered on this computer too.
 
 The folder you pick in the export
 dialog is filled in automatically next time - even after restarting the
@@ -119,7 +126,10 @@ app - as long as it still exists, and **Choose folder…** opens there.
    still fine-tune anything afterward the normal way.
 4. **Play the song and tap along** - press **Space** (or click the big
    button) the instant a lyric line starts, then press it again the instant
-   that line finishes being sung - two taps per line, start then end. Lines
+   that line finishes being sung - two taps per line, start then end. (Or
+   switch **2. Tap along** to **Words** and hold Space for each word as it's
+   sung, timing words and lines in one pass - see
+   [Word tap mode](#word-tap-mode).) Lines
    fill in top to bottom automatically, and the button/status text always
    says which one (start or end, and which line) the next press will set.
    Skipping the end-tap is fine too - it just falls back to an automatic
@@ -322,7 +332,10 @@ carrying over whatever the previous project had selected.
   do within that ceiling: the current line now renders at 2x size (bigger,
   blockier, more legible - closer to real commercial karaoke discs) when
   it's short enough to fit, automatically falling back to normal size for
-  longer lines so nothing clips off-screen.
+  longer lines so nothing clips off-screen. Each word (or syllable) wipes
+  left to right across its own sung time, in steps the format can draw:
+  half a letter at 2x size, one letter at normal size - the same timing
+  as the video's smooth wipe, just in coarser steps.
 - **`.mp4`** is a real video file (AV1 by default, H.264 selectable for
   compatibility - see "Known limitations" below - plus AAC audio, at
   720p, 1080p or 4K, in 16:9 or vertical 9:16 - see "Video export
@@ -408,6 +421,36 @@ lines linger briefly after singing ends, then the screen goes blank until
 the countdown dots appear, and upcoming lines stay hidden until the line
 they belong to actually starts.
 
+## Word tap mode
+
+Switch **2. Tap along** from **Lines** to **Words** to time every word in
+a single listen instead of tapping lines and then fine-tuning their words.
+
+- Press Play (or **▶ Start word tapping**, which plays from 2 seconds
+  before the line), then **hold Space** for each word while it's being
+  sung: press the instant it starts, let go when it ends. You can also
+  hold the big button with the mouse.
+- The panel shows the line's words: green = done, highlighted = hold for
+  this one next, dim = still to come.
+- Words split into syllables (`beau|ti|ful`) take one press per syllable.
+- Each line's start and end come from its first and last word, so there's
+  no separate line pass. Starting a line in Words mode re-times it from
+  scratch, replacing whatever timing it had.
+- **Quick taps are fine**: a press shorter than 0.1s doesn't pin the
+  word's end, so its wipe runs straight on into the next word. Holding
+  longer pins the end there - right for held notes followed by a pause.
+  The line's last word always sets the line's end.
+- **Missed one?** Press **Enter** (or **↺ Redo line**) to start the line
+  over from 2 seconds before it. **◀ / ▶** pick another line. **Ctrl+Z**
+  undoes a whole word-tapped line at a time.
+- If a word lands after the *next* line's old start time, that line's
+  old timing is cleared, since it was evidently wrong and it's the next
+  one you'll tap anyway (Ctrl+Z brings it back).
+- Slow-down, the line loop and tap latency compensation all work as they
+  do for line tapping. Backing lines are skipped - tap those from their
+  row in the timing table.
+- The choice of Lines or Words is remembered on this computer.
+
 ## The fine-tuning timeline
 
 Below the lyrics table is a kdenlive/karaodeo-style timeline: one draggable
@@ -426,6 +469,16 @@ sync automatically, however you choose to work:
   never have to separately re-adjust the line after fine-tuning its outer
   words.
 - **Drag an edge** to trim just that side (start or end) independently.
+- **Snap to vocal onsets** (**🧲 Snap**, on by default): while you drag a
+  bubble or its left edge, its start snaps to the nearest *onset* - a
+  moment where new sound starts in the audio - once it comes within a few
+  pixels. Onsets show as small ticks under the ruler while you drag, and a
+  full-height line marks the one you're snapped to. Hold **Shift** (or
+  Alt) to drag freely. Ends never snap, since onsets mark where sound
+  starts, not where it stops. Onsets are found in the same background pass
+  that builds the waveform, from the vocal frequency range of the whole
+  mix - so a snare hit or a chord change can attract a snap too; it's a
+  guide, not a guarantee. Your choice is remembered on this computer.
 - **Click empty space** (or the time ruler) to jump playback there; **drag**
   empty space to scrub continuously, same as the seek bar up top but right
   on the timeline.
@@ -798,6 +851,9 @@ it and moves playback to just before it.
   audio instead of guessing. The estimate's constants live at the top of
   `src/lyrics.rs` (`SECONDS_PER_WORD`, `MIN_SING_DURATION`) if you want to
   tune the default instead.
+- Onset snapping works on the full mix (not isolated vocals), so on a
+  busy track some snap points are drums or instruments rather than words -
+  hold Shift to drag past them, or switch 🧲 Snap off.
 - The timeline's waveform backdrop is drawn from the *loaded audio file*,
   not the exported `.cdg`/`.mp4` - it's purely a visual aid for aligning
   bubbles against actual vocal onsets, not a preview of anything in the

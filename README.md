@@ -39,7 +39,9 @@ always shows what to do next.
 2. **Lyrics** - paste them (one line per line; a blank line starts a new
    verse) and click **Parse lyrics**, or load an LRC/UltraStar/KOK file.
 3. **Tap** - press Play, then **Space** the instant each line starts and
-   again when it ends. Slow the song down or loop a line if it's fast.
+   again when it ends - or switch to **Words** and hold Space for each
+   word while it's sung, timing every word in one listen. Slow the song
+   down or loop a line if it's fast.
 4. **Fine-tune** *(optional)* - click words as they're sung, drag bubbles
    on the timeline, or let **🪄 Auto-align** do it from the audio.
 5. **Export** - pick your formats, check the pre-export checklist, done.
@@ -52,9 +54,12 @@ once you know your way around.
 **Timing**
 - Tap-along with latency compensation, slow-down (0.5×/0.75×), line and A-B
   looping, and one-tap hand-off for lines sung back to back.
-- Word-by-word fine-tuning - by clicking, on a waveform timeline, or
-  automatically with **auto-align** (a speech model run against isolated
-  vocals; best-effort, so give it a listen).
+- **Words tap mode**: hold Space for each word (press = start, release =
+  end) to time every word and line in a single pass.
+- Word-by-word fine-tuning - by clicking, on a waveform timeline (drags
+  snap to where sound starts in the audio), or automatically with
+  **auto-align** (a speech model run against isolated vocals; best-effort,
+  so give it a listen).
 - **Syllable timing** for held words: `beau|ti|ful`.
 - **Copy a chorus's timing** onto its repeats in one go.
 
@@ -68,7 +73,8 @@ once you know your way around.
 - A live preview that can switch to the **exact** `.cdg` output.
 
 **Exports** (any combination at once, or a batch of saved projects)
-- `.cdg` (+ MP3+G `.zip`) for karaoke machines and KJ software.
+- `.cdg` (+ MP3+G `.zip`) for karaoke machines and KJ software, with a
+  left-to-right wipe through each word.
 - MP4 video in 16:9 or vertical 9:16, 720p to 4K.
 - Instrumental and vocals-only audio (built-in AI vocal removal).
 - `.ass` karaoke subtitles, `.srt`, LRC and UltraStar.
@@ -92,7 +98,7 @@ cargo build --release
 cargo run --release
 ```
 
-Needs Rust 1.88+ and, on Linux, a few system packages - see
+Needs Rust 1.95+ and, on Linux, a few system packages - see
 **[docs/BUILDING.md](docs/BUILDING.md)**.
 
 ## Documentation

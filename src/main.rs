@@ -767,10 +767,14 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "Space",
-                "Tap the next line's start / end (pause/play once all timed)",
+                "Tap the next line's start / end - in Words mode, hold for each \
+                 word (pause/play once all timed)",
             ),
             ("Shift+Space", "End this line and start the next in one tap"),
-            ("Enter", "Re-tap the current line's start"),
+            (
+                "Enter",
+                "Re-tap the current line's start (Words mode: redo the line)",
+            ),
             (
                 "M / F / D / S / B",
                 "Voice: Male / Female / Duet / Screaming / Backing",
@@ -812,6 +816,38 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
 ];
+
+/// Adds `add_contents` in its own scope, laid out as usual but drawn
+/// invisible (and not interactive) unless `visible` - so space is kept and
+/// nothing jumps when it appears. (egui 0.28's `Ui::add_visible_ui`, which
+/// later egui versions dropped.)
+fn add_visible_ui<R>(
+    ui: &mut egui::Ui,
+    visible: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.scope(|ui| {
+        if !visible {
+            ui.set_invisible();
+        }
+        add_contents(ui)
+    })
+}
+
+/// Was `key` pressed this frame as a new press - not one of the
+/// auto-repeat presses the OS sends while a key is held? egui's
+/// `key_pressed` counts those repeats too, which is wrong for one-shot
+/// actions like tapping: holding Space would tap over and over. egui sets
+/// `repeat` itself (from which keys it already saw down), so this holds on
+/// every platform.
+fn fresh_press(events: &[egui::Event], key: egui::Key) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key
+        )
+    })
+}
 
 /// A time typed into the transport's time readout: `MM:SS(.ss)` (as the
 /// timing table accepts), `H:MM:SS`, or plain seconds. `None` if it's not
@@ -869,6 +905,9 @@ fn help_text(ui: &mut egui::Ui, show_tips: bool, summary: &str, detail: impl Int
 
 /// The app's accent color (the "Abyssal" purple) - primary actions and the
 /// current step.
+/// How close (in screen pixels, so it feels the same at any zoom) a
+/// dragged bubble's start must come to an onset to snap onto it.
+const TIMELINE_SNAP_PX: f32 = 8.0;
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(140, 82, 220);
 const STEP_DONE: egui::Color32 = egui::Color32::from_rgb(70, 160, 95);
 
@@ -1012,6 +1051,20 @@ struct KaraokeApp {
     /// Whether that next tap sets `next_untimed`'s start or end - see
     /// [`TapPhase`].
     tap_phase: TapPhase,
+    /// Word tap mode (tap-along with `prefs.word_tap_mode` on): the next
+    /// word/syllable to hold a key for - see [`lyrics::WordCursor`].
+    word_pass_cursor: lyrics::WordCursor,
+    /// Word tap mode: the unit currently held down - its cursor, the
+    /// (latency-compensated) press time, and which window the press came
+    /// from (Space is watched for its release in that same window, since
+    /// `ctx.input` only sees the focused window's keys).
+    word_pass_held: Option<(lyrics::WordCursor, f64, egui::ViewportId)>,
+    /// Word tap mode: whether the big tap button is being held down with
+    /// the mouse (the button can be held like Space).
+    word_pass_button_down: bool,
+    /// The onset the timeline bubble being dragged is snapped to right now,
+    /// if any - drawn as a marker (see `draw_timeline`).
+    timeline_snap: Option<f64>,
     /// If set, the fine-tune-words panel is open for this line index.
     word_tap_line: Option<usize>,
     /// Whether clicking a word in the fine-tune panel sets its start or end
@@ -2253,6 +2306,10 @@ impl KaraokeApp {
             loop_last_pos: None,
             preview_popped_out: false,
             preview_mode: PreviewMode::default(),
+            word_pass_cursor: lyrics::WordCursor::default(),
+            word_pass_held: None,
+            word_pass_button_down: false,
+            timeline_snap: None,
             cdg_preview: CdgPreviewState::default(),
             start_edit: None,
             end_edit: None,
@@ -2558,6 +2615,10 @@ impl KaraokeApp {
         self.lines = snapshot.lines;
         self.title = snapshot.title;
         self.artist = snapshot.artist;
+        // A half-tapped line was just undone or redone - word tap mode
+        // starts that line over from its opening word.
+        self.word_pass_held = None;
+        self.word_pass_cursor.unit = 0;
         self.recompute_next_untimed();
         self.word_tap_line = None;
         self.timeline_drag = None;
@@ -2614,6 +2675,14 @@ impl KaraokeApp {
     }
 
     fn undo(&mut self) {
+        // An edit still being gathered into one step (a half word-tapped
+        // line) is what Ctrl+Z should undo - commit it first, rather than
+        // skipping past it to the step before.
+        if let Some(baseline) = self.undo_pending_baseline.take() {
+            if baseline != self.undo_snapshot() {
+                self.push_undo_snapshot(baseline);
+            }
+        }
         let Some(prev) = self.undo_stack.pop_back() else {
             self.status = "Nothing to undo.".to_string();
             return;
@@ -2938,7 +3007,7 @@ impl KaraokeApp {
                 ui.label(egui::RichText::new("Projects").small().weak());
                 for path in self.recent_files.projects.clone() {
                     if ui.button(file_label(&path)).clicked() {
-                        ui.close_menu();
+                        ui.close();
                         if !path.exists() {
                             self.status = format!("\"{}\" no longer exists.", file_label(&path));
                         } else if self.project_busy() {
@@ -2957,7 +3026,7 @@ impl KaraokeApp {
                 ui.label(egui::RichText::new("Audio").small().weak());
                 for path in self.recent_files.audio.clone() {
                     if ui.button(file_label(&path)).clicked() {
-                        ui.close_menu();
+                        ui.close();
                         if !path.exists() {
                             self.status = format!("\"{}\" no longer exists.", file_label(&path));
                         } else {
@@ -2973,11 +3042,11 @@ impl KaraokeApp {
     /// `pending_recovery` is set, in place of the rest of the UI until the
     /// user decides - see `AUTOSAVE_INTERVAL`/`on_exit` for how an autosave
     /// does (or doesn't) end up there in the first place.
-    fn draw_recovery_prompt(&mut self, ctx: &egui::Context) {
+    fn draw_recovery_prompt(&mut self, ui: &mut egui::Ui) {
         let Some(recovered) = self.pending_recovery.clone() else {
             return;
         };
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.heading("Recover previous session?");
@@ -3036,8 +3105,9 @@ impl KaraokeApp {
     /// Draws the "quit without saving?" prompt shown when a window-close
     /// request was intercepted because of unsaved changes - see the
     /// `close_requested()` check in `update`.
-    fn draw_quit_confirm_prompt(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn draw_quit_confirm_prompt(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.heading("Quit without saving?");
@@ -3083,7 +3153,7 @@ impl KaraokeApp {
     /// `request_new_project`. Same three-button shape either way (save
     /// first / discard and continue / cancel), just with action-specific
     /// wording so it's clear what's actually about to happen.
-    fn draw_unsaved_action_confirm_prompt(&mut self, ctx: &egui::Context) {
+    fn draw_unsaved_action_confirm_prompt(&mut self, ui: &mut egui::Ui) {
         let (heading, body, save_label, discard_label) = match self.pending_unsaved_action {
             Some(PendingUnsavedAction::NewProject) => (
                 "Start a new project without saving?",
@@ -3105,7 +3175,7 @@ impl KaraokeApp {
             ),
             None => return,
         };
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.heading(heading);
@@ -3391,7 +3461,7 @@ impl KaraokeApp {
         if let Some(bytes) = &self.font_bytes {
             defs.font_data.insert(
                 LYRIC_FONT_KEY.to_string(),
-                egui::FontData::from_owned(bytes.clone()),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes.clone())),
             );
             defs.families.insert(
                 egui::FontFamily::Name(LYRIC_FONT_KEY.into()),
@@ -3743,15 +3813,12 @@ impl KaraokeApp {
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
-            let Some(path) = file.path else {
-                let name = if file.name.is_empty() {
-                    "dropped file".to_string()
-                } else {
-                    file.name.clone()
-                };
-                self.status = format!("Couldn't read \"{name}\" - no file path was given.");
+            let path = file.path().to_path_buf();
+            if path.as_os_str().is_empty() {
+                self.status =
+                    "Couldn't read the dropped file - no file path was given.".to_string();
                 continue;
-            };
+            }
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -3787,9 +3854,9 @@ impl KaraokeApp {
     fn draw_drop_hint(&self, ctx: &egui::Context) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
-            egui::Id::new("drop_hint_overlay"),
+            egui::Id::unique("drop_hint_overlay"),
         ));
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
         painter.text(
             screen.center(),
@@ -3867,6 +3934,316 @@ impl KaraokeApp {
             } else {
                 self.status = format!("{end_status} {}", self.status);
             }
+        }
+    }
+
+    /// Word tap mode is partway through a line while the song plays - kept
+    /// as one undo "gesture", so Ctrl+Z undoes a whole word-tapped line
+    /// rather than one word at a time.
+    fn word_pass_mid_line(&self) -> bool {
+        let playing = self.audio.as_ref().is_some_and(|a| a.is_playing());
+        self.word_pass_held.is_some()
+            || (playing
+                && self.word_pass_cursor.unit > 0
+                && self.word_pass_cursor.line < self.lines.len())
+    }
+
+    /// Points the word tap cursor somewhere valid again if the lyrics
+    /// changed under it (re-parse, load, undo) - the first line still
+    /// needing word taps.
+    fn sync_word_pass_cursor(&mut self) {
+        if self.word_pass_held.is_some() {
+            return;
+        }
+        let c = self.word_pass_cursor;
+        let valid = match self.lines.get(c.line) {
+            Some(l) => !l.is_backing && c.unit < l.words().len(),
+            None => c.line == self.lines.len() && c.unit == 0,
+        };
+        if !valid {
+            self.word_pass_cursor = lyrics::first_word_tap_cursor(&self.lines);
+        }
+    }
+
+    /// The timing unit `cursor` points at, as shown on screen: `beau-` /
+    /// `-ti-` / `-ful` for syllables, the plain word otherwise.
+    fn word_pass_unit_label(&self, cursor: lyrics::WordCursor) -> String {
+        let Some(line) = self.lines.get(cursor.line) else {
+            return String::new();
+        };
+        let units = lyrics::timing_units(&line.text);
+        let Some(&(text, ends_word)) = units.get(cursor.unit) else {
+            return String::new();
+        };
+        let starts_word = cursor.unit == 0 || units[cursor.unit - 1].1;
+        format!(
+            "{}{}{}",
+            if starts_word { "" } else { "-" },
+            text,
+            if ends_word { "" } else { "-" }
+        )
+    }
+
+    /// Word tap mode, key/button *down*: the cursor's unit starts now.
+    fn word_pass_press(&mut self, viewport: egui::ViewportId) {
+        if self.word_pass_held.is_some() {
+            return;
+        }
+        self.sync_word_pass_cursor();
+        let Some(audio) = &self.audio else { return };
+        if !audio.is_playing() {
+            self.status = "Press Play, then hold Space for each word as it's sung.".to_string();
+            return;
+        }
+        let cursor = self.word_pass_cursor;
+        if cursor.line >= self.lines.len() {
+            self.status = "Every line is already word-tapped.".to_string();
+            return;
+        }
+        let pos = compensate_tap(audio.position(), self.prefs.tap_latency_ms, audio.speed());
+        match lyrics::word_tap_down(&mut self.lines, cursor, pos) {
+            Ok(fx) => {
+                self.word_pass_held = Some((cursor, pos, viewport));
+                let n_units = self.lines[cursor.line].words().len();
+                let mut msg = format!(
+                    "Line {} · word {}/{} \"{}\" at {}",
+                    cursor.line + 1,
+                    cursor.unit + 1,
+                    n_units,
+                    self.word_pass_unit_label(cursor),
+                    lyrics::format_timecode(pos)
+                );
+                self.append_word_pass_effects(&mut msg, fx);
+                self.status = msg;
+                self.recompute_next_untimed();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Word tap mode, key/button *up*: ends the held unit (see
+    /// [`lyrics::word_tap_up`]) and moves the cursor on.
+    fn word_pass_release(&mut self) {
+        let Some((cursor, down_pos, _)) = self.word_pass_held.take() else {
+            return;
+        };
+        let Some(audio) = &self.audio else { return };
+        let pos = compensate_tap(audio.position(), self.prefs.tap_latency_ms, audio.speed())
+            .max(down_pos);
+        match lyrics::word_tap_up(&mut self.lines, cursor, down_pos, pos) {
+            Ok((_, fx)) => {
+                let next = lyrics::advance_word_cursor(&self.lines, cursor);
+                self.word_pass_cursor = next;
+                if next.line != cursor.line {
+                    let line = &self.lines[cursor.line];
+                    let mut msg = format!(
+                        "Line {} word-tapped ({} - {}).",
+                        cursor.line + 1,
+                        lyrics::format_timecode(line.start.unwrap_or(down_pos)),
+                        lyrics::format_timecode(line.sing_end_override.unwrap_or(pos)),
+                    );
+                    if next.line < self.lines.len() {
+                        msg.push_str(&format!(
+                            " Next: line {}, \"{}\".",
+                            next.line + 1,
+                            self.word_pass_unit_label(next)
+                        ));
+                    } else {
+                        msg.push_str(" That was the last line.");
+                    }
+                    self.append_word_pass_effects(&mut msg, fx);
+                    self.status = msg;
+                }
+                self.recompute_next_untimed();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn append_word_pass_effects(&self, msg: &mut String, fx: lyrics::WordTapEffects) {
+        if let Some(p) = fx.trimmed_prev {
+            msg.push_str(&format!(" (line {}'s end moved back to meet it)", p + 1));
+        }
+        if let Some(n) = fx.cleared_next {
+            msg.push_str(&format!(
+                " (line {}'s old timing was cleared - it's next; Ctrl+Z restores it)",
+                n + 1
+            ));
+        }
+    }
+
+    /// Where to start playback to word-tap `line` from: 2s before the line
+    /// (or, if it has no start yet, before the end of the last timed main
+    /// line ahead of it), never before 0:00.
+    fn word_pass_lead_in(&self, line: usize) -> f64 {
+        let own = self.lines.get(line).and_then(|l| l.start);
+        let before = self.lines[..line.min(self.lines.len())]
+            .iter()
+            .rev()
+            .filter(|l| !l.is_backing)
+            .find_map(|l| l.sing_end_override.or(l.start));
+        own.or(before).map_or(0.0, |t| (t - 2.0).max(0.0))
+    }
+
+    /// Word tap mode's part of the "Tap along" panel: which line is up,
+    /// its words (done / current / to come), and the big hold-able button.
+    fn draw_word_pass_controls(&mut self, ui: &mut egui::Ui) {
+        self.sync_word_pass_cursor();
+        let cursor = self.word_pass_cursor;
+        let playing = self.audio.as_ref().is_some_and(|a| a.is_playing());
+        let done = cursor.line >= self.lines.len();
+
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("◀")
+                .on_hover_text("Previous line")
+                .clicked()
+            {
+                self.step_word_pass_line(false);
+            }
+            if self.lines.is_empty() {
+                ui.label("Parse the lyrics to start");
+            } else if done {
+                ui.label("All lines word-tapped");
+            } else {
+                ui.label(format!("Line {}/{}", cursor.line + 1, self.lines.len()));
+            }
+            if ui.small_button("▶").on_hover_text("Next line").clicked() {
+                self.step_word_pass_line(true);
+            }
+            if ui
+                .add_enabled(!done, egui::Button::new("↺ Redo line  [Enter]"))
+                .on_hover_text(
+                    "Start this line over from its opening word, playing from 2 seconds \
+                     before it.",
+                )
+                .clicked()
+            {
+                self.redo_word_pass_line();
+            }
+        });
+
+        if let Some(line) = self.lines.get(cursor.line) {
+            let units = lyrics::timing_units(&line.text);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (k, &(text, ends_word)) in units.iter().enumerate() {
+                    let rich = egui::RichText::new(text).size(16.0);
+                    let rich = if k < cursor.unit {
+                        rich.color(STEP_DONE)
+                    } else if k == cursor.unit {
+                        rich.strong()
+                            .color(egui::Color32::WHITE)
+                            .background_color(ACCENT)
+                    } else {
+                        rich.weak()
+                    };
+                    ui.label(rich);
+                    if ends_word {
+                        ui.label(egui::RichText::new(" ").size(16.0));
+                    }
+                }
+            });
+        }
+
+        let held = self.word_pass_held.is_some();
+        let label = if self.lines.is_empty() {
+            "⏱ Hold for each word  [Space]".to_string()
+        } else if done {
+            "✔ Every line is word-tapped".to_string()
+        } else if held {
+            format!(
+                "● Holding \"{}\" - let go when it ends",
+                self.word_pass_held
+                    .map(|(c, _, _)| self.word_pass_unit_label(c))
+                    .unwrap_or_default()
+            )
+        } else {
+            format!(
+                "⏱ Hold for \"{}\"  [Space]",
+                self.word_pass_unit_label(cursor)
+            )
+        };
+        let enabled = playing && !done;
+        let fill = if held { STEP_DONE } else { ACCENT };
+        let resp = ui
+            .add_enabled_ui(enabled, |ui| {
+                ui.add_sized(
+                    [ui.available_width(), 48.0],
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(fill)
+                    .sense(egui::Sense::click_and_drag()),
+                )
+            })
+            .inner;
+        // The button holds like Space: press = word starts, release = ends
+        // (the release itself is picked up in `handle_keyboard_shortcuts`).
+        let down = enabled && resp.is_pointer_button_down_on();
+        if down && !self.word_pass_button_down {
+            self.word_pass_press(egui::ViewportId::ROOT);
+        } else if !down && self.word_pass_button_down && !ui.input(|i| i.key_down(egui::Key::Space))
+        {
+            // Released this frame - end the word now, not a frame later.
+            self.word_pass_release();
+        }
+        self.word_pass_button_down = down;
+
+        if !playing
+            && !done
+            && ui
+                .button("▶ Start word tapping")
+                .on_hover_text("Plays from 2 seconds before this line.")
+                .clicked()
+        {
+            let at = self.word_pass_lead_in(cursor.line);
+            self.seek_and_play(at);
+            self.status = format!(
+                "Hold Space for each word - up now: \"{}\" (line {}).",
+                self.word_pass_unit_label(cursor),
+                cursor.line + 1
+            );
+        }
+    }
+
+    /// Word tap mode: start the cursor's line over from its opening word,
+    /// playing from just before it (Enter, or the "Redo line" button).
+    fn redo_word_pass_line(&mut self) {
+        self.sync_word_pass_cursor();
+        self.word_pass_held = None;
+        let line = self.word_pass_cursor.line;
+        if line >= self.lines.len() {
+            self.status = "No line to redo - pick one with ◀ / ▶.".to_string();
+            return;
+        }
+        self.word_pass_cursor.unit = 0;
+        let at = self.word_pass_lead_in(line);
+        self.seek_and_play(at);
+        self.status = format!(
+            "Redoing line {} - hold Space for \"{}\".",
+            line + 1,
+            self.word_pass_unit_label(self.word_pass_cursor)
+        );
+    }
+
+    /// Word tap mode: move the cursor to the previous/next main line.
+    fn step_word_pass_line(&mut self, forward: bool) {
+        self.sync_word_pass_cursor();
+        self.word_pass_held = None;
+        let cur = self.word_pass_cursor.line;
+        let has_units = |l: &LyricLine| !l.is_backing && !l.words().is_empty();
+        let target = if forward {
+            (cur + 1..self.lines.len()).find(|&i| has_units(&self.lines[i]))
+        } else {
+            (0..cur.min(self.lines.len()))
+                .rev()
+                .find(|&i| has_units(&self.lines[i]))
+        };
+        if let Some(t) = target {
+            self.word_pass_cursor = lyrics::WordCursor { line: t, unit: 0 };
         }
     }
 
@@ -4463,7 +4840,7 @@ impl KaraokeApp {
                     ui.vertical(|ui| {
                         ui.set_width(200.0);
                         egui::ScrollArea::vertical()
-                            .id_source("codex_nav_scroll")
+                            .id_salt("codex_nav_scroll")
                             .show(ui, |ui| {
                                 // Grouped by category, in the fixed order
                                 // each category's first article appears in
@@ -4492,11 +4869,11 @@ impl KaraokeApp {
                     });
                     ui.separator();
                     egui::ScrollArea::vertical()
-                        .id_source("codex_article_scroll")
+                        .id_salt("codex_article_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if let Some(article) = codex::all_articles().get(self.codex_selected) {
-                                egui_commonmark::CommonMarkViewer::new("codex_article").show(
+                                egui_commonmark::CommonMarkViewer::new().show(
                                     ui,
                                     &mut self.codex_cache,
                                     article.content,
@@ -4527,10 +4904,10 @@ impl KaraokeApp {
             .show(ctx, |ui| {
                 ui.set_max_width(520.0);
                 egui::ScrollArea::vertical()
-                    .id_source("disclaimer_modal_scroll")
+                    .id_salt("disclaimer_modal_scroll")
                     .max_height(420.0)
                     .show(ui, |ui| {
-                        egui_commonmark::CommonMarkViewer::new("disclaimer_modal").show(
+                        egui_commonmark::CommonMarkViewer::new().show(
                             ui,
                             &mut self.codex_cache,
                             codex::DISCLAIMER_TEXT,
@@ -4620,7 +4997,7 @@ impl KaraokeApp {
                     ui.indent("video_opts", |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Resolution:");
-                            egui::ComboBox::from_id_source("export_video_res")
+                            egui::ComboBox::from_id_salt("export_video_res")
                                 .selected_text(self.video_resolution.label())
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
@@ -4709,7 +5086,7 @@ impl KaraokeApp {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Codec:");
-                            egui::ComboBox::from_id_source("export_video_codec")
+                            egui::ComboBox::from_id_salt("export_video_codec")
                                 .selected_text(self.video_codec.label())
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
@@ -4743,7 +5120,7 @@ impl KaraokeApp {
                     ui.indent("stem_opts", |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Format:");
-                            egui::ComboBox::from_id_source("export_stem_format")
+                            egui::ComboBox::from_id_salt("export_stem_format")
                                 .selected_text(self.instrumental_format.label())
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
@@ -4872,7 +5249,7 @@ impl KaraokeApp {
                 if !self.batch_projects.is_empty() {
                     let mut remove = None;
                     egui::ScrollArea::vertical()
-                        .id_source("batch_projects_scroll")
+                        .id_salt("batch_projects_scroll")
                         .max_height(110.0)
                         .show(ui, |ui| {
                             for (i, p) in self.batch_projects.iter().enumerate() {
@@ -5067,7 +5444,7 @@ impl KaraokeApp {
             .take(140)
             .collect();
         let mut dismiss = false;
-        egui::Area::new(egui::Id::new("status_toast"))
+        egui::Area::new(egui::Id::unique("status_toast"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -5075,7 +5452,7 @@ impl KaraokeApp {
                 let color = kind.color(ui.visuals());
                 let frame = egui::Frame::popup(ui.style())
                     .stroke(egui::Stroke::new(1.5_f32, color))
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+                    .inner_margin(egui::Margin::symmetric(12, 8));
                 let resp = frame
                     .show(ui, |ui| {
                         ui.set_max_width(420.0);
@@ -5355,7 +5732,12 @@ impl KaraokeApp {
         let Some(frames) = self.ui_style_frames else {
             self.ui_style_frames = Some(0);
             ctx.set_zoom_factor(self.prefs.ui_zoom);
-            ctx.style_mut(|style| {
+            // Always dark: every color here (accent, bubble text, step bar,
+            // status colors) was designed against egui's dark theme, which
+            // was egui 0.28's default - later egui follows the OS theme
+            // unless told otherwise.
+            ctx.set_theme(egui::Theme::Dark);
+            ctx.all_styles_mut(|style| {
                 // Selected items, slider/progress fills and text selection
                 // in the accent purple - the same color as the primary
                 // buttons and the step bar's current step.
@@ -5420,10 +5802,10 @@ impl KaraokeApp {
                 if *step == WorkflowStep::Tap && snap.lines > 0 && status != StepStatus::Done {
                     label.push_str(&format!("  {}/{}", snap.timed, snap.lines));
                 }
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(fill)
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::symmetric(10.0, 3.0))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::symmetric(10, 3))
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new(label).color(text_color).strong());
                     })
@@ -5457,10 +5839,10 @@ impl KaraokeApp {
             ),
             _ => "Everything's timed - ready to export.".to_string(),
         };
-        egui::Frame::none()
+        egui::Frame::NONE
             .stroke(egui::Stroke::new(1.0_f32, ACCENT))
-            .rounding(6.0)
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new(message).strong());
@@ -5515,6 +5897,20 @@ impl KaraokeApp {
     /// before the last tapped point (the start of the song if nothing is
     /// tapped yet), so picking up where you left off is one click.
     fn start_tapping_from_next_line(&mut self) {
+        if self.prefs.word_tap_mode {
+            self.sync_word_pass_cursor();
+            let cursor = self.word_pass_cursor;
+            if cursor.line < self.lines.len() {
+                let at = self.word_pass_lead_in(cursor.line);
+                self.seek_and_play(at);
+                self.status = format!(
+                    "Hold Space for each word - up now: \"{}\" (line {}).",
+                    self.word_pass_unit_label(cursor),
+                    cursor.line + 1
+                );
+                return;
+            }
+        }
         let resume = self.lines[..self.next_untimed.min(self.lines.len())]
             .iter()
             .rev()
@@ -5679,7 +6075,7 @@ impl KaraokeApp {
         } else {
             ui.visuals().text_color()
         }))
-        .id_source("export_checklist")
+        .id_salt("export_checklist")
         .default_open(warnings > 0)
         .show(ui, |ui| {
             ui.label(
@@ -5690,7 +6086,7 @@ impl KaraokeApp {
                 .weak(),
             );
             egui::ScrollArea::vertical()
-                .id_source("export_checklist_scroll")
+                .id_salt("export_checklist_scroll")
                 .max_height(220.0)
                 .show(ui, |ui| {
                     for issue in &issues {
@@ -5790,29 +6186,25 @@ impl KaraokeApp {
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("preview_window"),
             builder,
-            |ctx, class| {
-                if class == egui::ViewportClass::Embedded {
-                    // Backend without multi-window support - fall back to
-                    // a floating window inside the main one.
-                    let mut open = true;
-                    egui::Window::new("Preview")
-                        .open(&mut open)
-                        .resizable(true)
-                        .default_size([640.0, 360.0])
-                        .show(ctx, |ui| {
-                            let h = ui.available_height();
-                            self.draw_preview(ui, Some(h));
-                        });
-                    if !open {
+            |ui, class| {
+                let ctx = &ui.ctx().clone();
+                if class == egui::ViewportClass::EmbeddedWindow {
+                    // Backend without multi-window support - egui has
+                    // already wrapped this in a floating window inside the
+                    // main one (with no close box of ours to watch), so
+                    // offer the way back here.
+                    if ui.button("Bring back").clicked() {
                         self.preview_popped_out = false;
                     }
+                    let h = ui.available_height();
+                    self.draw_preview(ui, Some(h));
                     return;
                 }
 
                 self.handle_keyboard_shortcuts(ctx);
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(egui::Color32::BLACK))
-                    .show(ctx, |ui| {
+                    .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+                    .show(ui, |ui| {
                         let avail = ui.available_size();
                         let aspect = match self.video_style.orientation {
                             video::Orientation::Landscape => 16.0 / 9.0,
@@ -5836,19 +6228,33 @@ impl KaraokeApp {
     /// handled exactly once, by whichever window had focus. That keeps
     /// tapping along with Space working while you watch the big preview.
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        // Word tap mode: a held word ends when Space is let go in the
+        // window it was pressed in (and the tap button isn't held either).
+        if let Some((_, _, viewport)) = self.word_pass_held {
+            if viewport == ctx.viewport_id()
+                && !ctx.input(|i| i.key_down(egui::Key::Space))
+                && !self.word_pass_button_down
+            {
+                self.word_pass_release();
+            }
+        }
         // Ctrl+S / Ctrl+Shift+S save the project - unlike the shortcuts
         // below, these are safe to fire even while a text field has focus,
         // the same way most apps let Ctrl+S through while you're typing.
-        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+        if ctx.input(|i| {
+            i.modifiers.command && !i.modifiers.shift && fresh_press(&i.events, egui::Key::S)
+        }) {
             self.save_project();
         }
-        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+        if ctx.input(|i| {
+            i.modifiers.command && i.modifiers.shift && fresh_press(&i.events, egui::Key::S)
+        }) {
             self.save_project_as_dialog();
         }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
+        if ctx.input(|i| i.modifiers.command && fresh_press(&i.events, egui::Key::E)) {
             self.open_export_dialog();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+        if ctx.input(|i| fresh_press(&i.events, egui::Key::F1)) {
             self.show_shortcuts = !self.show_shortcuts;
         }
 
@@ -5857,12 +6263,25 @@ impl KaraokeApp {
         // accidentally trigger a tap.
         let typing = ctx.memory(|m| m.focused().is_some());
         if !typing {
-            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            // One-shot actions use `fresh_press`, not `key_pressed`: egui's
+            // `key_pressed` also fires for the auto-repeat presses a held
+            // key sends, so holding Space a moment too long would tap
+            // start, end, start... and run through lines. Keys where
+            // holding is useful (arrows, , / . nudges, undo, Delete, Home)
+            // keep repeating.
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::Space)) {
                 // Once there's nothing left to tap (no lyrics parsed yet,
                 // or every line already has both a start and an end),
                 // Space drives playback instead - much less hunting for the
                 // mouse while fine-tuning with the timeline/word panel.
-                if self.next_untimed >= self.lines.len() {
+                if self.prefs.word_tap_mode {
+                    self.sync_word_pass_cursor();
+                    if self.word_pass_cursor.line >= self.lines.len() {
+                        self.toggle_play_pause();
+                    } else {
+                        self.word_pass_press(ctx.viewport_id());
+                    }
+                } else if self.next_untimed >= self.lines.len() {
                     self.toggle_play_pause();
                 } else if ctx.input(|i| i.modifiers.shift) {
                     self.tap_end_and_start_next();
@@ -5909,25 +6328,25 @@ impl KaraokeApp {
             // tapping itself, without reaching for each line's dropdown.
             // Plain presses only (`!modifiers.command`), so this can't
             // fire as a side effect of e.g. Ctrl+S.
-            if ctx.input(|i| i.key_pressed(egui::Key::M) && !i.modifiers.command) {
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::M) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Male);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.command) {
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::F) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Female);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::D) && !i.modifiers.command) {
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::D) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Duet);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command) {
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::S) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Screaming);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::L) && !i.modifiers.command) {
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::L) && !i.modifiers.command) {
                 self.toggle_loop_line(None);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::B) && !i.modifiers.command) {
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::B) && !i.modifiers.command) {
                 self.assign_singer_to_current_line(Singer::Backing);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Questionmark)) {
+            if ctx.input(|i| fresh_press(&i.events, egui::Key::Questionmark)) {
                 self.show_shortcuts = !self.show_shortcuts;
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
@@ -5955,7 +6374,13 @@ impl KaraokeApp {
                     self.status = "Tap a line (or click one in the table) to nudge it.".to_string();
                 }
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.command) {
+            if self.prefs.word_tap_mode
+                && ctx.input(|i| fresh_press(&i.events, egui::Key::Enter) && !i.modifiers.command)
+            {
+                self.redo_word_pass_line();
+            } else if ctx
+                .input(|i| fresh_press(&i.events, egui::Key::Enter) && !i.modifiers.command)
+            {
                 match self.edit_target() {
                     Some(i) if self.lines[i].is_backing => self.tap_backing_line(i),
                     Some(i) => self.retap_line(i),
@@ -6309,7 +6734,11 @@ impl KaraokeApp {
                 .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(alpha));
         }
 
-        let mut content_ui = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center), None);
+        let mut content_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
         // Safety net alongside the proportional sizing below: nothing drawn
         // in here can spill past the visible mock-screen rect into the rest
         // of the page, even in an edge case the proportional math doesn't
@@ -6837,7 +7266,7 @@ impl KaraokeApp {
             let mut job = job;
             job.wrap.max_width = rect.width() * 0.92;
             job.halign = egui::Align::Center;
-            let galley = ui.fonts(|f| f.layout_job(job));
+            let galley = ui.painter().layout_job(job);
             let baseline_y = rect.top() + height * video::BACKING_LANE_Y;
             let pos = egui::pos2(rect.center().x, baseline_y - galley.size().y * 0.8);
             ui.painter()
@@ -6885,6 +7314,18 @@ impl KaraokeApp {
                     .clamp(timeline::MIN_PX_PER_SEC, timeline::MAX_PX_PER_SEC);
                 self.timeline_view.scroll_secs = 0.0;
             }
+            if ui
+                .checkbox(&mut self.prefs.snap_to_onsets, "🧲 Snap")
+                .on_hover_text(
+                    "Dragging a bubble (or its left edge) snaps its start to the nearest \
+                     vocal onset - where new sound starts in the audio, shown as ticks \
+                     while you drag. Hold Shift (or Alt) to drag freely. Onsets come from the whole \
+                     mix, so a drum hit can attract a snap too.",
+                )
+                .changed()
+            {
+                prefs::save(APP_ID, &self.prefs);
+            }
             help_text(
                 ui,
                 self.prefs.show_tips,
@@ -6920,6 +7361,13 @@ impl KaraokeApp {
         );
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+        // Onset snapping for this frame's drags: within a few pixels at the
+        // current zoom, unless switched off or Shift/Alt is held (Shift too,
+        // since some Linux desktops take Alt+drag to move the window).
+        let snapping = self.prefs.snap_to_onsets
+            && self.waveform.is_some()
+            && !ui.input(|i| i.modifiers.alt || i.modifiers.shift);
+        let snap_secs = (TIMELINE_SNAP_PX / self.timeline_view.px_per_sec) as f64;
 
         // Plain scroll zooms; shift+scroll pans instead (handled after the
         // bubble loops, once we know whether a drag is in progress).
@@ -6988,6 +7436,27 @@ impl KaraokeApp {
             }
         }
 
+        // While dragging with snapping on, show where the onsets are - short
+        // ticks under the ruler, so the bubbles' edges can be read against
+        // them without hiding the waveform.
+        if snapping && self.timeline_drag.is_some() {
+            if let Some(waveform) = &self.waveform {
+                let from = self.timeline_view.x_to_time(rect.left(), rect.left());
+                let to = self.timeline_view.x_to_time(rect.left(), rect.right());
+                let tick = ACCENT.gamma_multiply(0.6);
+                for &t in waveform.onsets_in(from, to) {
+                    let x = self.timeline_view.time_to_x(rect.left(), t);
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, rect.top() + ruler_h - 6.0),
+                            egui::pos2(x, rect.top() + ruler_h + 4.0),
+                        ],
+                        egui::Stroke::new(1.5_f32, tick),
+                    );
+                }
+            }
+        }
+
         let backing_lane_top = main_lane_top + lane_h + lane_gap;
         if has_backing {
             painter.line_segment(
@@ -7028,7 +7497,7 @@ impl KaraokeApp {
                     ),
                 );
 
-                let id = ui.id().with(("timeline_bubble", orig_idx));
+                let id = ui.scope_id().with(("timeline_bubble", orig_idx));
                 let bubble_response = ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
 
                 let (_, highlight) = self.singer_colors(line.singer);
@@ -7045,7 +7514,7 @@ impl KaraokeApp {
                     egui::Stroke::new(1.0_f32, highlight)
                 };
                 painter.rect_filled(bubble_rect, 3.0, fill);
-                painter.rect_stroke(bubble_rect, 3.0, stroke);
+                painter.rect_stroke(bubble_rect, 3.0, stroke, egui::StrokeKind::Middle);
                 Self::draw_edge_grab_strips(&painter, bubble_rect);
                 if bubble_rect.width() > 16.0 {
                     painter.with_clip_rect(bubble_rect.shrink(2.0)).text(
@@ -7075,7 +7544,7 @@ impl KaraokeApp {
                     // Deliberately *not* `interact_pointer_pos()` here - egui
                     // only recognizes a drag once the pointer has moved past
                     // its own click-vs-drag threshold (`MAX_CLICK_DIST`, 6px as
-                    // of egui 0.28), so by the time `drag_started()` fires,
+                    // of egui 0.28-0.37), so by the time `drag_started()` fires,
                     // `interact_pointer_pos()` already reflects that post-
                     // threshold position, shifted a few pixels in whatever
                     // direction the user's hand first moved. Classifying the
@@ -7133,8 +7602,20 @@ impl KaraokeApp {
                             .filter(|d| {
                                 d.line_idx == orig_idx && d.target == TimelineDragTarget::Line
                             })
-                            .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
-                        if let Some((new_start, new_sing_end)) = resolved {
+                            .map(|d| {
+                                d.session.resolve_snapped(
+                                    pos.x,
+                                    self.timeline_view.px_per_sec,
+                                    |t| {
+                                        self.waveform
+                                            .as_ref()
+                                            .filter(|_| snapping)
+                                            .and_then(|w| w.nearest_onset(t, snap_secs))
+                                    },
+                                )
+                            });
+                        if let Some(((new_start, new_sing_end), hit)) = resolved {
+                            self.timeline_snap = hit;
                             if let Some(l) = self.lines.get_mut(orig_idx) {
                                 if let Some(s) = new_start {
                                     l.start = Some(s);
@@ -7163,6 +7644,7 @@ impl KaraokeApp {
                         self.audition_seek(seek_near);
                     }
                     self.timeline_drag = None;
+                    self.timeline_snap = None;
                 }
             }
 
@@ -7203,7 +7685,7 @@ impl KaraokeApp {
                         ),
                     );
 
-                    let id = ui.id().with(("timeline_word_bubble", orig_idx, w));
+                    let id = ui.scope_id().with(("timeline_word_bubble", orig_idx, w));
                     let bubble_response =
                         ui.interact(bubble_rect, id, egui::Sense::click_and_drag());
 
@@ -7220,6 +7702,7 @@ impl KaraokeApp {
                         bubble_rect,
                         3.0,
                         egui::Stroke::new(1.0_f32, egui::Color32::WHITE.gamma_multiply(0.5)),
+                        egui::StrokeKind::Middle,
                     );
                     Self::draw_edge_grab_strips(&painter, bubble_rect);
                     if bubble_rect.width() > 14.0 {
@@ -7319,8 +7802,20 @@ impl KaraokeApp {
                                 .timeline_drag
                                 .as_ref()
                                 .filter(|d| d.line_idx == orig_idx && d.target == target)
-                                .map(|d| d.session.resolve(pos.x, self.timeline_view.px_per_sec));
-                            if let Some((new_start, new_end)) = resolved {
+                                .map(|d| {
+                                    d.session.resolve_snapped(
+                                        pos.x,
+                                        self.timeline_view.px_per_sec,
+                                        |t| {
+                                            self.waveform
+                                                .as_ref()
+                                                .filter(|_| snapping)
+                                                .and_then(|w| w.nearest_onset(t, snap_secs))
+                                        },
+                                    )
+                                });
+                            if let Some(((new_start, new_end), hit)) = resolved {
+                                self.timeline_snap = hit;
                                 if let Some(l) = self.lines.get_mut(orig_idx) {
                                     if let Some(s) = new_start {
                                         if let Some(slot) = l.word_overrides.get_mut(w) {
@@ -7384,6 +7879,7 @@ impl KaraokeApp {
                             self.audition_seek(seek_near);
                         }
                         self.timeline_drag = None;
+                        self.timeline_snap = None;
                     }
                 }
             }
@@ -7412,6 +7908,17 @@ impl KaraokeApp {
                         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 160, 255)),
                     );
                 }
+            }
+        }
+
+        // The onset the current drag is snapped to: a full-height line.
+        if let Some(t) = self.timeline_snap.filter(|_| self.timeline_drag.is_some()) {
+            let x = self.timeline_view.time_to_x(rect.left(), t);
+            if (rect.left()..=rect.right()).contains(&x) {
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(2.0_f32, ACCENT),
+                );
             }
         }
 
@@ -7492,12 +7999,15 @@ impl KaraokeApp {
 const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl eframe::App for KaraokeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.37: panels are shown inside the root `Ui` (not on the
+        // `Context`); everything else here still works through `ctx`.
+        let ctx = &ui.ctx().clone();
         // An autosave found at startup means the last run didn't shut down
         // cleanly - ask before drawing anything else, rather than silently
         // discarding or silently resuming into it.
         if self.pending_recovery.is_some() {
-            self.draw_recovery_prompt(ctx);
+            self.draw_recovery_prompt(ui);
             return;
         }
 
@@ -7515,11 +8025,11 @@ impl eframe::App for KaraokeApp {
             self.show_quit_confirm = true;
         }
         if self.show_quit_confirm {
-            self.draw_quit_confirm_prompt(ctx);
+            self.draw_quit_confirm_prompt(ui);
             return;
         }
         if self.pending_unsaved_action.is_some() {
-            self.draw_unsaved_action_confirm_prompt(ctx);
+            self.draw_unsaved_action_confirm_prompt(ui);
             return;
         }
 
@@ -7576,9 +8086,15 @@ impl eframe::App for KaraokeApp {
         self.auto_follow_word_tap_line();
 
         self.handle_keyboard_shortcuts(ctx);
+        if self
+            .word_pass_held
+            .is_some_and(|(_, _, v)| v != egui::ViewportId::ROOT && !self.preview_popped_out)
+        {
+            self.word_pass_release();
+        }
         self.sync_ui_style(ctx);
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("Abyssal CDG Creator");
@@ -7984,7 +8500,7 @@ impl eframe::App for KaraokeApp {
         self.draw_toast(ctx);
         self.draw_disclaimer_modal(ctx);
 
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
+        egui::Panel::bottom("bottom").show(ui, |ui| {
             ui.add_space(4.0);
             let busy = self.project_busy();
             ui.horizontal(|ui| {
@@ -8010,7 +8526,7 @@ impl eframe::App for KaraokeApp {
                         self.start_word_alignment();
                     }
                     ui.label("Language:");
-                    egui::ComboBox::from_id_source("align_language")
+                    egui::ComboBox::from_id_salt("align_language")
                         .selected_text(format!(
                             "{} ({})",
                             self.align_language.label(),
@@ -8030,7 +8546,7 @@ impl eframe::App for KaraokeApp {
                          \"Instrumental audio\"/\"Vocals audio\" export or video's \"Remove \
                          vocals\", which always use Inst HQ 3.",
                     );
-                    egui::ComboBox::from_id_source("align_vocal_model")
+                    egui::ComboBox::from_id_salt("align_vocal_model")
                         .selected_text(self.align_vocal_model.label())
                         .show_ui(ui, |ui| {
                             for model in mdx::MdxModel::ALL {
@@ -8083,22 +8599,22 @@ impl eframe::App for KaraokeApp {
             ui.add_space(4.0);
         });
 
-        egui::TopBottomPanel::bottom("timeline_panel")
+        egui::Panel::bottom("timeline_panel")
             .resizable(false)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.add_space(4.0);
                 self.draw_timeline(ui);
                 ui.add_space(4.0);
             });
 
-        egui::SidePanel::left("lyrics_panel")
+        egui::Panel::left("lyrics_panel")
             .resizable(true)
-            .default_width(360.0)
-            .width_range(280.0..=560.0)
-            .show(ctx, |ui| {
+            .default_size(360.0)
+            .size_range(280.0..=560.0)
+            .show(ui, |ui| {
                 ui.label("1. Paste the song lyrics (one line per line of text):");
                 egui::ScrollArea::vertical()
-                    .id_source("lyrics_scroll")
+                    .id_salt("lyrics_scroll")
                     .max_height(300.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -8113,7 +8629,7 @@ impl eframe::App for KaraokeApp {
                                     self.lyrics_raw.chars().count() as isize - len_before as isize;
                                 self.lyrics_edited_span = Some(track_lyrics_edit(
                                     self.lyrics_edited_span.take(),
-                                    cursor.primary.ccursor.index,
+                                    cursor.primary.index.0,
                                     delta,
                                 ));
                             }
@@ -8140,13 +8656,51 @@ impl eframe::App for KaraokeApp {
                 );
                 ui.add_space(8.0);
                 ui.separator();
-                ui.label("2. Tap along:");
-                help_text(
-                    ui,
-                    self.prefs.show_tips,
-                    "Space: tap each line's start, then its end · Shift+Space: end + start \
+                ui.horizontal(|ui| {
+                    ui.label("2. Tap along:");
+                    let mut words = self.prefs.word_tap_mode;
+                    ui.selectable_value(&mut words, false, "Lines")
+                        .on_hover_text(
+                            "Two presses per line - its start, then its end. Word timing \
+                         within each line is estimated until you fine-tune it.",
+                        );
+                    ui.selectable_value(&mut words, true, "Words")
+                        .on_hover_text(
+                            "Hold Space for each word (or |syllable) while it's sung - press \
+                         when it starts, let go when it ends. Times every word and the \
+                         line itself in one pass.",
+                        );
+                    if words != self.prefs.word_tap_mode {
+                        self.prefs.word_tap_mode = words;
+                        self.word_pass_held = None;
+                        if words {
+                            self.word_pass_cursor = lyrics::first_word_tap_cursor(&self.lines);
+                        }
+                        prefs::save(APP_ID, &self.prefs);
+                    }
+                });
+                if self.prefs.word_tap_mode {
+                    help_text(
+                        ui,
+                        self.prefs.show_tips,
+                        "Hold Space for each word while it's sung · Enter: redo line.",
+                        "Press Play, then hold Space down for each word while it's being \
+                         sung - press the instant it starts, let go when it ends (a quick \
+                         tap is fine for short words; the wipe just runs on into the next \
+                         one). Words split with | (beau|ti|ful) get one press per syllable. \
+                         Each line's start and end come from its first and last word, so \
+                         there's no separate line pass. Missed a word? Press Enter to redo \
+                         the line from 2 seconds before it; ◀ / ▶ pick another line. Slow \
+                         the song down if it's fast. Backing lines are skipped - tap those \
+                         from their row in the table.",
+                    );
+                } else {
+                    help_text(
+                        ui,
+                        self.prefs.show_tips,
+                        "Space: tap each line's start, then its end · Shift+Space: end + start \
                      next · M/F/D/S/B: voice.",
-                    "Press Play, then press Space (or click below) the instant each line \
+                        "Press Play, then press Space (or click below) the instant each line \
                      starts being sung, and again the instant it ends - two taps per line. \
                      Lines fill in top to bottom automatically - missed one? Drag the seek \
                      bar back a few seconds and try again. (Skipping the end-tap is fine too - \
@@ -8155,7 +8709,8 @@ impl eframe::App for KaraokeApp {
                      ends it and starts the next in one tap. Press M/F/D/S/B to set that \
                      line's voice (Male/Female/Duet/Screaming/Backing) without leaving the \
                      keyboard.",
-                );
+                    );
+                }
                 ui.horizontal(|ui| {
                     ui.label("Tap latency:");
                     let resp = ui
@@ -8179,76 +8734,80 @@ impl eframe::App for KaraokeApp {
                         prefs::save(APP_ID, &self.prefs);
                     }
                 });
-                let can_tap = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false)
-                    && self.next_untimed < self.lines.len();
-                ui.add_enabled_ui(can_tap, |ui| {
-                    let label = if self.next_untimed < self.lines.len() {
-                        let phase = match self.tap_phase {
-                            TapPhase::Start => "start",
-                            TapPhase::End => "end",
+                if self.prefs.word_tap_mode {
+                    self.draw_word_pass_controls(ui);
+                } else {
+                    let can_tap = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false)
+                        && self.next_untimed < self.lines.len();
+                    ui.add_enabled_ui(can_tap, |ui| {
+                        let label = if self.next_untimed < self.lines.len() {
+                            let phase = match self.tap_phase {
+                                TapPhase::Start => "start",
+                                TapPhase::End => "end",
+                            };
+                            format!(
+                                "⏱ Tap {} of line ({}/{})  [Space]",
+                                phase,
+                                self.next_untimed + 1,
+                                self.lines.len()
+                            )
+                        } else {
+                            "⏱ Tap next line".to_string()
                         };
-                        format!(
-                            "⏱ Tap {} of line ({}/{})  [Space]",
-                            phase,
-                            self.next_untimed + 1,
-                            self.lines.len()
-                        )
-                    } else {
-                        "⏱ Tap next line".to_string()
-                    };
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 48.0],
-                            egui::Button::new(
-                                egui::RichText::new(label)
-                                    .color(egui::Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(ACCENT),
-                        )
-                        .clicked()
-                    {
-                        self.tap_next();
-                    }
-                    // Back-to-back lines: one press ends this line and starts
-                    // the next at the same instant (see
-                    // `tap_end_and_start_next`). Only offered at an end tap
-                    // with another line still to go.
-                    let has_next_main = self.lines[self.next_untimed.min(self.lines.len())..]
-                        .iter()
-                        .skip(1)
-                        .any(|l| !l.is_backing);
-                    if self.tap_phase == TapPhase::End
-                        && has_next_main
-                        && ui
+                        if ui
                             .add_sized(
-                                [ui.available_width(), 24.0],
+                                [ui.available_width(), 48.0],
                                 egui::Button::new(
-                                    "⏭ End this line + start the next  [Shift+Space]",
-                                ),
-                            )
-                            .on_hover_text(
-                                "For lines sung straight into each other with no gap: sets \
-                                 this line's end and the next line's start at the same \
-                                 instant, in one tap.",
+                                    egui::RichText::new(label)
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(ACCENT),
                             )
                             .clicked()
-                    {
-                        self.tap_end_and_start_next();
-                    }
-                });
+                        {
+                            self.tap_next();
+                        }
+                        // Back-to-back lines: one press ends this line and starts
+                        // the next at the same instant (see
+                        // `tap_end_and_start_next`). Only offered at an end tap
+                        // with another line still to go.
+                        let has_next_main = self.lines[self.next_untimed.min(self.lines.len())..]
+                            .iter()
+                            .skip(1)
+                            .any(|l| !l.is_backing);
+                        if self.tap_phase == TapPhase::End
+                            && has_next_main
+                            && ui
+                                .add_sized(
+                                    [ui.available_width(), 24.0],
+                                    egui::Button::new(
+                                        "⏭ End this line + start the next  [Shift+Space]",
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "For lines sung straight into each other with no gap: sets \
+                                 this line's end and the next line's start at the same \
+                                 instant, in one tap.",
+                                )
+                                .clicked()
+                        {
+                            self.tap_end_and_start_next();
+                        }
+                    });
+                }
             });
 
         // Max width tracks the window so the panel can be dragged wide for a
         // bigger preview, while always leaving room for the timing table.
-        let preview_panel_max = (ctx.screen_rect().width() * 0.65).max(560.0);
-        egui::SidePanel::right("colors_preview_panel")
+        let preview_panel_max = (ctx.content_rect().width() * 0.65).max(560.0);
+        egui::Panel::right("colors_preview_panel")
             .resizable(true)
-            .default_width(340.0)
-            .width_range(260.0..=preview_panel_max)
-            .show(ctx, |ui| {
+            .default_size(340.0)
+            .size_range(260.0..=preview_panel_max)
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical()
-                    .id_source("right_panel_scroll")
+                    .id_salt("right_panel_scroll")
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("4. Preview (matches the exported file):");
@@ -8290,12 +8849,12 @@ impl eframe::App for KaraokeApp {
                                 .color(egui::Color32::from_rgb(230, 160, 40))
                         };
                         egui::CollapsingHeader::new(header)
-                            .id_source("colors_section")
+                            .id_salt("colors_section")
                             .default_open(false)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("Preset:");
-                                    egui::ComboBox::from_id_source("color_preset")
+                                    egui::ComboBox::from_id_salt("color_preset")
                                         .selected_text(self.color_preset.label())
                                         .show_ui(ui, |ui| {
                                             for preset in ALL_COLOR_PRESETS {
@@ -8445,7 +9004,7 @@ impl eframe::App for KaraokeApp {
                                 ui.add_space(6.0);
                                 ui.horizontal(|ui| {
                                     ui.label("Fit:");
-                                    egui::ComboBox::from_id_source("background_fit")
+                                    egui::ComboBox::from_id_salt("background_fit")
                                         .selected_text(self.background_fit.label())
                                         .show_ui(ui, |ui| {
                                             for option in [
@@ -8574,7 +9133,7 @@ impl eframe::App for KaraokeApp {
                                             let mut pick: Option<String> = None;
                                             egui::ScrollArea::vertical()
                                                 .max_height(180.0)
-                                                .id_source("font_picker_scroll")
+                                                .id_salt("font_picker_scroll")
                                                 .show(ui, |ui| {
                                                     for name in &filtered {
                                                         let selected =
@@ -8694,7 +9253,7 @@ impl eframe::App for KaraokeApp {
                     });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.label("3. Review / fine-tune timestamps and voice:");
             if !self.lines.is_empty() {
                 let statuses = line_statuses(&self.lines);
@@ -8908,7 +9467,7 @@ impl eframe::App for KaraokeApp {
                     let known_custom = self.known_custom_singers();
                     if !known_custom.is_empty() {
                         ui.separator();
-                        egui::ComboBox::from_id_source("bulk_custom_singer")
+                        egui::ComboBox::from_id_salt("bulk_custom_singer")
                             .width(100.0)
                             .selected_text("Custom…")
                             .show_ui(ui, |ui| {
@@ -9032,7 +9591,7 @@ impl eframe::App for KaraokeApp {
             self.timing_table_scrolled_to = follow_target;
 
             egui::ScrollArea::vertical()
-                .id_source("timing_scroll")
+                .id_salt("timing_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // Current auto-estimated end per line (used only as a
@@ -9156,7 +9715,7 @@ impl eframe::App for KaraokeApp {
                             });
 
                         egui::ScrollArea::horizontal()
-                            .id_source("timing_scroll_h")
+                            .id_salt("timing_scroll_h")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 egui::Grid::new("lines_grid_rest")
@@ -9319,7 +9878,7 @@ impl eframe::App for KaraokeApp {
                                 // of alignment with its own header.
                                 ui.horizontal(|ui| {
                                     let known_custom = self.known_custom_singers();
-                                    egui::ComboBox::from_id_source(("singer", i))
+                                    egui::ComboBox::from_id_salt(("singer", i))
                                         .width(82.0)
                                         .selected_text(lyrics::effective_singer_label(
                                             self.lines[i].singer,
@@ -9392,7 +9951,7 @@ impl eframe::App for KaraokeApp {
                                 });
 
                                 ui.horizontal(|ui| {
-                                    egui::ComboBox::from_id_source(("countdown_mode", i))
+                                    egui::ComboBox::from_id_salt(("countdown_mode", i))
                                         .width(78.0)
                                         .selected_text(self.lines[i].countdown_mode.label())
                                         .show_ui(ui, |ui| {
@@ -9435,7 +9994,7 @@ impl eframe::App for KaraokeApp {
                                     || self.word_tap_line == Some(i)
                                     || self.next_untimed == i
                                     || self.selected_lines.contains(&i);
-                                ui.add_visible_ui(row_active, |ui| {
+                                add_visible_ui(ui, row_active, |ui| {
                                 if self.lines[i].is_backing {
                                     // Backing lines aren't part of tap-along,
                                     // so their own Tap button does both ends:
@@ -9459,12 +10018,12 @@ impl eframe::App for KaraokeApp {
                                     retap_idx = Some(i);
                                 }
                                 });
-                                ui.add_visible_ui(row_active, |ui| {
+                                add_visible_ui(ui, row_active, |ui| {
                                 if ui.small_button("Words").clicked() {
                                     words_idx = Some(i);
                                 }
                                 });
-                                ui.add_visible_ui(row_active, |ui| {
+                                add_visible_ui(ui, row_active, |ui| {
                                 if ui
                                     .selectable_label(self.lines[i].is_backing, "Backing")
                                     .on_hover_text(
@@ -9479,7 +10038,7 @@ impl eframe::App for KaraokeApp {
                                     backing_toggle_idx = Some(i);
                                 }
                                 });
-                                ui.add_visible_ui(row_active, |ui| {
+                                add_visible_ui(ui, row_active, |ui| {
                                 ui.horizontal(|ui| {
                                     if self.lines[i].start.is_some() {
                                         if ui.small_button("-0.1s").clicked() {
@@ -9585,7 +10144,9 @@ impl eframe::App for KaraokeApp {
         // Record undo history for whatever changed this frame - see
         // `track_undo_history` for why a timeline drag or a focused text
         // field counts as one gesture rather than a step per frame.
-        let gesture_active = self.timeline_drag.is_some() || ctx.memory(|m| m.focused().is_some());
+        let gesture_active = self.timeline_drag.is_some()
+            || ctx.memory(|m| m.focused().is_some())
+            || self.word_pass_mid_line();
         self.track_undo_history(gesture_active);
     }
 
@@ -9755,6 +10316,77 @@ mod tests {
         assert_eq!(parse_jump_time("abc"), None);
         assert_eq!(parse_jump_time("1:2:3:4"), None);
         assert_eq!(parse_jump_time("nan"), None);
+    }
+
+    fn key_event(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn word_tap_progress_messages_dont_toast() {
+        for msg in [
+            "Line 3 · word 2/5 \"-ti-\" at 0:12.30",
+            "Line 3 word-tapped (0:12.10 - 0:15.40). Next: line 4, \"so\".",
+            "Line 3 word-tapped (0:12.10 - 0:15.40). That was the last line.",
+            "Line 4 · word 1/3 \"so\" at 0:16.00 (line 5's old timing was cleared - \
+             it's next; Ctrl+Z restores it)",
+            "Hold Space for each word - up now: \"so\" (line 4).",
+            "Redoing line 4 - hold Space for \"so\".",
+        ] {
+            assert_eq!(classify_status(msg), StatusKind::Info, "{msg}");
+        }
+    }
+
+    #[test]
+    fn fresh_press_ignores_repeats_releases_and_other_keys() {
+        use egui::Key::{Enter, Space};
+        assert!(fresh_press(&[key_event(Space, true, false)], Space));
+        assert!(!fresh_press(&[key_event(Space, true, true)], Space));
+        assert!(!fresh_press(&[key_event(Space, false, false)], Space));
+        assert!(!fresh_press(&[key_event(Enter, true, false)], Space));
+        assert!(!fresh_press(&[], Space));
+    }
+
+    /// Runs real egui frames to confirm egui itself marks a held key's
+    /// OS auto-repeat presses as `repeat` (the backend sends them all with
+    /// `repeat: false`), so holding Space taps exactly once.
+    #[test]
+    fn holding_a_key_counts_as_one_fresh_press_across_frames() {
+        let ctx = egui::Context::default();
+        let frame = |events: Vec<egui::Event>| {
+            let mut fresh = false;
+            let mut pressed = false;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    fresh = ui.input(|i| fresh_press(&i.events, egui::Key::Space));
+                    pressed = ui.input(|i| i.key_pressed(egui::Key::Space));
+                },
+            );
+            // egui 0.37 panics on dropping unapplied texture updates (the
+            // font atlas) - there's no renderer here to apply them.
+            out.textures_delta.clear();
+            (fresh, pressed)
+        };
+        let down = || key_event(egui::Key::Space, true, false);
+        let up = || key_event(egui::Key::Space, false, false);
+
+        assert_eq!(frame(vec![down()]), (true, true), "first press");
+        // OS key-repeat while still held: egui's `key_pressed` fires again
+        // (the bug), `fresh_press` doesn't.
+        assert_eq!(frame(vec![down()]), (false, true), "auto-repeat");
+        assert_eq!(frame(vec![down()]), (false, true), "auto-repeat");
+        assert_eq!(frame(vec![up()]), (false, false), "release");
+        assert_eq!(frame(vec![down()]), (true, true), "next real press");
     }
 
     #[test]

@@ -9,13 +9,12 @@ just *use* it, grab an installer from the
 
 A normal, reasonably current Rust toolchain - install via
 [rustup](https://rustup.rs) if you don't have one. `rustc --version` should
-be **1.88 or newer** (ideally current stable); that floor comes from the
-strictest MSRV among this project's dependencies (`image`/`libloading`).
-**On macOS, use Rust 1.99 for now** - Rust 1.100+ can't compile an old
-macOS-only dependency of the GUI toolkit (`objc2` 0.4.1); CI and releases
-are pinned to 1.99 too. If `cargo build` fails outright, see
-[BUILD_TROUBLESHOOTING.md](../BUILD_TROUBLESHOOTING.md) - it covers this
-and an old toolchain, by far the most common cause.
+be **1.95 or newer** (ideally current stable); that floor comes from the
+strictest MSRV among this project's dependencies (the `egui`/`eframe` 0.37
+GUI toolkit), and `Cargo.toml`'s `rust-version` says so up front. If
+`cargo build` fails outright, see
+[BUILD_TROUBLESHOOTING.md](../BUILD_TROUBLESHOOTING.md) - an old toolchain
+is by far the most common cause.
 
 ## 2. System packages
 

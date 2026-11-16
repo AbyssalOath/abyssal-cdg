@@ -7,6 +7,56 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-16
+
+A faster-timing release: time every word in one listen with the new
+Words tap mode, snap timeline drags onto where words actually start, and
+get a real left-to-right wipe in the `.cdg` instead of words popping on.
+Also fixes held keys repeating taps, and upgrades the GUI toolkit so
+macOS builds work on current Rust again.
+
+### Added
+
+- **Word tap mode**: switch Tap along from **Lines** to **Words** and
+  hold Space for each word (or `|` syllable) while it's sung - press when
+  it starts, let go when it ends. Every word, and each line's start and
+  end, is timed in one listen, with no separate line pass or clicking
+  words in the fine-tune panel. Enter redoes the current line from 2
+  seconds before it, ◀ / ▶ pick a line, and Ctrl+Z undoes a whole line at
+  a time. The big tap button can be held with the mouse too. Remembered
+  per computer.
+- **Snap to vocal onsets on the timeline**: dragging a line or word
+  bubble (or its left edge) snaps its start to the nearest onset - where
+  new sound starts in the audio - shown as ticks while you drag, with the
+  snapped one marked. Hold Shift (or Alt) to drag freely, or untick
+  **🧲 Snap**. Onsets are found from the vocal frequency range of the mix
+  while the waveform loads.
+
+### Changed
+
+- **`.cdg` words now wipe instead of popping**: each word (or syllable)
+  used to change color all at once when it started. It now wipes left to
+  right across the time it's sung - half a letter at a time at 2x size,
+  a letter at a time at normal size - matching the video's wipe, for main
+  and backing lines. Same file size: each piece of a letter is still
+  drawn exactly once, just spread out over the word.
+- **GUI toolkit upgraded** (egui/eframe 0.28 -> 0.37, egui_commonmark
+  0.17 -> 0.26). macOS builds work on current Rust again, so the
+  temporary Rust 1.99 pin is gone from CI and release builds. Building
+  from source now needs **Rust 1.95+** (declared in `Cargo.toml`). The app
+  stays in dark mode even on a light-mode desktop (newer egui otherwise
+  follows the system theme). Remembered side-panel widths may reset
+  once after updating.
+
+### Fixed
+
+- **Holding a key no longer repeats it**: holding Space a moment too long
+  while tapping used to fire extra taps (start, end, start...) and run
+  through lines. Space, Shift+Space, Enter (re-tap), L (loop), the voice
+  keys M/F/D/S/B, ?, F1, Ctrl+S and Ctrl+E now act once per press. Keys
+  where holding is useful still repeat: ← / → seek, `,` / `.` nudge,
+  Ctrl+Z / Ctrl+Y, Delete and Home.
+
 ## [0.2.5] - 2026-11-13
 
 A big usability release: the app now walks you through each song, timing

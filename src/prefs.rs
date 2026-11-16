@@ -41,6 +41,15 @@ pub struct Prefs {
     /// UI size buttons or Ctrl+= / Ctrl+- / Ctrl+0.
     #[serde(default = "default_zoom")]
     pub ui_zoom: f32,
+    /// Tap-along in word mode (one held press per word/syllable) instead of
+    /// line mode (a press for each line's start and end) - remembered, since
+    /// people tend to stick with one way of working.
+    #[serde(default)]
+    pub word_tap_mode: bool,
+    /// Timeline drags snap a bubble's start to the nearest vocal onset
+    /// (hold Alt to drag freely). On by default.
+    #[serde(default = "default_true")]
+    pub snap_to_onsets: bool,
 }
 
 fn default_zoom() -> f32 {
@@ -63,6 +72,8 @@ impl Default for Prefs {
             show_tips: true,
             export_folder: None,
             ui_zoom: 1.0,
+            word_tap_mode: false,
+            snap_to_onsets: true,
         }
     }
 }
@@ -128,6 +139,8 @@ mod tests {
                 show_tips: false,
                 export_folder: Some(PathBuf::from("/music/karaoke")),
                 ui_zoom: 1.5,
+                word_tap_mode: true,
+                snap_to_onsets: false,
             },
         );
         assert_eq!(load(&app_id).tap_latency_ms, 140.0);
@@ -137,6 +150,8 @@ mod tests {
             Some(PathBuf::from("/music/karaoke"))
         );
         assert_eq!(load(&app_id).ui_zoom, 1.5);
+        assert!(load(&app_id).word_tap_mode);
+        assert!(!load(&app_id).snap_to_onsets);
     }
 
     #[test]
@@ -150,6 +165,8 @@ mod tests {
         assert!(p.show_tips);
         assert_eq!(p.export_folder, None);
         assert_eq!(p.ui_zoom, 1.0);
+        assert!(!p.word_tap_mode);
+        assert!(p.snap_to_onsets);
     }
 
     #[test]
@@ -162,6 +179,8 @@ mod tests {
                 show_tips: true,
                 export_folder: None,
                 ui_zoom: 99.0,
+                word_tap_mode: false,
+                snap_to_onsets: true,
             },
         );
         assert_eq!(load(&app_id).tap_latency_ms, MAX_TAP_LATENCY_MS);

@@ -223,6 +223,50 @@ impl DragSession {
             }
         }
     }
+
+    /// [`Self::resolve`], then - for drags that move the *start* (a body
+    /// move or the left edge) - pulls the start onto `snap(start)` (e.g. the
+    /// nearest vocal onset) if that's still within bounds. Ends never snap:
+    /// onsets mark where sound starts, not where it stops. Returns the
+    /// resolved values and the snap target if it was applied.
+    pub fn resolve_snapped(
+        &self,
+        pointer_x: f32,
+        px_per_sec: f32,
+        snap: impl Fn(f64) -> Option<f64>,
+    ) -> ((Option<f64>, Option<f64>), Option<f64>) {
+        let free = self.resolve(pointer_x, px_per_sec);
+        let Some(start) = free.0 else {
+            return (free, None);
+        };
+        let Some(target) = snap(start) else {
+            return (free, None);
+        };
+        let delta = target - self.orig_start;
+        let snapped = match self.mode {
+            DragMode::Body => {
+                let (s, e) = apply_body_drag(self.orig_start, self.orig_end, delta, self.bounds);
+                (Some(s), Some(e))
+            }
+            DragMode::LeftEdge => (
+                Some(apply_left_edge_drag(
+                    self.orig_start,
+                    self.orig_end,
+                    delta,
+                    self.bounds,
+                )),
+                None,
+            ),
+            DragMode::RightEdge => return (free, None),
+        };
+        // Clamped short of the onset by a neighbour or the minimum
+        // length - snapping there would just be a jump, so don't.
+        if snapped.0.is_some_and(|s| (s - target).abs() < 1e-9) {
+            (snapped, Some(target))
+        } else {
+            (free, None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +450,54 @@ mod tests {
         let first = session.resolve(250.0, 40.0);
         let second = session.resolve(250.0, 40.0);
         assert_eq!(first, second);
+    }
+
+    fn session(mode: DragMode) -> DragSession {
+        DragSession::start(
+            mode,
+            10.0,
+            12.0,
+            DragBounds {
+                min_start: 8.0,
+                max_sing_end: 15.0,
+            },
+            0.0,
+        )
+    }
+
+    #[test]
+    fn body_and_left_edge_drags_snap_their_start() {
+        let snap = |t: f64| ((t - 10.6).abs() < 0.2).then_some(10.6);
+        // 100 px/s: pointer +50px = start 10.5, snaps to 10.6.
+        let ((s, e), hit) = session(DragMode::Body).resolve_snapped(50.0, 100.0, snap);
+        assert_eq!(hit, Some(10.6));
+        assert!((s.unwrap() - 10.6).abs() < 1e-9);
+        assert!((e.unwrap() - 12.6).abs() < 1e-9, "body keeps its length");
+        let ((s, e), hit) = session(DragMode::LeftEdge).resolve_snapped(50.0, 100.0, snap);
+        assert_eq!(hit, Some(10.6));
+        assert!((s.unwrap() - 10.6).abs() < 1e-9);
+        assert_eq!(e, None);
+    }
+
+    #[test]
+    fn right_edge_and_far_drags_dont_snap() {
+        let snap = |t: f64| ((t - 10.6).abs() < 0.2).then_some(10.6);
+        let (free, hit) = session(DragMode::RightEdge).resolve_snapped(50.0, 100.0, snap);
+        assert_eq!(hit, None);
+        assert_eq!(free, session(DragMode::RightEdge).resolve(50.0, 100.0));
+        // Pointer at start 11.5 - no onset nearby.
+        let (free, hit) = session(DragMode::Body).resolve_snapped(150.0, 100.0, snap);
+        assert_eq!(hit, None);
+        assert_eq!(free, session(DragMode::Body).resolve(150.0, 100.0));
+    }
+
+    #[test]
+    fn snap_is_skipped_when_bounds_would_clamp_it() {
+        // Onset at 7.9 is before min_start (8.0): stay where the pointer is.
+        let snap = |_: f64| Some(7.9);
+        let (free, hit) = session(DragMode::Body).resolve_snapped(-190.0, 100.0, snap);
+        assert_eq!(hit, None);
+        assert_eq!(free, session(DragMode::Body).resolve(-190.0, 100.0));
     }
 
     #[test]
