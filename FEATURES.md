@@ -58,7 +58,7 @@ Each row has a status dot - amber = not
 timed yet, grey = timed with estimated word timing, green = fine-tuned
 (or a one-word line) - and a progress bar above the table counts them
 ("23/41 timed · 6 estimated · 17 fine-tuned"). A row's Tap / Words /
-Backing / ±0.1s / ✕ buttons appear when you hover it (and stay on the
+Backing / ±0.1s / ✖ buttons appear when you hover it (and stay on the
 line you're tapping, the one open in the fine-tune panel, and any
 checked rows), so a long song isn't a wall of buttons.
 
@@ -86,7 +86,7 @@ that fades after a few seconds (click to dismiss). After an export, a
 ### Tips, UI size and remembered settings
 Untick **💡 Tips** (top panel) and the
 explanations under each control shrink to a one-line summary - hover its
-ⓘ for the full text. It's remembered on this computer, and starts on for
+ℹ for the full text. It's remembered on this computer, and starts on for
 a fresh install so first-time users get the full guidance.
 
 **UI size − 100% +** in the top panel (or
@@ -255,7 +255,7 @@ app - as long as it still exists, and **Choose folder…** opens there.
      instead of guessing. Correcting a value (typing, nudging, or
      dragging) automatically rewinds playback a couple seconds so you can
      immediately hear whether it landed right.
-   - Or skip tapping every word by hand entirely: **"🪄 Auto-align
+   - Or skip tapping every word by hand entirely: **"✨ Auto-align
      words"** shells out to a forced-alignment tool to fill in real,
      audio-derived word timing for every already-timed line in one click
      (see "Auto-aligning word timing" below - it's the closest thing this
@@ -336,6 +336,23 @@ carrying over whatever the previous project had selected.
   left to right across its own sung time, in steps the format can draw:
   half a letter at 2x size, one letter at normal size - the same timing
   as the video's smooth wipe, just in coarser steps.
+
+  **Screen layout** (Export… → under CD+Graphics, saved with the project):
+  - **2 lines (current + next)** - the default: the line being sung, with
+    a dim preview of the next one underneath.
+  - **3-line page** / **4-line page** - the classic professional karaoke
+    look: that many lines on screen at once, stacked top to bottom. As
+    each line finishes, it's erased and its spot is refilled with the
+    line that many lines ahead, so the next few lines are always there to
+    read in advance. A countdown break ends the page; the line after it
+    starts a fresh page from the top. Backing vocals get their own row
+    under the page. Switch the preview to **.cdg (exact)** to see it.
+
+  **Long lines wrap**: a line longer than a `.cdg` row (48 characters) is
+  shown on two rows, split at the word nearest its middle, with exactly
+  the same word timing - your lyrics stay as they are. To pick the break
+  yourself, use the checklist's **Split line** fix. (Backing lines have a
+  single row of their own, so a too-long one is still cut off.)
 - **`.mp4`** is a real video file (AV1 by default, H.264 selectable for
   compatibility - see "Known limitations" below - plus AAC audio, at
   720p, 1080p or 4K, in 16:9 or vertical 9:16 - see "Video export
@@ -344,7 +361,7 @@ carrying over whatever the previous project had selected.
   all. It's a much heavier file and needs `ffmpeg` (bundled with an
   installed copy of the app - see [docs/BUILDING.md](docs/BUILDING.md) for a
   dev build), but it'll look sharp on any screen. Unlike the `.cdg`
-  path (which only has room for one current line + a one-line preview),
+  path (a current line + a one-line preview, or a 3-4 line rolling page),
   the video groups lines into verse-style blocks of up to 5 lines, split
   **exactly wherever you left a blank line in your pasted lyrics** - so if
   you pasted 4 lines, a blank line, then 2 more, you get a 4-line block
@@ -519,7 +536,7 @@ neural network over the audio, not a quick filter pass.
 
 Tapping along sets each line's start/end (two taps), but the word-by-word
 wipe *within* that window is otherwise just an estimate (word count x
-~0.45s/word) until you fine-tune it. "🪄 Auto-align words" (next to "Reset
+~0.45s/word) until you fine-tune it. "✨ Auto-align words" (next to "Reset
 all timing") replaces that estimate - and any earlier manual per-word
 taps - with real, audio-derived timing for every word in every
 already-timed line, in one click. The line's own start/end move to match
@@ -599,8 +616,8 @@ windows, title card duration, block grouping) shared with both exporters.
 verse blocks (up to 5 lines, split on blank lines in your pasted lyrics)
 with a continuous pixel-level wipe - since that's the richer of the two and
 the one most people are timing against. The `.cdg` export is more
-constrained (one current line + a single dim preview line underneath, per
-the format's tiny 300x216 canvas) and won't look identical to the preview
+constrained (one current line + a single dim preview line underneath, or
+a 3-4 line page, per the format's tiny 300x216 canvas) and won't look identical to the preview
 even though the *timing* is identical. If you're targeting `.cdg`
 specifically, switch the preview to **.cdg (exact)** to see its real
 look.
@@ -846,7 +863,7 @@ it and moves playback to just before it.
 - Tapping sets both the start and end of each line (two taps), but the
   word-by-word wipe *within* that window is still an *estimate* by default
   (word count x ~0.45s/word) unless you fine-tune specific words via the
-  "Words" panel or the timeline's word bubbles, or run "🪄 Auto-align
+  "Words" panel or the timeline's word bubbles, or run "✨ Auto-align
   words" (see "Auto-aligning word timing" above) to fill it in from real
   audio instead of guessing. The estimate's constants live at the top of
   `src/lyrics.rs` (`SECONDS_PER_WORD`, `MIN_SING_DURATION`) if you want to

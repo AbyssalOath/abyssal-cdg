@@ -98,25 +98,56 @@ fn line_list(indices: &[usize]) -> String {
     out
 }
 
+/// Lines longer than a `.cdg` row. A main line is wrapped onto the next
+/// row(s) automatically (`export::wrap_for_cdg`), so that's only a note -
+/// splitting it by hand just picks where it breaks. A backing line (one
+/// row of its own, nowhere to wrap to) or a single word that long (no
+/// place to break it) really does get cut off.
 fn cdg_line_length(lines: &[LyricLine], issues: &mut Vec<Issue>) {
     for (i, line) in lines.iter().enumerate() {
-        let len = lyrics::normalize_text(&line.text).chars().count();
-        if len > SAFE_COLS as usize {
-            issues.push(Issue {
-                severity: Severity::Warning,
-                message: format!(
-                    "Line {} is {len} characters - a .cdg row fits {SAFE_COLS}, so the end \
-                     (\"…{}\") gets cut off.",
-                    i + 1,
-                    lyrics::normalize_text(&line.text)
-                        .chars()
-                        .skip(SAFE_COLS as usize)
-                        .collect::<String>()
-                ),
-                line: Some(i),
-                fix: lyrics::best_split_word(&line.text).map(|_| Fix::SplitLine(i)),
-            });
+        let text = lyrics::normalize_text(&line.text);
+        let len = text.chars().count();
+        if len <= SAFE_COLS as usize {
+            continue;
         }
+        let wraps = !line.is_backing
+            && line
+                .text
+                .split_whitespace()
+                .all(|w| lyrics::normalize_text(w).chars().count() <= SAFE_COLS as usize)
+            && lyrics::best_split_word(&line.text).is_some();
+        let (severity, message) = if wraps {
+            (
+                Severity::Note,
+                format!(
+                    "Line {} is {len} characters - more than a .cdg row's {SAFE_COLS}, so \
+                     the .cdg wraps it onto two rows near the middle. Split it yourself to \
+                     choose where it breaks.",
+                    i + 1
+                ),
+            )
+        } else {
+            (
+                Severity::Warning,
+                format!(
+                    "Line {} is {len} characters - a .cdg row fits {SAFE_COLS}, so the end \
+                     (\"…{}\") gets cut off{}.",
+                    i + 1,
+                    text.chars().skip(SAFE_COLS as usize).collect::<String>(),
+                    if line.is_backing {
+                        " (backing lines have one row of their own)"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+        };
+        issues.push(Issue {
+            severity,
+            message,
+            line: Some(i),
+            fix: lyrics::best_split_word(&line.text).map(|_| Fix::SplitLine(i)),
+        });
     }
 }
 
@@ -314,7 +345,9 @@ mod tests {
             .find(|i| i.fix.is_some())
             .expect("long line issue");
         assert_eq!(issue.fix, Some(Fix::SplitLine(0)));
-        assert_eq!(issue.severity, Severity::Warning);
+        // The .cdg wraps it - worth knowing, not wrong.
+        assert_eq!(issue.severity, Severity::Note);
+        assert!(issue.message.contains("wraps"));
         // Not a CDG export - no length warning.
         let issues = run(
             &[timed(&long, 1.0, 5.0)],
@@ -328,6 +361,22 @@ mod tests {
             },
         );
         assert!(issues.iter().all(|i| i.fix.is_none()));
+    }
+
+    #[test]
+    fn long_lines_that_cannot_wrap_are_still_warnings() {
+        // A backing line has only its own row.
+        let mut backing = timed(&"word ".repeat(12), 1.0, 5.0);
+        backing.is_backing = true;
+        let issues = check(&[timed("main", 0.5, 4.0), backing], None);
+        let issue = issues.iter().find(|i| i.line == Some(1)).expect("issue");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert!(issue.message.contains("cut off"));
+        // One word longer than a row has nowhere to break.
+        let huge = format!("hi {}", "x".repeat(50));
+        let issues = check(&[timed(&huge, 1.0, 5.0)], None);
+        let issue = issues.iter().find(|i| i.line == Some(0)).expect("issue");
+        assert_eq!(issue.severity, Severity::Warning);
     }
 
     #[test]

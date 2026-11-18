@@ -1466,7 +1466,7 @@ this crate.
 **Purpose.** Runs a wav2vec2-CTC speech model (via `ort`, loaded through
 `onnxrt.rs`) once per already-timed, multi-word line, restricted to that
 line's own tapped `[start, end)` window (plus a little padding), to fill
-in real audio-derived word timing - "🪄 Auto-align words." Deliberately
+in real audio-derived word timing - "✨ Auto-align words." Deliberately
 per-line rather than one whole-song pass: each call only has to figure
 out where *within a few seconds of audio* a handful of words fall, and a
 mistimed line needs re-tapping regardless of how good alignment is.
@@ -1650,6 +1650,23 @@ once, so a wipe costs no more packets than lighting the word at once.
 `paired_audio_path`/`copy_paired_audio` (the "MP3+G" convention - copying
 the loaded audio next to the export under a matching base filename).
 `render_cdg_with_settings` - the actual top-to-bottom renderer.
+`CdgLayout` (`Classic`/`Page3`/`Page4`, saved per project) - classic uses
+the rows above; the page layouts use `PageGeometry` instead (`PAGE3`:
+slots at rows 2/5/8, backing row 11; `PAGE4`: slots 1/4/7/10, backing row
+14; the countdown stays on row 13 in every layout). `page_line_start` -
+a page layout's line start: the first line of a page redraws the whole
+screen (everything but the backing row) as that page; any other line just
+frees the slot of the line before it, refilling it with the line
+`n` ahead (`page_slot` - slots wrap around within a page).
+`wrap_for_cdg(line)` - runs on every main line before any of that: a line
+over `SAFE_COLS` (48) characters is split at `lyrics::best_split_word`
+(repeatedly, until each piece fits or is one word) into consecutive
+`TimedLine`s whose units are pinned via `word_overrides`/
+`word_end_overrides` to the original's resolved timing, so the wipe is
+unchanged; pieces after the first get `CountdownMode::Suppress` so no
+break/page change can land mid-line. The checklist (`checks.rs`'s
+`cdg_line_length`) mirrors this: a Note for wrapped lines, a Warning only
+for backing lines and unbreakable words.
 
 **Callers/callees.** Called by `main.rs`'s `start_combined_export`. Calls
 `cdg.rs`, `font.rs`, and `lyrics.rs` (`word_timings`, `countdown_window`,
@@ -1664,6 +1681,17 @@ the loaded audio next to the export under a matching base filename).
   early or be silently dropped. Instead the whole backing schedule is
   computed up front and `advance(w, t)` first emits every backing op at or
   before `t`, so both rows' wipes interleave in true time order.
+- **`BackingLane::background` is the page layouts' "draw when there's
+  time" queue.** A refilled slot costs up to ~100 tiles (1/3 s of
+  packets) - drawn all at once at a line's start, it'd push that line's
+  first wipe steps late. Instead the writes are queued, already diffed
+  against the screen, and `drain_background` sends them in place of the
+  filler packets `advance_to` would otherwise pad with - never past the
+  next timed write. Nothing else may draw to a queued tile until it's
+  written: the queue is flushed (as part of the next line's ahead-of-time
+  writes) before any line starts, and dropped before anything that
+  redraws those rows anyway (a page clear, a new page, the outro). In the
+  classic layout it's always empty, so classic output is unchanged.
 - **The CDG palette is 16 slots, and all 16 are used** - 8 via the low
   CLUT (background + 3 voice pairs + preview), 8 via the high CLUT
   (title + artist + screaming, default and backing pairs). There's no room
@@ -2223,7 +2251,7 @@ format.
 
 ### Forced alignment, end to end
 
-Clicking "🪄 Auto-align words" calls `main.rs`'s `start_word_alignment`,
+Clicking "✨ Auto-align words" calls `main.rs`'s `start_word_alignment`,
 which first builds one request per already-timed, *multi-word* line
 (skipping single-word lines - nothing to split), each with a padded
 search window bounded by its neighbors (`align::WINDOW_PAD_SECS`, and
@@ -2490,7 +2518,8 @@ you've read the relevant chapters above.
   (see "How the Modules Talk"), never from `export::Palette` directly.
 - **Layout**: the fixed row constants at the top of `export.rs`
   (`TITLE_ROW`/`CURRENT_ROW`/`BACKING_ROW`/`PREVIEW_ROW`/`COUNTDOWN_ROW`,
-  ...) assume a specific vertical budget within the safe 16-row canvas -
+  ..., plus `PAGE3`/`PAGE4` for the page layouts) assume a specific
+  vertical budget within the safe 16-row canvas -
   moving one means checking every other row it might now collide with,
   especially the 2-row-tall title/current bands.
 - **Palette budget**: this app already uses 14 of CD+G's 16 color slots

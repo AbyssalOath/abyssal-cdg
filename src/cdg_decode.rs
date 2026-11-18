@@ -375,6 +375,7 @@ mod tests {
                 Some("Band"),
                 &TimingSettings::default(),
                 outro,
+                crate::export::CdgLayout::Classic,
             ))
         };
         let outro = Outro {

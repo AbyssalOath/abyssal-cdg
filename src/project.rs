@@ -111,6 +111,10 @@ pub struct ProjectFile {
     /// `#[serde(default)]`) for every project saved before it existed.
     #[serde(default)]
     pub outro: crate::lyrics::OutroSettings,
+    /// The `.cdg` screen layout - classic (via `#[serde(default)]`) for
+    /// every project saved before it existed.
+    #[serde(default)]
+    pub cdg_layout: crate::export::CdgLayout,
     /// Whether the video export/preview shows a small credit line under
     /// the title card - on (via `default_true`, not the usual bare
     /// `#[serde(default)]`, which for a `bool` would silently mean *off*)
@@ -304,6 +308,7 @@ mod tests {
                 text: "Thanks!\nSee you next time".to_string(),
                 show_title: false,
             },
+            cdg_layout: crate::export::CdgLayout::Page4,
             video_style: VideoStyle {
                 orientation: crate::video::Orientation::Portrait,
                 lyric_size_pct: 130,
@@ -368,6 +373,7 @@ mod tests {
         assert_eq!(loaded.video_codec, VideoCodec::default());
         assert_eq!(loaded.video_style, VideoStyle::default());
         assert_eq!(loaded.outro, crate::lyrics::OutroSettings::default());
+        assert_eq!(loaded.cdg_layout, crate::export::CdgLayout::Classic);
         assert!(loaded.show_credit_line);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -468,6 +474,7 @@ mod tests {
             video_codec: VideoCodec::default(),
             video_style: VideoStyle::default(),
             outro: crate::lyrics::OutroSettings::default(),
+            cdg_layout: crate::export::CdgLayout::default(),
             show_credit_line: true,
             background: None,
             background_fit: BackgroundFit::default(),

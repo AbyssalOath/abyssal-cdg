@@ -116,7 +116,6 @@ impl CdgWriter {
         self.screen.get(idx).copied().flatten() != Some(canonical_tile(color0, color1, pixels))
     }
 
-    #[allow(dead_code)]
     pub fn len_packets(&self) -> usize {
         self.packets.len()
     }

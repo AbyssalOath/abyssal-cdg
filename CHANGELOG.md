@@ -7,6 +7,40 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-11-18
+
+A `.cdg` layout release: show a whole 3- or 4-line page at once, the
+classic professional karaoke look, and long lines now wrap onto the next
+row instead of getting cut off. Also fixes every icon showing as an empty
+box in v0.2.6 (most visible in the Linux AppImage).
+
+### Added
+
+- **`.cdg` page layouts**: besides the classic current line + next-line
+  preview, the `.cdg` can now show a **3- or 4-line page** - the classic
+  professional karaoke look. Each line is replaced by an upcoming one as
+  soon as it's sung, so the next few lines are always on screen; a
+  countdown break starts a fresh page. Pick it under CD+Graphics in the
+  Export dialog (saved with the project); the preview's .cdg (exact) mode
+  shows it. Redrawing lines never delays a highlight - it's fitted into
+  the gaps between wipe steps.
+- **Long `.cdg` lines wrap instead of getting cut off**: a lyric line
+  longer than a `.cdg` row (48 characters) is split onto two rows at the
+  word nearest its middle, keeping its exact word timing - in both the
+  classic and page layouts. Your lyrics aren't changed; the pre-export
+  checklist now notes it (with the same one-click Split line fix to choose
+  the break yourself) instead of warning. Backing lines and single words
+  longer than a row still get cut off and still warn.
+
+### Fixed
+
+- **Icons showing as empty boxes** (v0.2.6 regression, most visible in the
+  Linux AppImage): the egui 0.37 upgrade made its bundled emoji/icon fonts
+  opt-in, so every button and label icon (Play, Undo, Save, ♪, ...) drew as
+  a blank box on systems without an emoji font. They're bundled again. Three
+  icons that the bundled fonts never covered (the Auto-align wand, the word
+  delete ✕ and the help-text ⓘ) now use ✨, ✖ and ℹ instead.
+
 ## [0.2.6] - 2026-11-16
 
 A faster-timing release: time every word in one listen with the new

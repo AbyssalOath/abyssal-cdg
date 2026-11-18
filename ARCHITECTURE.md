@@ -98,6 +98,14 @@ export.rs    The ".cdg renderer": lays out lines/words/countdown dots on the CDG
              the main lines. Each word wipes left to right one tile column at a
              time across its sung window (`unit_wipe_columns`) - half a letter
              per step at 2x - rather than changing color all at once.
+             `CdgLayout` picks classic (current line + preview) or a 3/4-line
+             page (`PageGeometry` slots, rolling refill as lines finish, new
+             page after each countdown break); slot refills ride the
+             BackingLane as low-priority `background` tile writes, sent in
+             place of filler packets so they never delay a wipe.
+             `wrap_for_cdg` first splits main lines over 48 chars at their
+             middle word into consecutive lines pinned to the original's
+             per-unit timing (countdown suppressed between the pieces).
 video.rs     The "video renderer": an independent RGB24 frame renderer (via
              `ab_glyph` for anti-aliased text) piped into an `ffmpeg` subprocess
              (this project's own bundled LGPL build, not a system install - see
@@ -161,7 +169,7 @@ onnxrt.rs    Locates and loads the ONNX Runtime shared library itself (not a
 align.rs     Runs a wav2vec2-CTC speech model natively (via `ort`, same as
              vocals.rs) once per already-timed line, restricted to that line's own
              tapped window, to fill in real word-level timing via forced alignment
-             - "🪄 Auto-align words". main.rs's `start_word_alignment` isolates
+             - "✨ Auto-align words". main.rs's `start_word_alignment` isolates
              vocals first (`vocals::separate_vocals_to_temp_wav`) and aligns
              against that stem instead of the full mix - the CTC model tracks
              singing more reliably without instrumentation underneath it - falling

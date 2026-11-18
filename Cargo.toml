@@ -1,6 +1,6 @@
 [package]
 name = "abyssal-cdg"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 # Strictest MSRV among dependencies (egui/eframe 0.37) - see
 # BUILD_TROUBLESHOOTING.md.
@@ -16,7 +16,12 @@ license-file = "LICENSE"
 # (via egui-winit) but 0.37 makes them opt-in eframe features - without
 # "clipboard", pasting lyrics would silently stop working. Needs Rust 1.95+.
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "wayland", "x11", "clipboard", "links"] }
-egui = "0.37"
+# "monochrome_emoji_fonts": egui 0.37 moved its bundled emoji/icon fonts
+# (NotoEmoji + emoji-icon-font) behind this opt-in feature - without it
+# every icon glyph in the UI (⏯ ↶ 🎵 ...) renders as a tofu box on machines
+# with no system emoji font, e.g. the AppImage. eframe doesn't forward the
+# feature, so it's enabled here and unified into eframe's egui.
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 # Renders the in-app "Codex" documentation browser (see codex.rs) - must
 # track egui's version: 0.26 is the release built against egui 0.37.
 egui_commonmark = "0.26"

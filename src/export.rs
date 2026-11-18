@@ -13,6 +13,21 @@
 //! line's words light up left-to-right in sync with its estimated singing
 //! duration (a classic color-wipe), using [`crate::lyrics::word_timings`].
 //!
+//! That's the [`CdgLayout::Classic`] layout. The page layouts
+//! ([`CdgLayout::Page3`]/[`CdgLayout::Page4`]) instead show 3 or 4 lines
+//! at once, stacked in fixed "slots" (see [`PageGeometry`]), the classic
+//! professional karaoke look: the page is drawn when its first line starts,
+//! and as each line finishes being sung, its slot is erased and refilled
+//! with the line that many lines ahead - so the next few lines are always
+//! readable in advance. A countdown break ends the page; the next line
+//! starts a fresh one from the top slot. The refills are drawn in the gaps
+//! between wipe steps (see [`BackingLane::background`]), so they never
+//! push a highlight late. Backing vocals get a row below the page.
+//!
+//! In every layout, a main line too long for one row (more than
+//! [`SAFE_COLS`] characters) is wrapped onto consecutive lines at a word
+//! boundary first (see [`wrap_for_cdg`]) instead of being cut off.
+//!
 //! Text size: CDG's native font is only 6 pixels wide, which reads as
 //! quite small/blocky on modern displays. Since the format's canvas is a
 //! fixed 300x216 pixels no matter what (there's no "resolution setting" -
@@ -32,11 +47,10 @@
 
 use crate::cdg::{CdgColor, CdgWriter, TilePixels, BLANK_TILE, SAFE_COLS};
 use crate::font;
-#[cfg(test)]
-use crate::lyrics::CountdownMode;
 use crate::lyrics::{
     backing_display_windows, countdown_window, countdown_window_between, effective_singer_label,
-    singer_legend, word_timings, Singer, TimedLine, TimingSettings, SUNG_LINGER_SECS,
+    singer_legend, word_timings, CountdownMode, Singer, TimedLine, TimingSettings,
+    SUNG_LINGER_SECS,
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -61,6 +75,63 @@ const CURRENT_ROW: u8 = 6;
 const BACKING_ROW: u8 = 8;
 const PREVIEW_ROW: u8 = 10;
 const COUNTDOWN_ROW: u8 = 13;
+
+/// How the `.cdg` screen is laid out - see the module docs. Saved per
+/// project; `Classic` for every project saved before this existed.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum CdgLayout {
+    /// The current line plus a dim preview of the next one.
+    #[default]
+    Classic,
+    /// 3 lines on screen at once, refilled as they're sung.
+    Page3,
+    /// 4 lines on screen at once, refilled as they're sung.
+    Page4,
+}
+
+impl CdgLayout {
+    pub const ALL: [CdgLayout; 3] = [CdgLayout::Classic, CdgLayout::Page3, CdgLayout::Page4];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CdgLayout::Classic => "2 lines (current + next)",
+            CdgLayout::Page3 => "3-line page",
+            CdgLayout::Page4 => "4-line page",
+        }
+    }
+
+    fn page(self) -> Option<&'static PageGeometry> {
+        match self {
+            CdgLayout::Classic => None,
+            CdgLayout::Page3 => Some(&PAGE3),
+            CdgLayout::Page4 => Some(&PAGE4),
+        }
+    }
+}
+
+/// Where a page layout's lines go: one 2-row band per slot (room for 2x
+/// text), with a blank row between slots, and the backing lane's own row.
+/// [`COUNTDOWN_ROW`] stays where it is in every layout - no slot or
+/// backing row uses it, so the countdown dots never collide with a page
+/// being drawn early.
+struct PageGeometry {
+    slots: &'static [u8],
+    backing_row: u8,
+}
+
+/// Rows 2-3, 5-6, 8-9; backing at 11 - roughly centered above the countdown.
+const PAGE3: PageGeometry = PageGeometry {
+    slots: &[2, 5, 8],
+    backing_row: 11,
+};
+/// Rows 1-2, 4-5, 7-8, 10-11; backing at 14 (just under the countdown row,
+/// which is empty while lines are being sung).
+const PAGE4: PageGeometry = PageGeometry {
+    slots: &[1, 4, 7, 10],
+    backing_row: 14,
+};
 
 /// Preferred (largest) scale for the title card and current line; both
 /// fall back to 1x automatically if the text is too long to fit at this size.
@@ -386,15 +457,27 @@ enum BackingOp {
 /// [`Self::advance`], which first emits whatever backing operations fall
 /// before that point. The two schedules interleave exactly as they would in
 /// real time.
+///
+/// It also carries [`Self::background`]: low-priority tile writes (a page
+/// layout's slot refills) that go out in place of filler packets whenever
+/// the writer is advanced - in the gaps between wipe steps - instead of
+/// all at once ahead of a line, where they'd make it late.
 struct BackingLane {
     layouts: Vec<LineLayout>,
     unsung: Vec<u8>,
     ops: Vec<(f64, BackingOp)>,
     next: usize,
+    /// The row backing lines draw on ([`BACKING_ROW`], or a page layout's
+    /// own [`PageGeometry::backing_row`]).
+    row: u8,
+    /// Pending low-priority tile writes, already diffed against the
+    /// screen. Nothing else may draw to their tiles until they're written
+    /// (or dropped, when whatever they'd draw gets cleared anyway).
+    background: std::collections::VecDeque<TileWrite>,
 }
 
 impl BackingLane {
-    fn new(track: &[TimedLine], palette: &Palette) -> Self {
+    fn new(track: &[TimedLine], palette: &Palette, row: u8) -> Self {
         let windows = backing_display_windows(track);
         let mut layouts = Vec::with_capacity(track.len());
         let mut unsung = Vec::with_capacity(track.len());
@@ -446,28 +529,34 @@ impl BackingLane {
             unsung,
             ops,
             next: 0,
+            row,
+            background: std::collections::VecDeque::new(),
         }
     }
 
     /// Advances `w` to `t`, emitting every pending backing-lane operation
-    /// scheduled at or before `t` along the way.
+    /// scheduled at or before `t` along the way (and background writes in
+    /// the gaps between them).
     fn advance(&mut self, w: &mut CdgWriter, t: f64) {
         self.emit_until(w, t);
+        drain_background(&mut self.background, w, t);
         w.advance_to(t);
     }
 
     /// Emits every pending operation scheduled at or before `t`, without
     /// moving the writer past the last one emitted.
     fn emit_until(&mut self, w: &mut CdgWriter, t: f64) {
-        while let Some((at, op)) = self.ops.get(self.next) {
-            if *at > t {
+        while let Some(&(at, _)) = self.ops.get(self.next) {
+            if at > t {
                 break;
             }
-            w.advance_to(*at);
-            match *op {
+            drain_background(&mut self.background, w, at);
+            w.advance_to(at);
+            let row = self.row;
+            match self.ops[self.next].1 {
                 BackingOp::Show(k) => {
-                    clear_row(w, BACKING_ROW);
-                    draw_row_scaled(w, BACKING_ROW, &self.layouts[k], BG, self.unsung[k]);
+                    clear_row(w, row);
+                    draw_row_scaled(w, row, &self.layouts[k], BG, self.unsung[k]);
                 }
                 BackingOp::Highlight {
                     k,
@@ -476,22 +565,94 @@ impl BackingLane {
                     tc,
                     color,
                 } => {
-                    draw_char_column_at(
-                        w,
-                        BACKING_ROW,
-                        &self.layouts[k],
-                        char_idx,
-                        ch,
-                        tc,
-                        BG,
-                        color,
-                    );
+                    draw_char_column_at(w, row, &self.layouts[k], char_idx, ch, tc, BG, color);
                 }
-                BackingOp::Clear => clear_row(w, BACKING_ROW),
+                BackingOp::Clear => clear_row(w, row),
             }
             self.next += 1;
         }
     }
+}
+
+/// Writes queued background tiles in place of the filler packets that
+/// would otherwise pad the stream up to `until` - never past it, so a
+/// timed write scheduled at `until` still lands on time.
+fn drain_background(
+    queue: &mut std::collections::VecDeque<TileWrite>,
+    w: &mut CdgWriter,
+    until: f64,
+) {
+    let until_packets = (until * crate::cdg::PACKETS_PER_SEC).round() as usize;
+    while w.len_packets() < until_packets {
+        let Some((r, c, c0, c1, px)) = queue.pop_front() else {
+            break;
+        };
+        w.tile_block(r, c, c0, c1, &px);
+    }
+}
+
+/// A main line, split into lines that each fit one `.cdg` row: a line
+/// longer than [`SAFE_COLS`] characters is split at the word boundary
+/// nearest its middle ([`crate::lyrics::best_split_word`] - the same point
+/// the checklist's "Split line" fix uses), repeatedly, until every piece
+/// fits or is a single word (which still gets clipped - there's nowhere to
+/// break it). The user's lyrics are untouched; this only changes what the
+/// `.cdg` draws.
+///
+/// Every piece's units are pinned (as manual start/end overrides) to the
+/// original line's resolved word timing, so the wipe is exactly what it
+/// would have been on one line. A piece runs from its first unit's start
+/// to the next piece's start (the last keeps the line's own end and
+/// `sing_end`), and the pieces after the first suppress the countdown -
+/// they're one sung line, never a break, so no blank screen or page
+/// change lands between them.
+fn wrap_for_cdg(line: &TimedLine) -> Vec<TimedLine> {
+    let fits = crate::lyrics::normalize_text(&line.text).chars().count() <= SAFE_COLS as usize;
+    let split = if fits {
+        None
+    } else {
+        crate::lyrics::best_split_word(&line.text)
+    };
+    let Some(k) = split else {
+        return vec![line.clone()];
+    };
+    let words: Vec<&str> = line.text.split_whitespace().collect();
+    let units_before: usize = words[..k]
+        .iter()
+        .map(|w| crate::lyrics::timing_units(w).len())
+        .sum();
+    let timings = word_timings(line);
+    let pinned = |range: std::ops::Range<usize>| -> (Vec<Option<f64>>, Vec<Option<f64>>) {
+        timings[range]
+            .iter()
+            .map(|t| (Some(t.highlight_at), Some(t.held_until)))
+            .unzip()
+    };
+    let split_time = timings
+        .get(units_before)
+        .map_or(line.sing_end, |t| t.highlight_at)
+        .clamp(line.start, line.end);
+
+    let mut first = line.clone();
+    first.text = words[..k].join(" ");
+    first.end = split_time;
+    first.sing_end = timings[..units_before]
+        .last()
+        .map_or(split_time, |t| t.held_until)
+        .clamp(line.start, split_time);
+    (first.word_overrides, first.word_end_overrides) = pinned(0..units_before);
+
+    let mut second = line.clone();
+    second.text = words[k..].join(" ");
+    second.start = split_time;
+    second.sing_end = line.sing_end.clamp(split_time, line.end);
+    second.starts_new_block = false;
+    second.countdown_mode = CountdownMode::Suppress;
+    (second.word_overrides, second.word_end_overrides) = pinned(units_before..timings.len());
+
+    let mut out = wrap_for_cdg(&first);
+    out.extend(wrap_for_cdg(&second));
+    out
 }
 
 /// Lay out `text` at `preferred_scale`, automatically falling back to 1x
@@ -906,6 +1067,118 @@ fn schedule_countdown_dots(
     }
 }
 
+/// A page layout's slot row for line `i` (see [`PageGeometry`]): lines fill
+/// the slots top to bottom from the first line of their page, wrapping
+/// around - line `k` of a page reuses the slot line `k - n` just left.
+fn page_slot(page: &PageGeometry, page_first: &[usize], i: usize) -> u8 {
+    page.slots[(i - page_first[i]) % page.slots.len()]
+}
+
+/// What a page layout's slot for line `i` shows before it's sung: its
+/// layout and unsung color.
+fn page_line(timed_lines: &[TimedLine], i: usize, palette: &Palette) -> (LineLayout, u8) {
+    let line = &timed_lines[i];
+    (
+        layout_line_scaled(&line.text, PREFERRED_SCALE),
+        palette.singer_colors(line.singer).0,
+    )
+}
+
+/// The page layouts' equivalent of the classic layout's line-start draw:
+/// gets line `i` on screen by `line.start` (writing early by however long
+/// the drawing takes) and returns its slot row.
+///
+/// - First line of a page: the whole screen becomes the new page - its
+///   first `n` lines in their slots, every other row blank (title card,
+///   countdown, whatever's left), except the backing row. If drawing all of
+///   that ahead of time would have to start before the writer's current
+///   position, only the first line (and the clears) go ahead of time and
+///   the other slots are queued as background writes.
+/// - Any other line: it's already on screen (drawn with the page, or by a
+///   refill queued when the line `n` before it finished) - any refills
+///   still queued are flushed now, so it's guaranteed there, and then the
+///   slot of the line that was just sung gets refilled with the line `n`
+///   ahead (or blanked, at the end of the page) in the background.
+#[allow(clippy::too_many_arguments)]
+fn page_line_start(
+    w: &mut CdgWriter,
+    lane: &mut BackingLane,
+    page: &PageGeometry,
+    timed_lines: &[TimedLine],
+    page_first: &[usize],
+    i: usize,
+    palette: &Palette,
+) -> u8 {
+    let n = page.slots.len();
+    let pps = crate::cdg::PACKETS_PER_SEC;
+    let start = timed_lines[i].start;
+    let slot = page_slot(page, page_first, i);
+    if page_first[i] == i {
+        lane.background.clear();
+        let mut urgent: Vec<TileWrite> = Vec::new();
+        let mut rest: Vec<TileWrite> = Vec::new();
+        let mut slot_rows = vec![false; crate::cdg::SAFE_ROWS as usize];
+        for k in 0..n {
+            let row = page.slots[k];
+            slot_rows[row as usize] = true;
+            slot_rows[row as usize + 1] = true;
+            let line = (i + k < timed_lines.len() && page_first[i + k] == i)
+                .then(|| page_line(timed_lines, i + k, palette));
+            let writes = band_writes(
+                w,
+                row,
+                PREFERRED_SCALE,
+                line.as_ref().map(|(l, _)| l),
+                line.as_ref().map_or(BG, |&(_, c)| c),
+            );
+            if k == 0 {
+                urgent.extend(writes);
+            } else {
+                rest.extend(writes);
+            }
+        }
+        for row in 0..crate::cdg::SAFE_ROWS {
+            if !slot_rows[row as usize] && row != page.backing_row {
+                urgent.extend(band_writes(w, row, 1, None, BG));
+            }
+        }
+        let all_ahead = start - (urgent.len() + rest.len()) as f64 / pps;
+        if all_ahead >= w.current_time_secs() {
+            urgent.append(&mut rest);
+        }
+        lane.advance(w, (start - urgent.len() as f64 / pps).max(0.0));
+        apply_writes(w, &urgent);
+        lane.background.extend(rest);
+    } else {
+        let mut writes: Vec<TileWrite> = lane.background.drain(..).collect();
+        // Normally nothing: the line was drawn by its refill.
+        let (layout, unsung) = page_line(timed_lines, i, palette);
+        let queued: std::collections::HashSet<(u8, u8)> =
+            writes.iter().map(|t| (t.0, t.1)).collect();
+        writes.extend(
+            band_writes(w, slot, PREFERRED_SCALE, Some(&layout), unsung)
+                .into_iter()
+                .filter(|t| !queued.contains(&(t.0, t.1))),
+        );
+        lane.advance(w, (start - writes.len() as f64 / pps).max(0.0));
+        apply_writes(w, &writes);
+
+        let prev = i - 1;
+        let refill = prev + n;
+        let next = (refill < timed_lines.len() && page_first[refill] == page_first[prev])
+            .then(|| page_line(timed_lines, refill, palette));
+        let refill_writes = band_writes(
+            w,
+            page_slot(page, page_first, prev),
+            PREFERRED_SCALE,
+            next.as_ref().map(|(l, _)| l),
+            next.as_ref().map_or(BG, |&(_, c)| c),
+        );
+        lane.background.extend(refill_writes);
+    }
+    slot
+}
+
 /// Same as [`render_cdg_with_settings`], using [`TimingSettings::default`] -
 /// kept as its own entry point so the many existing callers/tests that
 /// don't care about custom timing settings don't all need updating just
@@ -930,13 +1203,14 @@ pub fn render_cdg(
         artist,
         &TimingSettings::default(),
         None,
+        CdgLayout::Classic,
     )
 }
 
 /// Render a complete karaoke CDG stream, padded to `total_duration` seconds.
 /// `backing_track` is the resolved backing track (see
 /// [`crate::lyrics::resolve_backing_track`]), drawn on its own row
-/// concurrently with `timed_lines` (the main track).
+/// concurrently with `timed_lines` (the main track), laid out per `layout`.
 #[allow(clippy::too_many_arguments)]
 pub fn render_cdg_with_settings(
     timed_lines: &[TimedLine],
@@ -947,9 +1221,28 @@ pub fn render_cdg_with_settings(
     artist: Option<&str>,
     timing_settings: &TimingSettings,
     outro: Option<&Outro>,
+    layout: CdgLayout,
 ) -> Vec<u8> {
+    let wrapped: Vec<TimedLine> = timed_lines.iter().flat_map(wrap_for_cdg).collect();
+    let timed_lines = wrapped.as_slice();
     let mut w = CdgWriter::new();
-    let mut lane = BackingLane::new(backing_track, palette);
+    let page = layout.page();
+    let backing_row = page.map_or(BACKING_ROW, |p| p.backing_row);
+    let mut lane = BackingLane::new(backing_track, palette, backing_row);
+    // Page layouts: the first line of each line's page (a page runs from
+    // one countdown break to the next - the same breaks the loop below
+    // blanks the screen for).
+    let mut page_first: Vec<usize> = Vec::with_capacity(timed_lines.len());
+    for i in 0..timed_lines.len() {
+        let starts_page = i == 0
+            || countdown_window(
+                &timed_lines[i - 1],
+                timed_lines[i].countdown_mode,
+                timing_settings,
+            )
+            .is_some();
+        page_first.push(if starts_page { i } else { page_first[i - 1] });
+    }
 
     w.load_color_table(&palette.low_clut(), false);
     w.load_color_table(&palette.high_clut(), true);
@@ -1030,16 +1323,31 @@ pub fn render_cdg_with_settings(
         // start that many packets *before* `line.start` - otherwise the
         // line (and its first word's highlight, queued behind it) would
         // land late by however long the drawing takes.
-        let mut writes = band_writes(&w, CURRENT_ROW, PREFERRED_SCALE, Some(&layout), unsung_idx);
-        writes.extend(band_writes(&w, COUNTDOWN_ROW, 1, None, BG));
-        if i == 0 && card_clear_with_first_line {
-            writes.extend(band_writes(&w, TITLE_ROW, PREFERRED_SCALE, None, BG));
-            writes.extend(band_writes(&w, ARTIST_ROW, 1, None, BG));
-            writes.extend(band_writes(&w, LEGEND_ROW, 1, None, BG));
-        }
-        let lead = writes.len() as f64 / crate::cdg::PACKETS_PER_SEC;
-        lane.advance(&mut w, (line.start - lead).max(0.0));
-        apply_writes(&mut w, &writes);
+        let band_row = match page {
+            None => {
+                let mut writes =
+                    band_writes(&w, CURRENT_ROW, PREFERRED_SCALE, Some(&layout), unsung_idx);
+                writes.extend(band_writes(&w, COUNTDOWN_ROW, 1, None, BG));
+                if i == 0 && card_clear_with_first_line {
+                    writes.extend(band_writes(&w, TITLE_ROW, PREFERRED_SCALE, None, BG));
+                    writes.extend(band_writes(&w, ARTIST_ROW, 1, None, BG));
+                    writes.extend(band_writes(&w, LEGEND_ROW, 1, None, BG));
+                }
+                let lead = writes.len() as f64 / crate::cdg::PACKETS_PER_SEC;
+                lane.advance(&mut w, (line.start - lead).max(0.0));
+                apply_writes(&mut w, &writes);
+                CURRENT_ROW
+            }
+            Some(page) => page_line_start(
+                &mut w,
+                &mut lane,
+                page,
+                timed_lines,
+                &page_first,
+                i,
+                palette,
+            ),
+        };
 
         // The dim next-line preview isn't needed at the line's exact start,
         // so it's drawn just after the first word lights (below) rather
@@ -1075,7 +1383,7 @@ pub fn render_cdg_with_settings(
         events.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
         let first_at = events.first().map(|e| e.at);
         for ev in &events {
-            if !preview_drawn && Some(ev.at) != first_at {
+            if page.is_none() && !preview_drawn && Some(ev.at) != first_at {
                 let writes = band_writes(&w, PREVIEW_ROW, 1, next_layout.as_ref(), PREVIEW);
                 apply_writes(&mut w, &writes);
                 preview_drawn = true;
@@ -1083,7 +1391,7 @@ pub fn render_cdg_with_settings(
             lane.advance(&mut w, ev.at);
             draw_char_column_at(
                 &mut w,
-                CURRENT_ROW,
+                band_row,
                 &layout,
                 ev.char_idx,
                 ev.ch,
@@ -1093,7 +1401,7 @@ pub fn render_cdg_with_settings(
             );
         }
 
-        if !preview_drawn {
+        if page.is_none() && !preview_drawn {
             let writes = band_writes(&w, PREVIEW_ROW, 1, next_layout.as_ref(), PREVIEW);
             apply_writes(&mut w, &writes);
         }
@@ -1110,8 +1418,10 @@ pub fn render_cdg_with_settings(
             // clear it as soon as this line is done being sung, so the
             // screen reads as "done, waiting" and then the countdown dots,
             // rather than showing a line that's still a break away.
-            lane.advance(&mut w, line.sing_end);
-            clear_row(&mut w, PREVIEW_ROW);
+            if page.is_none() {
+                lane.advance(&mut w, line.sing_end);
+                clear_row(&mut w, PREVIEW_ROW);
+            }
 
             // Let the just-finished line linger fully highlighted for a
             // bit, then clear it too (or immediately, if the break is short
@@ -1120,7 +1430,18 @@ pub fn render_cdg_with_settings(
             // countdown appears, instead of sitting there the whole time.
             let blank_at = (line.sing_end + SUNG_LINGER_SECS).min(cd_start);
             lane.advance(&mut w, blank_at);
-            clear_band(&mut w, CURRENT_ROW, PREFERRED_SCALE);
+            match page {
+                None => clear_band(&mut w, CURRENT_ROW, PREFERRED_SCALE),
+                Some(page) => {
+                    // Whatever refills haven't gone out yet would only be
+                    // erased again - drop them and clear the whole page.
+                    lane.background.clear();
+                    for &slot in page.slots {
+                        let writes = band_writes(&w, slot, PREFERRED_SCALE, None, BG);
+                        apply_writes(&mut w, &writes);
+                    }
+                }
+            }
 
             // Only actually draw the countdown dots if there's a real next
             // line to count into - for the last line of the song, this same
@@ -1139,6 +1460,7 @@ pub fn render_cdg_with_settings(
     // (main and backing) is done - see `outro_window`.
     if let Some(outro) = outro {
         lane.advance(&mut w, outro.start);
+        lane.background.clear(); // the outro redraws every row anyway
         draw_cdg_outro(&mut w, outro, title, artist);
     }
 
@@ -1640,6 +1962,7 @@ mod tests {
             None,
             &settings,
             None,
+            CdgLayout::Classic,
         )
     }
 
@@ -1720,5 +2043,284 @@ mod tests {
         );
         assert_eq!(p.high_clut()[6].r, p.backing_unsung.r);
         assert_eq!(p.high_clut()[7].b, p.backing_highlight.b);
+    }
+
+    // ---- Page layouts ----
+
+    fn render_layout(lines: &[LyricLine], total: f64, layout: CdgLayout) -> Vec<u8> {
+        let settings = TimingSettings::default();
+        let timed = crate::lyrics::resolve_timing_with_settings(lines, Some(total), &settings);
+        let backing = crate::lyrics::resolve_backing_track(lines, &settings);
+        render_cdg_with_settings(
+            &timed,
+            &backing,
+            total,
+            &Palette::default(),
+            None,
+            None,
+            &settings,
+            None,
+            layout,
+        )
+    }
+
+    fn timed_lines(texts_and_starts: &[(&str, f64)]) -> Vec<LyricLine> {
+        texts_and_starts
+            .iter()
+            .map(|&(t, s)| {
+                let mut l = LyricLine::new(t);
+                l.start = Some(s);
+                l
+            })
+            .collect()
+    }
+
+    /// The decoded screen at `t`: for each safe row, whether anything
+    /// other than background is drawn on it.
+    fn inked_rows(bytes: &[u8], t: f64) -> Vec<bool> {
+        let mut pb = crate::cdg_decode::CdgPlayback::new(bytes.to_vec());
+        pb.seek(t);
+        let rgba = pb.rgba();
+        let px = |x: usize, y: usize| &rgba[(y * crate::cdg_decode::WIDTH + x) * 4..][..4];
+        let bg = px(0, 0).to_vec();
+        (0..crate::cdg::SAFE_ROWS as usize)
+            .map(|r| {
+                let y0 = (r + crate::cdg::SAFE_ROW_OFFSET as usize) * 12;
+                (y0..y0 + 12).any(|y| (6..294).any(|x| px(x, y) != bg.as_slice()))
+            })
+            .collect()
+    }
+
+    /// The decoded pixels of one safe row at `t`.
+    fn row_pixels(bytes: &[u8], t: f64, row: u8) -> Vec<u8> {
+        let mut pb = crate::cdg_decode::CdgPlayback::new(bytes.to_vec());
+        pb.seek(t);
+        let rgba = pb.rgba();
+        let y0 = (row + crate::cdg::SAFE_ROW_OFFSET) as usize * 12;
+        rgba[y0 * crate::cdg_decode::WIDTH * 4..(y0 + 12) * crate::cdg_decode::WIDTH * 4].to_vec()
+    }
+
+    fn five_lines() -> Vec<LyricLine> {
+        timed_lines(&[
+            ("one two three", 1.0),
+            ("four five six", 4.0),
+            ("seven eight", 7.0),
+            ("nine ten", 10.0),
+            ("eleven twelve", 13.0),
+        ])
+    }
+
+    #[test]
+    fn page_layout_shows_the_upcoming_lines_in_their_slots() {
+        let bytes = render_layout(&five_lines(), 20.0, CdgLayout::Page4);
+        let rows = inked_rows(&bytes, 2.0);
+        for slot in PAGE4.slots {
+            assert!(
+                rows[*slot as usize],
+                "slot at row {slot} should show a line"
+            );
+        }
+        // Nothing where the classic layout's preview would be... other
+        // than the page's own slots.
+        assert!(!rows[COUNTDOWN_ROW as usize]);
+        // The 3-line page: exactly its 3 slots.
+        let bytes = render_layout(&five_lines(), 20.0, CdgLayout::Page3);
+        let rows = inked_rows(&bytes, 2.0);
+        let inked: Vec<usize> = (0..rows.len()).filter(|&r| rows[r]).collect();
+        assert_eq!(inked, vec![2, 3, 5, 6, 8, 9], "3-line page rows (2x text)");
+    }
+
+    #[test]
+    fn page_layout_refills_a_sung_lines_slot_with_the_line_n_ahead() {
+        let lines = five_lines();
+        let bytes = render_layout(&lines, 20.0, CdgLayout::Page4);
+        let top = PAGE4.slots[0];
+        // While line 1 is sung, slot 0 holds line 1 ("one two three")...
+        let during_first = row_pixels(&bytes, 2.0, top);
+        // ...and once line 2 has started, line 5 ("eleven twelve") instead.
+        let after = row_pixels(&bytes, 5.5, top);
+        assert_ne!(during_first, after, "slot 0 should have been refilled");
+        assert!(
+            inked_rows(&bytes, 5.5)[top as usize],
+            "...with the 5th line, not blanked"
+        );
+        // Line 2's slot has no line 6 to take - it's blanked once line 3
+        // starts.
+        assert!(inked_rows(&bytes, 6.5)[PAGE4.slots[1] as usize]);
+        assert!(!inked_rows(&bytes, 8.0)[PAGE4.slots[1] as usize]);
+    }
+
+    #[test]
+    fn page_layout_starts_a_fresh_page_after_a_countdown_break() {
+        let lines = timed_lines(&[
+            ("before the break", 1.0),
+            ("still before", 4.0),
+            ("after the break", 30.0),
+            ("last one", 33.0),
+        ]);
+        let bytes = render_layout(&lines, 40.0, CdgLayout::Page4);
+        // Before the break: lines 1-2 in slots 0-1, and the post-break
+        // lines aren't shown a break early.
+        let rows = inked_rows(&bytes, 2.0);
+        assert!(rows[1] && rows[4]);
+        assert!(!rows[7] && !rows[10]);
+        // Mid-break: the page is gone.
+        let rows = inked_rows(&bytes, 15.0);
+        assert!(PAGE4.slots.iter().all(|&s| !rows[s as usize]));
+        // After: line 3 starts the new page at the top.
+        let rows = inked_rows(&bytes, 30.5);
+        assert!(rows[1] && rows[4], "new page from the top slot");
+        assert!(!rows[7] && !rows[10]);
+    }
+
+    #[test]
+    fn page_layout_first_highlight_is_on_time() {
+        // A full page of long-ish 2x lines starting at 0.5s: the first line
+        // (~0.2s of tiles) fits ahead of time, the whole page (~0.8s)
+        // doesn't - so the first line must go first and the rest fill in
+        // behind it.
+        let lines = timed_lines(&[
+            ("first line of the page", 0.5),
+            ("second line of the page", 3.0),
+            ("third line of the page", 6.0),
+            ("fourth line of the page", 9.0),
+        ]);
+        let bytes = render_layout(&lines, 15.0, CdgLayout::Page4);
+        let top = PAGE4.slots[0];
+        let before = row_pixels(&bytes, 0.49, top);
+        let after = row_pixels(&bytes, 0.52, top);
+        assert!(
+            inked_rows(&bytes, 0.49)[top as usize],
+            "line drawn before it starts"
+        );
+        assert_ne!(before, after, "first wipe step lands at the line's start");
+        // And the rest of the page does show up shortly after.
+        let rows = inked_rows(&bytes, 2.5);
+        assert!(PAGE4.slots.iter().all(|&s| rows[s as usize]));
+    }
+
+    #[test]
+    fn page_layout_backing_lines_get_a_row_below_the_page() {
+        let mut lines = five_lines();
+        lines.insert(1, backing_line("ooh", 2.0, 3.5));
+        for layout in [CdgLayout::Page3, CdgLayout::Page4] {
+            let bytes = render_layout(&lines, 20.0, layout);
+            let row = layout.page().unwrap().backing_row;
+            assert!(non_blank_draws_at_row(&bytes, row) > 0, "{layout:?}");
+            assert!(inked_rows(&bytes, 3.0)[row as usize], "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn every_layout_renders_a_valid_stream_for_awkward_songs() {
+        let mut lines = timed_lines(&[
+            ("x", 0.0),
+            (
+                "a line far too long to fit on the cdg screen at any size whatsoever",
+                0.5,
+            ),
+            ("tight", 0.8),
+            ("beau|ti|ful", 1.0),
+            ("after a gap", 25.0),
+        ]);
+        lines.insert(2, backing_line("echo", 0.5, 26.0));
+        for layout in CdgLayout::ALL {
+            let bytes = render_layout(&lines, 40.0, layout);
+            assert_eq!(bytes.len() % 24, 0);
+            assert_eq!(
+                bytes.len() / 24,
+                40 * 300,
+                "{layout:?} padded to the song length"
+            );
+            let bytes = render_layout(&[], 5.0, layout);
+            assert_eq!(bytes.len() / 24, 5 * 300);
+        }
+    }
+
+    // ---- Wrapping long lines ----
+
+    fn unit_times(lines: &[TimedLine]) -> Vec<(f64, f64)> {
+        lines
+            .iter()
+            .flat_map(|l| {
+                word_timings(l)
+                    .into_iter()
+                    .map(|t| (t.highlight_at, t.held_until))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_line_that_fits_is_not_wrapped() {
+        let text = format!("{} {}", "a".repeat(23), "b".repeat(24)); // 48
+        let line = TimedLine::new(text, 1.0, 5.0, Singer::Default);
+        let out = wrap_for_cdg(&line);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, line.text);
+        assert_eq!(out[0].word_overrides, line.word_overrides, "left untouched");
+    }
+
+    #[test]
+    fn a_long_line_wraps_at_its_middle_word_keeping_its_timing() {
+        let mut l =
+            LyricLine::new("this line is much too long to fit on a single cdg row so it wr|aps");
+        // One manual word start/end, which must survive the split.
+        l.word_overrides = vec![None, None, Some(2.0)];
+        l.word_end_overrides = vec![None, None, Some(2.6)];
+        let line = TimedLine::from_line(&l, 1.0, 9.0);
+        let pieces = wrap_for_cdg(&line);
+        assert_eq!(pieces.len(), 2);
+        for p in &pieces {
+            assert!(crate::lyrics::normalize_text(&p.text).chars().count() <= SAFE_COLS as usize);
+        }
+        // Same words, split near the middle (33 / 32 chars displayed).
+        assert_eq!(pieces[0].text, "this line is much too long to fit");
+        assert_eq!(pieces[1].text, "on a single cdg row so it wr|aps");
+        // Exactly the same wipe, unit for unit (syllables included).
+        assert_eq!(unit_times(&pieces), unit_times(std::slice::from_ref(&line)));
+        // The pieces tile the original window.
+        assert_eq!(pieces[0].start, line.start);
+        assert_eq!(pieces[0].end, pieces[1].start);
+        assert_eq!(pieces[1].start, word_timings(&line)[8].highlight_at);
+        assert_eq!(pieces[1].end, line.end);
+        assert_eq!(pieces[1].sing_end, line.sing_end);
+        // No countdown/page break between them; the first keeps its own.
+        assert_eq!(pieces[0].countdown_mode, line.countdown_mode);
+        assert_eq!(pieces[1].countdown_mode, CountdownMode::Suppress);
+    }
+
+    #[test]
+    fn a_very_long_line_wraps_more_than_once_and_one_huge_word_cannot() {
+        let line = TimedLine::new("word ".repeat(25), 0.0, 10.0, Singer::Default); // 124
+        let pieces = wrap_for_cdg(&line);
+        assert_eq!(pieces.len(), 4);
+        assert!(pieces
+            .iter()
+            .all(|p| p.text.chars().count() <= SAFE_COLS as usize));
+        assert_eq!(unit_times(&pieces), unit_times(std::slice::from_ref(&line)));
+
+        let huge = TimedLine::new("x".repeat(60), 0.0, 5.0, Singer::Default);
+        let out = wrap_for_cdg(&huge);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, huge.text);
+    }
+
+    #[test]
+    fn a_wrapped_line_draws_on_two_rows_in_every_layout() {
+        let lines = timed_lines(&[(
+            "this line is much too long to fit on a single cdg row so it wraps",
+            1.0,
+        )]);
+        // Classic: the first half is the current line, the second half its
+        // preview - then the second half becomes the current line.
+        let bytes = render_layout(&lines, 12.0, CdgLayout::Classic);
+        let rows = inked_rows(&bytes, 1.5);
+        assert!(rows[CURRENT_ROW as usize] && rows[PREVIEW_ROW as usize]);
+        // Page: the two halves in the first two slots.
+        let bytes = render_layout(&lines, 12.0, CdgLayout::Page4);
+        let rows = inked_rows(&bytes, 1.5);
+        assert!(rows[PAGE4.slots[0] as usize] && rows[PAGE4.slots[1] as usize]);
+        assert!(!rows[PAGE4.slots[2] as usize]);
     }
 }

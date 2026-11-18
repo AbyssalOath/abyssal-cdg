@@ -26,7 +26,7 @@ pub struct Prefs {
     /// to cancel out how late a tap lands after what was actually heard.
     #[serde(default)]
     pub tap_latency_ms: f64,
-    /// Whether help text shows in full or as one-line summaries with an ⓘ
+    /// Whether help text shows in full or as one-line summaries with an ℹ
     /// (the "Tips" toggle). On for a fresh install (and for a preferences
     /// file saved before this existed), so first-time users get the
     /// explanations; experienced users can turn them off once.

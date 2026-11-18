@@ -148,9 +148,10 @@ file to stay current on its own.
 (Apache-2.0 OR MIT) AND BSD-3-Clause (1): encoding_rs
 (Apache-2.0 OR MIT) AND NCSA (1): libfuzzer-sys
 (Apache-2.0 OR MIT) AND OFL-1.1 AND Ubuntu-font-1.0 (1): epaint_default_fonts (egui's
-    default fonts crate embeds a fallback font under OFL-1.1/the Ubuntu Font License -
-    same permissive font-license family already used for this project's own bundled
-    fonts, see "Bundled binaries and models" above)
+    default fonts crate embeds fallback fonts under OFL-1.1/the Ubuntu Font License,
+    plus, via the "monochrome_emoji_fonts" feature, Noto Emoji (OFL-1.1) and
+    emoji-icon-font (MIT) for UI icons - same permissive font-license family already
+    used for this project's own bundled fonts, see "Bundled binaries and models" above)
 (Apache-2.0 OR MIT) AND Unicode-3.0 (2): unicode-ident, unicode-properties
 0BSD OR Apache-2.0 (1): audio-codec-algorithms
 0BSD OR Apache-2.0 OR MIT (1): adler2

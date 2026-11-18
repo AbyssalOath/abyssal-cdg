@@ -887,7 +887,7 @@ fn open_in_file_manager(dir: &Path) -> std::io::Result<()> {
 
 /// An explanation shown under a control. With tips on (see the "Tips"
 /// toggle), the full `detail` as small grey text, as always; with tips off,
-/// just the one-line `summary` plus an ⓘ that shows `detail` on hover -
+/// just the one-line `summary` plus an ℹ that shows `detail` on hover -
 /// nothing is lost, it's just out of the way. An empty `summary` hides the
 /// text entirely when tips are off (used for pure tips).
 fn help_text(ui: &mut egui::Ui, show_tips: bool, summary: &str, detail: impl Into<String>) {
@@ -897,7 +897,7 @@ fn help_text(ui: &mut egui::Ui, show_tips: bool, summary: &str, detail: impl Int
     } else if !summary.is_empty() {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(summary).small().weak());
-            ui.label(egui::RichText::new("ⓘ").small().weak())
+            ui.label(egui::RichText::new("ℹ").small().weak())
                 .on_hover_text(detail);
         });
     }
@@ -1185,6 +1185,9 @@ struct KaraokeApp {
     video_style: video::VideoStyle,
     /// The outro card settings (saved with the project).
     outro: lyrics::OutroSettings,
+    /// The `.cdg` screen layout - classic 2-line or a 3/4-line page
+    /// (saved with the project).
+    cdg_layout: export::CdgLayout,
     /// Whether the video export/preview shows a small credit line under
     /// the title card (see `video.rs`'s `CREDIT_TEXT`) - on by default,
     /// but never forced: this is the user's own toggle, not a watermark
@@ -1666,6 +1669,7 @@ struct ExportInputs {
     video_codec: VideoCodec,
     video_style: video::VideoStyle,
     outro: lyrics::OutroSettings,
+    cdg_layout: export::CdgLayout,
     show_credit_line: bool,
     background: Option<video::Background>,
     background_fit: video::BackgroundFit,
@@ -1701,6 +1705,7 @@ impl ExportInputs {
             video_codec: p.video_codec,
             video_style: p.video_style,
             outro: p.outro,
+            cdg_layout: p.cdg_layout,
             show_credit_line: p.show_credit_line,
             background: p.background,
             background_fit: p.background_fit,
@@ -1794,6 +1799,7 @@ fn run_export(
     });
     let timing_settings = inputs.timing_settings;
     let cdg_palette = inputs.colors.palette();
+    let cdg_layout = inputs.cdg_layout;
     let video_palette = inputs.colors.video_palette();
     let title = (!inputs.title.trim().is_empty()).then(|| inputs.title.trim().to_string());
     let artist = (!inputs.artist.trim().is_empty()).then(|| inputs.artist.trim().to_string());
@@ -1875,6 +1881,7 @@ fn run_export(
             artist.as_deref(),
             &timing_settings,
             outro.as_ref(),
+            cdg_layout,
         );
         let r = std::fs::write(&cdg_path, &bytes)
             .map(|()| cdg_path.clone())
@@ -2341,6 +2348,7 @@ impl KaraokeApp {
             video_codec: VideoCodec::default(),
             video_style: video::VideoStyle::default(),
             outro: lyrics::OutroSettings::default(),
+            cdg_layout: export::CdgLayout::default(),
             show_credit_line: true,
             background: None,
             background_fit: video::BackgroundFit::default(),
@@ -2585,6 +2593,7 @@ impl KaraokeApp {
             video_codec: self.video_codec,
             video_style: self.video_style,
             outro: self.outro.clone(),
+            cdg_layout: self.cdg_layout,
             show_credit_line: self.show_credit_line,
             background: self.background.clone(),
             background_fit: self.background_fit,
@@ -2736,6 +2745,7 @@ impl KaraokeApp {
         self.video_codec = project.video_codec;
         self.video_style = project.video_style;
         self.outro = project.outro;
+        self.cdg_layout = project.cdg_layout;
         self.show_credit_line = project.show_credit_line;
         self.background = project.background;
         self.background_fit = project.background_fit;
@@ -4939,6 +4949,20 @@ impl KaraokeApp {
                 ui.checkbox(&mut self.export_cdg, "CD+Graphics (.cdg)");
                 ui.add_enabled_ui(self.export_cdg, |ui| {
                     ui.indent("cdg_opts", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Screen:");
+                            for layout in export::CdgLayout::ALL {
+                                ui.radio_value(&mut self.cdg_layout, layout, layout.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "2 lines: the line being sung plus a dim preview of the next. \
+                             3- or 4-line page: the classic karaoke look - several lines \
+                             on screen at once, each replaced by an upcoming line once \
+                             it's sung. Saved with the project; the preview's .cdg \
+                             (exact) mode shows it.",
+                        );
                         ui.checkbox(
                             &mut self.export_cdg_zip,
                             "Also package as an MP3+G .zip (.cdg + .mp3)",
@@ -5879,7 +5903,7 @@ impl KaraokeApp {
                             if snap.estimated > 0
                                 && self.align_job.is_none()
                                 && ui
-                                    .button("🪄 Auto-align words")
+                                    .button("✨ Auto-align words")
                                     .on_hover_text(
                                         "Fill in every timed line's word timing from the audio.",
                                     )
@@ -5953,6 +5977,7 @@ impl KaraokeApp {
             video_codec: self.video_codec,
             video_style: self.video_style,
             outro: self.outro.clone(),
+            cdg_layout: self.cdg_layout,
             show_credit_line: self.show_credit_line,
             background: self.background.clone(),
             background_fit: self.background_fit,
@@ -6518,6 +6543,7 @@ impl KaraokeApp {
         format!("{:?}", self.palette()).hash(&mut h);
         format!("{:?}", self.timing_settings).hash(&mut h);
         format!("{:?}", self.outro).hash(&mut h);
+        self.cdg_layout.hash(&mut h);
         self.title.trim().hash(&mut h);
         self.artist.trim().hash(&mut h);
         self.audio
@@ -6570,6 +6596,7 @@ impl KaraokeApp {
                 total,
                 title.is_some() || artist.is_some(),
             );
+            let cdg_layout = self.cdg_layout;
             let (tx, rx) = std::sync::mpsc::channel();
             let repaint = ctx.clone();
             std::thread::spawn(move || {
@@ -6582,6 +6609,7 @@ impl KaraokeApp {
                     artist.as_deref(),
                     &settings,
                     outro.as_ref(),
+                    cdg_layout,
                 );
                 let _ = tx.send(cdg_decode::CdgPlayback::new(bytes));
                 repaint.request_repaint();
@@ -8438,7 +8466,7 @@ impl eframe::App for KaraokeApp {
                     .on_hover_text(
                         "Show the full explanations under each control. Turn off once you \
                          know your way around - each becomes a one-line summary, with the \
-                         full text on its ⓘ.",
+                         full text on its ℹ.",
                     )
                     .changed()
                 {
@@ -8522,7 +8550,7 @@ impl eframe::App for KaraokeApp {
                     if ui.button("Reset all timing").clicked() {
                         self.reset_timing();
                     }
-                    if ui.button("🪄 Auto-align words").clicked() {
+                    if ui.button("✨ Auto-align words").clicked() {
                         self.start_word_alignment();
                     }
                     ui.label("Language:");
@@ -10047,7 +10075,7 @@ impl eframe::App for KaraokeApp {
                                         if ui.small_button("+0.1s").clicked() {
                                             nudge = Some((i, 0.1));
                                         }
-                                        if ui.small_button("✕").clicked() {
+                                        if ui.small_button("✖").clicked() {
                                             clear_idx = Some(i);
                                         }
                                     }
