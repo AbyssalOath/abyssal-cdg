@@ -25,6 +25,8 @@ create afterward.
 - [Auto-aligning word timing](#auto-aligning-word-timing)
 - [Live preview vs. the exported file](#live-preview-vs-the-exported-file)
 - [Importing existing lyric files](#importing-existing-lyric-files)
+- [Importing timing from a .cdg](#importing-timing-from-a-cdg) - reuse an
+  old karaoke track's timing (beta)
 - [Exporting to LRC / UltraStar](#exporting-to-lrc--ultrastar)
 - [Copying a chorus's timing](#copying-a-choruss-timing)
 - [Syllables (per-syllable timing)](#syllables-per-syllable-timing)
@@ -95,7 +97,7 @@ screen - and is remembered on this computer. The app's purple accent marks
 the main actions (Play, Tap, Export, the step bar's current step) and
 selections throughout.
 
-The **Lines / Words** tap mode and the timeline's **🧲 Snap** setting are
+The **Lines / Words** tap mode and the timeline's **🎯 Snap** setting are
 remembered on this computer too.
 
 The folder you pick in the export
@@ -486,7 +488,7 @@ sync automatically, however you choose to work:
   never have to separately re-adjust the line after fine-tuning its outer
   words.
 - **Drag an edge** to trim just that side (start or end) independently.
-- **Snap to vocal onsets** (**🧲 Snap**, on by default): while you drag a
+- **Snap to vocal onsets** (**🎯 Snap**, on by default): while you drag a
   bubble or its left edge, its start snaps to the nearest *onset* - a
   moment where new sound starts in the audio - once it comes within a few
   pixels. Onsets show as small ticks under the ruler while you drag, and a
@@ -681,6 +683,42 @@ file to verify against, rather than guess and risk silently wrong timing).
 is a configurable wizard over generic delimited text, not a fixed grammar,
 so there's no single format to target there either.
 
+## Importing timing from a .cdg
+
+**Beta.** "Import timing from .cdg…" (under "Load lyrics file…", or drop
+a `.cdg` onto the window) copies the line *and word* timing from an
+existing karaoke `.cdg` onto your lyrics. The typical use is redoing a
+track you already have - an uncensored version, a fixed typo, a video
+instead of MP3+G - without re-tapping and fine-tuning it from scratch.
+
+A `.cdg` contains no text, only drawing instructions, so **the words come
+from your lyrics**: paste (and parse) or load them first, then import. The
+timing is read from the `.cdg`'s highlight wipe - when the "sung" color
+reaches each word - and matched onto your lines by word count:
+
+- **Your line breaks don't have to match the original's.** A line you
+  wrote as one can span two of the `.cdg`'s lines, and vice versa.
+- **A reworded line with the same number of words** (e.g. a censored word
+  swapped back) keeps its full word timing.
+- **A line whose word count changed** gets its start and end from the
+  `.cdg`, but estimated word timing - it shows grey in the timing table;
+  run Auto-align or click its words. The rest of the song stays in sync.
+- **Added lines** with no counterpart are left untimed (tap them);
+  **removed lines** and the `.cdg`'s own title/"Intro..." text are skipped.
+- Pauses the original holds between words are kept.
+
+The timing is exactly as good as the original `.cdg`'s - this copies it,
+it doesn't improve it - and it matches the audio that came with the
+`.cdg` (usually the instrumental), so load that, or check the offset with
+**Shift selection ◀ Earlier / Later ▶** if your audio starts differently.
+A word the original never wipes (e.g. text cut off at the screen edge)
+leaves that line one word short, so it gets line timing only. Always play
+the result through before exporting; Ctrl+Z undoes the whole import.
+
+How well it reads a file depends on how that karaoke program drew it.
+It's been tested with `.cdg`s from three different programs, plus this
+app's own; scrolling `.cdg`s aren't supported.
+
 ## Exporting to LRC / UltraStar
 
 The "Export…" dialog can also produce a portable lyrics file alongside (or
@@ -870,7 +908,7 @@ it and moves playback to just before it.
   tune the default instead.
 - Onset snapping works on the full mix (not isolated vocals), so on a
   busy track some snap points are drums or instruments rather than words -
-  hold Shift to drag past them, or switch 🧲 Snap off.
+  hold Shift to drag past them, or switch 🎯 Snap off.
 - The timeline's waveform backdrop is drawn from the *loaded audio file*,
   not the exported `.cdg`/`.mp4` - it's purely a visual aid for aligning
   bubbles against actual vocal onsets, not a preview of anything in the

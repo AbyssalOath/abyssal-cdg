@@ -9,6 +9,7 @@ mod align;
 mod audio;
 mod cdg;
 mod cdg_decode;
+mod cdg_import;
 mod checks;
 mod codex;
 mod ctc;
@@ -3814,6 +3815,55 @@ impl KaraokeApp {
         }
     }
 
+    fn import_cdg_timing_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("CD+G karaoke", &["cdg"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+        {
+            self.import_cdg_timing(&path);
+        }
+    }
+
+    /// Times the current lyric lines from an existing `.cdg`'s highlight
+    /// wipe (see `cdg_import.rs`). The words come from the lyrics already
+    /// here - a `.cdg` holds no text - so they must be pasted or loaded
+    /// first; they're matched to the `.cdg`'s lines by word count, which is
+    /// what lets an edited (e.g. uncensored) copy of the lyrics keep the
+    /// original's timing. One undo step, like any other edit.
+    fn import_cdg_timing(&mut self, path: &std::path::Path) {
+        if self.lines.is_empty() {
+            self.status = if self.lyrics_raw.trim().is_empty() {
+                "Paste or load the lyrics first - a .cdg has no text in it, only the \
+                 timing, so its timing is matched onto your lyrics."
+                    .to_string()
+            } else {
+                "Click \"Parse lyrics\" first, then import the .cdg's timing onto them.".to_string()
+            };
+            return;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Couldn't read {}: {e}", path.display());
+                return;
+            }
+        };
+        let cdg = cdg_import::extract_timing(&bytes);
+        if cdg.is_empty() {
+            self.status = format!(
+                "Found no highlighted lyric lines in {} - is it a karaoke .cdg?",
+                path.display()
+            );
+            return;
+        }
+        let report = cdg_import::apply_timing(&mut self.lines, &cdg);
+        self.recompute_next_untimed();
+        self.start_edit = None;
+        self.end_edit = None;
+        self.status = report.summarize();
+    }
+
     /// Routes files dropped onto the window to whichever loader matches
     /// their extension - audio, a lyrics file (any of the auto-detected
     /// formats `load_lyrics_file` handles), or a `.abyzl` project - so
@@ -3837,6 +3887,7 @@ impl KaraokeApp {
             match ext.as_str() {
                 "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => self.load_audio(path),
                 "lrc" | "txt" | "kok" => self.load_lyrics_file(&path),
+                "cdg" => self.import_cdg_timing(&path),
                 project::FILE_EXTENSION => {
                     if self.project_busy() {
                         self.status =
@@ -7343,7 +7394,7 @@ impl KaraokeApp {
                 self.timeline_view.scroll_secs = 0.0;
             }
             if ui
-                .checkbox(&mut self.prefs.snap_to_onsets, "🧲 Snap")
+                .checkbox(&mut self.prefs.snap_to_onsets, "🎯 Snap")
                 .on_hover_text(
                     "Dragging a bubble (or its left edge) snaps its start to the nearest \
                      vocal onset - where new sound starts in the audio, shown as ticks \
@@ -8668,6 +8719,26 @@ impl eframe::App for KaraokeApp {
                 }
                 if ui.button("Load lyrics file…").clicked() {
                     self.load_lyrics_file_dialog();
+                }
+                if ui
+                    .add_enabled(
+                        !self.lines.is_empty(),
+                        egui::Button::new("Import timing from .cdg…"),
+                    )
+                    .on_hover_text(
+                        "Copy the line and word timing from an existing karaoke .cdg onto \
+                         these lyrics - e.g. to redo a censored track uncensored without \
+                         re-timing it. Lines are matched by word count, so reworded lines \
+                         keep their timing too; any line whose word count changed gets its \
+                         start/end only (shown grey - Auto-align it). Beta.",
+                    )
+                    .on_disabled_hover_text(
+                        "Paste (and parse) or load the lyrics first - a .cdg has no text in \
+                         it, only the timing to match onto them.",
+                    )
+                    .clicked()
+                {
+                    self.import_cdg_timing_dialog();
                 }
                 help_text(
                     ui,
@@ -10874,5 +10945,53 @@ mod tests {
         let mut anchor = Some(0);
         apply_row_selection_click(&mut selected, &mut anchor, 7, false);
         assert_eq!(anchor, Some(7));
+    }
+}
+
+/// Every icon/symbol the UI shows has to be in a font the app actually
+/// bundles - an emoji newer than egui's bundled emoji font (like 🧲 was)
+/// silently draws as an empty box on systems without an emoji font.
+#[cfg(test)]
+mod icon_coverage {
+    #[test]
+    fn every_ui_symbol_has_a_bundled_glyph() {
+        use ab_glyph::Font;
+        let defs = egui::FontDefinitions::default();
+        let fonts: Vec<ab_glyph::FontRef> = defs
+            .font_data
+            .values()
+            .filter_map(|d| {
+                ab_glyph::FontRef::try_from_slice_and_index((*d.font).as_ref(), d.index).ok()
+            })
+            .collect();
+        assert!(!fonts.is_empty());
+        let sources = [
+            ("main.rs", include_str!("main.rs")),
+            ("timeline.rs", include_str!("timeline.rs")),
+            ("onboarding.rs", include_str!("onboarding.rs")),
+            ("checks.rs", include_str!("checks.rs")),
+            ("cdg_import.rs", include_str!("cdg_import.rs")),
+        ];
+        let mut missing = Vec::new();
+        for (file, src) in sources {
+            // Up to the file's tests - their sample text isn't shown in the
+            // UI (e.g. CJK lyrics testing the .cdg font's fallback).
+            let shipped = src.split("#[cfg(test)]\nmod ").next().unwrap_or(src);
+            for (n, line) in shipped.lines().enumerate() {
+                // Code only - comments may mention symbols freely (this
+                // one's own doc comment names the old 🧲 icon).
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                let code = line.split(" //").next().unwrap_or("");
+                for ch in code.chars().filter(|c| (*c as u32) > 0x7F) {
+                    if !fonts.iter().any(|f| f.glyph_id(ch).0 != 0) {
+                        missing.push(format!("{ch} (U+{:04X}) at {file}:{}", ch as u32, n + 1));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "no bundled glyph for: {missing:#?}");
     }
 }

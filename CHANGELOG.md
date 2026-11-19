@@ -7,6 +7,31 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-11-19
+
+Redo a karaoke track you already have without re-timing it: the new
+Import timing from .cdg copies an existing `.cdg`'s line and word timing
+onto your lyrics. Also fixes the timeline's Snap icon.
+
+### Added
+
+- **Import timing from .cdg (beta).** Copies the line and word timing from
+  an existing karaoke `.cdg` onto your lyrics, so a track you already have
+  (e.g. a censored release) can be redone - uncensored, or as a video -
+  without re-timing it. A `.cdg` has no text, so the words come from your
+  pasted lyrics; lines are matched by word count, tolerating different
+  line breaks and added/removed lines, and a reworded line with a
+  different word count keeps its start/end. Under "Load lyrics file…", or
+  drop a `.cdg` onto the window. See FEATURES.md.
+
+### Fixed
+
+- **The timeline's Snap toggle showed an empty box instead of its icon.**
+  Its 🧲 magnet is newer than the bundled emoji font (the same problem
+  v0.2.7 fixed for three other icons); it's now 🎯. A new test checks that
+  every symbol the UI shows has a glyph in the bundled fonts, so this
+  can't slip through again.
+
 ## [0.2.8] - 2026-11-18
 
 A bug-fix release for the MP3+G zip export, with refreshed screenshots.

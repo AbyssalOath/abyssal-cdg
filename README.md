@@ -38,6 +38,8 @@ always shows what to do next.
    on the window.
 2. **Lyrics** - paste them (one line per line; a blank line starts a new
    verse) and click **Parse lyrics**, or load an LRC/UltraStar/KOK file.
+   Redoing a song you already have as a `.cdg`? **Import timing from
+   .cdg…** copies its line and word timing onto your lyrics (beta).
 3. **Tap** - press Play, then **Space** the instant each line starts and
    again when it ends - or switch to **Words** and hold Space for each
    word while it's sung, timing every word in one listen. Slow the song
