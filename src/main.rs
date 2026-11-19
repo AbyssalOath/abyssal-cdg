@@ -10976,8 +10976,16 @@ mod icon_coverage {
         for (file, src) in sources {
             // Up to the file's tests - their sample text isn't shown in the
             // UI (e.g. CJK lyrics testing the .cdg font's fallback).
-            let shipped = src.split("#[cfg(test)]\nmod ").next().unwrap_or(src);
-            for (n, line) in shipped.lines().enumerate() {
+            // Line by line, so it works with either line ending (Windows
+            // checkouts get \r\n).
+            let lines: Vec<&str> = src.lines().collect();
+            let tests_start = lines
+                .windows(2)
+                .position(|w| {
+                    w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod ")
+                })
+                .unwrap_or(lines.len());
+            for (n, line) in lines[..tests_start].iter().enumerate() {
                 // Code only - comments may mention symbols freely (this
                 // one's own doc comment names the old 🧲 icon).
                 let trimmed = line.trim_start();
