@@ -380,7 +380,11 @@ jobs:
           gh release download v0.2.6 --repo "$GITHUB_REPOSITORY" --pattern "$dmg" --dir "$dl"
           echo "$sha256  $dl/$dmg" | shasum -a 256 -c -
           mnt="$(mktemp -d)"
-          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dl/$dmg"
+          # Our .dmg shows the app's license (AGPL) as an agreement on
+          # mount; with no answer, hdiutil cancels the attach. Feed it
+          # "y" - via process substitution, not `yes |`, which would die
+          # of SIGPIPE and fail the step under Actions' `-o pipefail`.
+          PAGER=cat hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dl/$dmg" < <(yes)
           found="$(find "$mnt" -name 'libonnxruntime.dylib' | head -n1)"
           test -n "$found"
           mkdir -p assets/onnxruntime
