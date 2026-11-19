@@ -15,8 +15,9 @@ jobs:
       matrix:
         include:
           # ONNX Runtime's own prebuilt binaries cover this target
-          # (`ort_platform`/`ort_archive_ext` name the release asset to
-          # download - see the "Fetch ONNX Runtime" step). `openh264_arch`
+          # (`ort_platform` is the runtime folder inside Microsoft's
+          # official NuGet package to take the library from - see the
+          # "Fetch ONNX Runtime" step). `openh264_arch`
           # is openh264's own build-system arch name (see
           # scripts/build-ffmpeg.sh, which auto-detects the OS name the
           # same way openh264's own Makefile does - no matrix field for
@@ -30,7 +31,6 @@ jobs:
             arch: aarch64
             formats: dmg
             ort_platform: osx-arm64
-            ort_archive_ext: tgz
             ort_lib_name: libonnxruntime.dylib
             openh264_arch: arm64
             openh264_dl_url: https://ciscobinary.openh264.org/libopenh264-2.6.0-mac-arm64.dylib.bz2
@@ -48,20 +48,14 @@ jobs:
             ffmpeg_configure_extra: "--extra-ldflags=-Wl,-rpath,@executable_path"
 
           # ONNX Runtime dropped prebuilt macOS x86_64 binaries between
-          # 1.23 and 1.25 (confirmed directly against the release asset
-          # list - no `onnxruntime-osx-x64-*` exists for the 1.28.0 this
-          # app targets). `ort_platform` is left empty so the download
-          # step is skipped; the "Build ONNX Runtime from source" step
-          # (gated on this exact target) cross-compiles one instead, on
-          # this same arm64 runner - ONNX Runtime's own CI does the same
-          # cross-compile for its coreml/webgpu macOS x86_64 jobs, so this
-          # is a proven, not experimental, approach.
+          # 1.23 and 1.25 (no osx-x64 in the 1.28.0 NuGet package or on
+          # PyPI either). `ort_platform` is left empty so the download
+          # step is skipped; see "Reuse ONNX Runtime from v0.2.6" below.
           - platform: macos-latest
             target: x86_64-apple-darwin
             arch: x64
             formats: dmg
             ort_platform: ""
-            ort_archive_ext: ""
             ort_lib_name: libonnxruntime.dylib
             openh264_arch: x86_64
             openh264_dl_url: https://ciscobinary.openh264.org/libopenh264-2.6.0-mac-x64.dylib.bz2
@@ -119,7 +113,6 @@ jobs:
             arch: amd64
             formats: deb,appimage
             ort_platform: linux-x64
-            ort_archive_ext: tgz
             ort_lib_name: libonnxruntime.so
             openh264_arch: x86_64
             openh264_dl_url: https://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2
@@ -144,7 +137,6 @@ jobs:
             arch: x64
             formats: nsis,wix
             ort_platform: win-x64
-            ort_archive_ext: zip
             ort_lib_name: onnxruntime.dll
             openh264_arch: x86_64
             openh264_dl_url: https://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2
@@ -170,9 +162,9 @@ jobs:
             ffmpeg_configure_extra: '--target-os=mingw32 --arch=x86_64 --extra-ldflags="-static -static-libgcc -static-libstdc++"'
 
     runs-on: ${{ matrix.platform }}
-    # The macOS x86_64 from-source ONNX Runtime build is the slow one here
-    # (everything else in this job finishes in single-digit minutes) - a
-    # full onnxruntime build can reasonably take over an hour.
+    # Sized for a from-source ONNX Runtime build (over an hour), which
+    # the macOS x86_64 job needs again whenever ONNX Runtime is bumped -
+    # see "Reuse ONNX Runtime from v0.2.6".
     timeout-minutes: 150
 
     steps:
@@ -331,14 +323,23 @@ jobs:
       - name: Fetch ONNX Runtime (prebuilt)
         # Skipped for macOS x86_64, which has no prebuilt binary to fetch
         # - see the next step and the matrix comment above.
+        #
+        # From Microsoft's official NuGet package (Microsoft.ML.OnnxRuntime,
+        # published 2026-07-25), not the GitHub release assets: the
+        # microsoft/onnxruntime GitHub repo - releases and source - has
+        # returned 404 since 2026-11-18. NuGet packages are immutable, and
+        # its linux-x64 libonnxruntime.so is byte-identical to the one the
+        # GitHub-sourced v0.2.6 release shipped. Pinned by SHA-256, like
+        # openh264, since it ends up inside every installer.
         if: matrix.ort_platform != ''
         shell: bash
         run: |
           set -e
           mkdir -p assets/onnxruntime ort_extracted
           version="1.28.0"
-          url="https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-${{ matrix.ort_platform }}-${version}.${{ matrix.ort_archive_ext }}"
-          archive="ort_download.${{ matrix.ort_archive_ext }}"
+          url="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${version}/microsoft.ml.onnxruntime.${version}.nupkg"
+          sha256="769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db"
+          archive="ort_download.nupkg"
           ok=0
           for attempt in 1 2 3; do
             if curl -fL --retry 3 -o "$archive" "$url"; then
@@ -349,57 +350,45 @@ jobs:
             sleep $((attempt * 15))
           done
           if [ "$ok" != "1" ]; then exit 1; fi
-          if [ "${{ matrix.ort_archive_ext }}" = "zip" ]; then
-            unzip -q -o "$archive" -d ort_extracted
-          else
-            tar xzf "$archive" -C ort_extracted
-          fi
-          # The lib is a versioned symlink chain in the linux/macOS
-          # archives (e.g. libonnxruntime.so -> libonnxruntime.so.1 ->
-          # libonnxruntime.so.1.28.0) - `cp -L` dereferences it into a
-          # single real file at the exact name onnxrt.rs looks for.
-          found="$(find ort_extracted -name '${{ matrix.ort_lib_name }}' | head -n1)"
-          test -n "$found"
-          cp -L "$found" "assets/onnxruntime/${{ matrix.ort_lib_name }}"
+          echo "$sha256  $archive" | sha256sum -c -
+          # A .nupkg is a zip; the native library sits at
+          # runtimes/<rid>/native/<lib> (a real file, no symlink chain).
+          member="runtimes/${{ matrix.ort_platform }}/native/${{ matrix.ort_lib_name }}"
+          unzip -q -o "$archive" "$member" -d ort_extracted
+          cp "ort_extracted/$member" "assets/onnxruntime/${{ matrix.ort_lib_name }}"
           rm -rf ort_extracted "$archive"
           test -f "assets/onnxruntime/${{ matrix.ort_lib_name }}"
 
-      - name: Build ONNX Runtime from source (macOS x86_64)
-        # The one target with no prebuilt binary to fetch (see the matrix
-        # comment above) - cross-compiled on this arm64 runner, the same
-        # way ONNX Runtime's own CI cross-compiles its macOS x86_64
-        # coreml/webgpu jobs (.github/workflows/macos-ci-build-and-test-workflow.yml
-        # in the microsoft/onnxruntime repo, `--osx_arch x86_64` on an
-        # arm64 `machine`). This step is the slow part of this whole
-        # workflow (see the job's timeout-minutes above) and, unlike
-        # everything else here, hasn't been dry-run outside real CI - if
-        # it needs adjusting, ONNX Runtime's own macOS CI workflow (linked
-        # above) is the authoritative reference for current build flags.
+      - name: Reuse ONNX Runtime from v0.2.6 (macOS x86_64)
+        # The one target with no prebuilt binary anywhere. It used to be
+        # cross-compiled here from the microsoft/onnxruntime source, which
+        # is gone from GitHub (see the step above) - so this takes the
+        # exact libonnxruntime.dylib (1.28.0, built from that official
+        # source by this workflow) out of this repo's own v0.2.6 Intel
+        # .dmg, pinned to its SHA-256 from that release's SHA256SUMS.txt.
+        # Bump ONNX Runtime -> this needs a real source build again
+        # (see git history for the old step).
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          brew install cmake ninja
-          version="1.28.0"
-          git clone --branch "v${version}" --depth 1 --recursive --shallow-submodules \
-            https://github.com/microsoft/onnxruntime.git /tmp/onnxruntime-src
-          cd /tmp/onnxruntime-src
-          python3 -m pip install --break-system-packages -r requirements.txt
-          python3 ./tools/ci_build/build.py \
-            --build_dir ./build \
-            --config Release \
-            --parallel \
-            --skip_submodule_sync \
-            --skip_tests \
-            --build_shared_lib \
-            --compile_no_warning_as_error \
-            --osx_arch x86_64 \
-            --update --build
-          mkdir -p "$GITHUB_WORKSPACE/assets/onnxruntime"
-          found="$(find ./build -maxdepth 2 -name 'libonnxruntime*.dylib' ! -path '*.dSYM*' | head -n1)"
+          dmg="Abyssal-CDG-Creator_0.2.6_x64.dmg"
+          sha256="8774a164cfece12827cbc2ee72ab2b7f486340624bc44134129630fa34d38edf"
+          dl="$(mktemp -d)"
+          gh release download v0.2.6 --repo "$GITHUB_REPOSITORY" --pattern "$dmg" --dir "$dl"
+          echo "$sha256  $dl/$dmg" | shasum -a 256 -c -
+          mnt="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dl/$dmg"
+          found="$(find "$mnt" -name 'libonnxruntime.dylib' | head -n1)"
           test -n "$found"
-          cp -L "$found" "$GITHUB_WORKSPACE/assets/onnxruntime/libonnxruntime.dylib"
-          test -f "$GITHUB_WORKSPACE/assets/onnxruntime/libonnxruntime.dylib"
+          mkdir -p assets/onnxruntime
+          cp -L "$found" assets/onnxruntime/libonnxruntime.dylib
+          hdiutil detach "$mnt"
+          rm -rf "$dl"
+          lipo -archs assets/onnxruntime/libonnxruntime.dylib
+          test "$(lipo -archs assets/onnxruntime/libonnxruntime.dylib)" = "x86_64"
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
