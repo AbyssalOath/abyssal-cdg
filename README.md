@@ -9,7 +9,7 @@ MP3+G players, an MP4 karaoke video, subtitles, or lyric files.
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
 ![Rust: stable](https://img.shields.io/badge/rust-stable-blue)
 
-![Abyssal CDG Creator](assets/screenshots/usage.png)
+![Abyssal CDG Creator](assets/screenshots/main-window.png)
 
 Free and open source, for Windows, macOS and Linux. Everything - vocal
 removal, video export, auto-alignment - runs on your own computer, with
@@ -85,9 +85,13 @@ changes are in **[CHANGELOG.md](CHANGELOG.md)**.
 <details>
 <summary>More screenshots</summary>
 
-![Export dialog](assets/screenshots/export.png)
-
-![MP4 video output](assets/screenshots/abyssal-cdg-example-3.png)
+<!-- Two screenshots per row: add a new <tr> for each further pair. -->
+<table>
+  <tr>
+    <td width="50%"><a href="assets/screenshots/export-dialog.png"><img src="assets/screenshots/export-dialog.png" alt="Export dialog"></a><br><sub>Export dialog</sub></td>
+    <td width="50%"><a href="assets/screenshots/video-output.png"><img src="assets/screenshots/video-output.png" alt="MP4 video output"></a><br><sub>MP4 video output</sub></td>
+  </tr>
+</table>
 
 </details>
 

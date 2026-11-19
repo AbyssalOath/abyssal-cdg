@@ -7,6 +7,22 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-11-18
+
+A bug-fix release for the MP3+G zip export, with refreshed screenshots.
+
+### Fixed
+
+- **MP3+G zip failed with "Encoder not found"** when the source song had
+  embedded cover art (common in FLAC/M4A files). ffmpeg tried to carry the
+  cover picture into the `.mp3` as a PNG, an encoder the bundled ffmpeg
+  doesn't include. The conversion now copies only the audio, so the zip is
+  written normally.
+
+### Changed
+
+- Updated README screenshots.
+
 ## [0.2.7] - 2026-11-18
 
 A `.cdg` layout release: show a whole 3- or 4-line page at once, the

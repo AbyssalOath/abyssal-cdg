@@ -165,6 +165,11 @@ fn write_wav(stem: &[Vec<f32>; 2], sample_rate: u32, path: &Path) -> Result<()> 
 pub fn encode_via_ffmpeg(wav_path: &Path, output_path: &Path, ext: &str) -> Result<()> {
     let mut cmd = crate::ffmpeg_path::command()?;
     cmd.args(["-y", "-i"]).arg(wav_path);
+    // Audio only: a source song with embedded cover art (an "attached pic"
+    // stream in a FLAC/M4A) would otherwise be mapped into the output as a
+    // video stream, and the mp3 muxer then wants a PNG encoder that some
+    // ffmpeg builds don't ship - "Encoder not found".
+    cmd.args(["-map", "0:a:0", "-vn"]);
     if ext == "mp3" {
         cmd.args(["-b:a", "320k"]);
     }
@@ -281,6 +286,67 @@ mod tests {
         assert_eq!(samples, vec![0.0, 0.0, 0.5, -0.5, -0.5, 0.5, 1.0, -1.0]);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression test for the v0.2.7 MP3+G zip failure: a FLAC with
+    /// embedded cover art (an "attached pic" mjpeg stream) made ffmpeg try
+    /// to carry the picture into the .mp3 via a PNG encoder this app's
+    /// LGPL ffmpeg build doesn't include - "Encoder not found". Needs the
+    /// real bundled/cached ffmpeg, so not run by default. Run with:
+    ///   cargo test --release vocals::tests::encode_ignores_embedded_cover_art -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn encode_ignores_embedded_cover_art() {
+        let dir =
+            std::env::temp_dir().join(format!("abyssal-cdg-cover-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cover = dir.join("cover.jpg");
+        let flac = dir.join("song.flac");
+        let mp3 = dir.join("song.mp3");
+        let run = |args: &[&str], out_path: &Path| {
+            let out = crate::ffmpeg_path::command()
+                .unwrap()
+                .args(["-nostdin", "-y", "-loglevel", "error"])
+                .args(args)
+                .arg(out_path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let cover_str = cover.to_str().unwrap();
+        run(
+            &["-f", "lavfi", "-i", "testsrc=s=64x64:d=1", "-frames:v", "1"],
+            &cover,
+        );
+        run(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=d=2",
+                "-i",
+                cover_str,
+                "-map",
+                "0:a",
+                "-map",
+                "1:v",
+                "-c:v",
+                "copy",
+                "-disposition:v",
+                "attached_pic",
+                "-c:a",
+                "flac",
+            ],
+            &flac,
+        );
+
+        encode_via_ffmpeg(&flac, &mp3, "mp3").expect("cover art must not break the MP3 encode");
+        assert!(std::fs::metadata(&mp3).unwrap().len() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End-to-end smoke test against the *real* ONNX model - not run by
