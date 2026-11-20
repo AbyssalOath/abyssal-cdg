@@ -93,6 +93,10 @@ changes are in **[CHANGELOG.md](CHANGELOG.md)**.
     <td width="50%"><a href="assets/screenshots/export-dialog.png"><img src="assets/screenshots/export-dialog.png" alt="Export dialog"></a><br><sub>Export dialog</sub></td>
     <td width="50%"><a href="assets/screenshots/video-output.png"><img src="assets/screenshots/video-output.png" alt="MP4 video output"></a><br><sub>MP4 video output</sub></td>
   </tr>
+  <tr>
+    <td width="50%"><a href="assets/screenshots/auto-aligning.png"><img src="assets/screenshots/auto-aligning.png" alt="Auto-aligning lyrics to the vocals"></a><br><sub>Auto-aligning</sub></td>
+    <td width="50%"><a href="assets/screenshots/exporting.png"><img src="assets/screenshots/exporting.png" alt="Export in progress"></a><br><sub>Exporting</sub></td>
+  </tr>
 </table>
 
 </details>

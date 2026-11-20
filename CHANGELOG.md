@@ -7,6 +7,23 @@ this project follows [Semantic Versioning](https://semver.org/) once it reaches 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-19
+
+Give every custom singer their own color: songs with several named
+singers no longer show them all in the Default color.
+
+### Fixed
+
+- **Custom singers can now each have their own color.** Typing a custom
+  singer name on a line still set to Default left the line on Default,
+  so every custom singer showed in the same color. A newly named line now
+  moves to a free voice color slot (Male, Female, Duet, then Screaming).
+  If that name is already in use, the line takes that singer's slot.
+  The Colors panel has a new **Custom singers** list for changing which
+  slot each singer uses, applied to all of that singer's lines at once.
+  The color pickers now show which custom singers use each pair, and a
+  warning appears when two custom singers share colors.
+
 ## [0.2.9] - 2026-11-19
 
 Redo a karaoke track you already have without re-timing it: the new

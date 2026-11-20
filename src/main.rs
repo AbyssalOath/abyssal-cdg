@@ -8982,6 +8982,89 @@ impl eframe::App for KaraokeApp {
                                     );
                                 }
                                 ui.add_space(6.0);
+                                let custom_singers = self.known_custom_singers();
+                                if !custom_singers.is_empty() {
+                                    ui.label(egui::RichText::new("Custom singers").strong());
+                                    help_text(
+                                        ui,
+                                        self.prefs.show_tips,
+                                        "",
+                                        "Each custom singer uses one of the voice color slots \
+                                             below. Give each singer a different slot to give \
+                                             them different colors, then set that slot's colors \
+                                             in the list below. There's a fixed number of slots \
+                                             because the .cdg format only has 16 colors.",
+                                    );
+                                    let mut reassign: Option<(String, Singer)> = None;
+                                    egui::Grid::new("custom_singer_voices")
+                                        .num_columns(2)
+                                        .spacing([8.0, 4.0])
+                                        .show(ui, |ui| {
+                                            for (name, base) in &custom_singers {
+                                                ui.label(name);
+                                                egui::ComboBox::from_id_salt((
+                                                    "custom_singer_voice",
+                                                    name,
+                                                ))
+                                                .width(100.0)
+                                                .selected_text(base.label())
+                                                .show_ui(ui, |ui| {
+                                                    for voice in Singer::ALL {
+                                                        if ui
+                                                            .selectable_label(
+                                                                *base == voice,
+                                                                voice.label(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            reassign = Some((name.clone(), voice));
+                                                        }
+                                                    }
+                                                });
+                                                ui.end_row();
+                                            }
+                                        });
+                                    if let Some((name, voice)) = reassign {
+                                        let n = lyrics::set_custom_singer_voice(
+                                            &mut self.lines,
+                                            &name,
+                                            voice,
+                                        );
+                                        self.status = format!(
+                                            "{name} now uses the {} colors ({n} line(s)).",
+                                            voice.label()
+                                        );
+                                    }
+                                    for (i, (name, base)) in custom_singers.iter().enumerate() {
+                                        if let Some((other, _)) =
+                                            custom_singers[..i].iter().find(|(_, b)| b == base)
+                                        {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(230, 160, 40),
+                                                egui::RichText::new(format!(
+                                                    "⚠ {other} and {name} share the {} colors",
+                                                    base.label()
+                                                ))
+                                                .small(),
+                                            );
+                                        }
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                                // "Male (Pink Guy) - upcoming" etc., so it's clear which
+                                // color pair belongs to which custom singer.
+                                let slot_label = |voice: Singer, part: &str| -> String {
+                                    let names: Vec<&str> = custom_singers
+                                        .iter()
+                                        .filter(|(_, b)| *b == voice)
+                                        .map(|(n, _)| n.as_str())
+                                        .collect();
+                                    if names.is_empty() {
+                                        format!("{} - {part}", voice.label())
+                                    } else {
+                                        format!("{} ({}) - {part}", voice.label(), names.join(", "))
+                                    }
+                                };
                                 egui::Grid::new("colors_grid")
                                     .num_columns(2)
                                     .spacing([8.0, 4.0])
@@ -8990,58 +9073,59 @@ impl eframe::App for KaraokeApp {
                                         ui.color_edit_button_srgba(&mut self.color_bg);
                                         ui.end_row();
 
-                                        ui.label("Default - upcoming").on_hover_text(
-                                            "Used for any line whose singer hasn't been \
+                                        ui.label(slot_label(Singer::Default, "upcoming"))
+                                            .on_hover_text(
+                                                "Used for any line whose singer hasn't been \
                                                  manually set. Defaults to the same look as \
                                                  Male, but can be set independently - e.g. to \
                                                  match a background image/video's palette.",
-                                        );
+                                            );
                                         ui.color_edit_button_srgba(&mut self.color_default_unsung);
                                         ui.end_row();
-                                        ui.label("Default - sung");
+                                        ui.label(slot_label(Singer::Default, "sung"));
                                         ui.color_edit_button_srgba(
                                             &mut self.color_default_highlight,
                                         );
                                         ui.end_row();
 
-                                        ui.label("Male - upcoming");
+                                        ui.label(slot_label(Singer::Male, "upcoming"));
                                         ui.color_edit_button_srgba(&mut self.color_male_unsung);
                                         ui.end_row();
-                                        ui.label("Male - sung");
+                                        ui.label(slot_label(Singer::Male, "sung"));
                                         ui.color_edit_button_srgba(&mut self.color_male_highlight);
                                         ui.end_row();
 
-                                        ui.label("Female - upcoming");
+                                        ui.label(slot_label(Singer::Female, "upcoming"));
                                         ui.color_edit_button_srgba(&mut self.color_female_unsung);
                                         ui.end_row();
-                                        ui.label("Female - sung");
+                                        ui.label(slot_label(Singer::Female, "sung"));
                                         ui.color_edit_button_srgba(
                                             &mut self.color_female_highlight,
                                         );
                                         ui.end_row();
 
-                                        ui.label("Duet - upcoming");
+                                        ui.label(slot_label(Singer::Duet, "upcoming"));
                                         ui.color_edit_button_srgba(&mut self.color_duet_unsung);
                                         ui.end_row();
-                                        ui.label("Duet - sung");
+                                        ui.label(slot_label(Singer::Duet, "sung"));
                                         ui.color_edit_button_srgba(&mut self.color_duet_highlight);
                                         ui.end_row();
 
-                                        ui.label("Screaming - upcoming");
+                                        ui.label(slot_label(Singer::Screaming, "upcoming"));
                                         ui.color_edit_button_srgba(
                                             &mut self.color_screaming_unsung,
                                         );
                                         ui.end_row();
-                                        ui.label("Screaming - sung");
+                                        ui.label(slot_label(Singer::Screaming, "sung"));
                                         ui.color_edit_button_srgba(
                                             &mut self.color_screaming_highlight,
                                         );
                                         ui.end_row();
 
-                                        ui.label("Backing - upcoming");
+                                        ui.label(slot_label(Singer::Backing, "upcoming"));
                                         ui.color_edit_button_srgba(&mut self.color_backing_unsung);
                                         ui.end_row();
-                                        ui.label("Backing - sung");
+                                        ui.label(slot_label(Singer::Backing, "sung"));
                                         ui.color_edit_button_srgba(
                                             &mut self.color_backing_highlight,
                                         );
@@ -10040,12 +10124,42 @@ impl eframe::App for KaraokeApp {
                                         )
                                         .changed()
                                     {
+                                        let was_unnamed =
+                                            self.lines[i].custom_singer_name.is_none();
                                         self.lines[i].custom_singer_name =
                                             if custom_buf.trim().is_empty() {
                                                 None
                                             } else {
                                                 Some(custom_buf)
                                             };
+                                        // A line that was still on Default and just got its
+                                        // first name moves to a free voice slot, so each
+                                        // custom singer gets its own color instead of all
+                                        // sharing Default's. A name that already exists on
+                                        // other lines keeps that name's slot. Lines on a
+                                        // deliberately chosen voice, or being renamed, keep
+                                        // their voice.
+                                        if was_unnamed
+                                            && self.lines[i].singer == Singer::Default
+                                            && self.lines[i].custom_singer_name.is_some()
+                                        {
+                                            let existing = known_custom
+                                                .iter()
+                                                .find(|(n, _)| {
+                                                    Some(n) == self.lines[i]
+                                                        .custom_singer_name
+                                                        .as_ref()
+                                                })
+                                                .map(|(_, base)| *base);
+                                            if let Some(voice) = existing.or_else(|| {
+                                                lyrics::free_voice_for_new_custom_singer(
+                                                    &self.lines,
+                                                    i,
+                                                )
+                                            }) {
+                                                self.lines[i].singer = voice;
+                                            }
+                                        }
                                     }
                                 });
 

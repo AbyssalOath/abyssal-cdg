@@ -146,6 +146,49 @@ pub fn effective_singer_label(singer: Singer, custom_name: &Option<String>) -> &
     custom_name.as_deref().unwrap_or_else(|| singer.label())
 }
 
+/// The lead voice color slots a brand-new custom singer can be given
+/// automatically, in preference order. `Default` is left out (it's what a
+/// line falls back to, so a custom singer sharing it is the very collision
+/// this exists to avoid) and so is `Backing` (it carries backing-track
+/// meaning, and is still selectable by hand).
+const AUTO_CUSTOM_VOICES: [Singer; 4] = [
+    Singer::Male,
+    Singer::Female,
+    Singer::Duet,
+    Singer::Screaming,
+];
+
+/// A voice color slot for a custom singer newly named on `line_idx` - the
+/// first of Male/Female/Duet/Screaming that no *other* line uses at all,
+/// so the new name gets its own color instead of silently sharing the
+/// line's current one (every custom name used to stay on `Default`, so
+/// several named singers all rendered identically). `None` when every slot
+/// is already taken - the caller should leave the line's voice alone then;
+/// with only a fixed number of `.cdg` palette slots, sharing is unavoidable
+/// past that point.
+pub fn free_voice_for_new_custom_singer(lines: &[LyricLine], line_idx: usize) -> Option<Singer> {
+    AUTO_CUSTOM_VOICES.into_iter().find(|&voice| {
+        !lines
+            .iter()
+            .enumerate()
+            .any(|(i, l)| i != line_idx && l.singer == voice)
+    })
+}
+
+/// Points every line named `name` at `voice`'s color slot - how a custom
+/// singer's color is changed as a whole, instead of line by line. Returns
+/// how many lines changed.
+pub fn set_custom_singer_voice(lines: &mut [LyricLine], name: &str, voice: Singer) -> usize {
+    let mut changed = 0;
+    for line in lines {
+        if line.custom_singer_name.as_deref() == Some(name) && line.singer != voice {
+            line.singer = voice;
+            changed += 1;
+        }
+    }
+    changed
+}
+
 /// Rough estimate of how long it takes to sing `text`, used only to decide
 /// how much of a line's on-screen window is "still being sung" vs. "already
 /// finished, waiting for the next line" (see [`countdown_window`]). This is
@@ -2428,6 +2471,68 @@ mod tests {
                 (Singer::Screaming, None)
             ]
         );
+    }
+
+    fn named(singer: Singer, name: Option<&str>) -> LyricLine {
+        let mut l = LyricLine::new("x");
+        l.singer = singer;
+        l.custom_singer_name = name.map(str::to_string);
+        l
+    }
+
+    #[test]
+    fn new_custom_singers_each_get_their_own_free_voice() {
+        // Pink Guy already took Male; naming a 2nd Default line must not
+        // land on Default (or Male) again.
+        let lines = vec![
+            named(Singer::Male, Some("Pink Guy")),
+            named(Singer::Default, None),
+            named(Singer::Default, Some("Getter")),
+        ];
+        assert_eq!(
+            free_voice_for_new_custom_singer(&lines, 2),
+            Some(Singer::Female)
+        );
+    }
+
+    #[test]
+    fn free_voice_ignores_the_line_being_named_and_skips_used_slots() {
+        let lines = vec![
+            named(Singer::Male, Some("A")),
+            named(Singer::Female, Some("B")),
+            named(Singer::Screaming, None),
+            named(Singer::Duet, Some("C")),
+        ];
+        // Line 3's own Duet doesn't count against it.
+        assert_eq!(
+            free_voice_for_new_custom_singer(&lines, 3),
+            Some(Singer::Duet)
+        );
+        // Every auto slot used by some other line -> leave it alone.
+        let full = vec![
+            named(Singer::Male, None),
+            named(Singer::Female, None),
+            named(Singer::Duet, None),
+            named(Singer::Screaming, None),
+            named(Singer::Default, Some("D")),
+        ];
+        assert_eq!(free_voice_for_new_custom_singer(&full, 4), None);
+    }
+
+    #[test]
+    fn set_custom_singer_voice_moves_every_line_with_that_name_only() {
+        let mut lines = vec![
+            named(Singer::Default, Some("Getter")),
+            named(Singer::Default, Some("Pink Guy")),
+            named(Singer::Default, Some("Getter")),
+        ];
+        assert_eq!(
+            set_custom_singer_voice(&mut lines, "Getter", Singer::Duet),
+            2
+        );
+        assert_eq!(lines[0].singer, Singer::Duet);
+        assert_eq!(lines[1].singer, Singer::Default);
+        assert_eq!(lines[2].singer, Singer::Duet);
     }
 
     #[test]

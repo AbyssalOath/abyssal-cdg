@@ -190,11 +190,14 @@ app - as long as it still exists, and **Choose folder…** opens there.
    "Lead Singer", whatever) right next to the voice dropdown - it shows up
    in the legend/dropdown instead of the generic "Male", and once typed
    once, becomes a one-click option in every other line's dropdown too, no
-   retyping. A custom name always shares its base category's color (Male 1
-   and Male 2 both render in Male's color) rather than getting its own -
-   there's no separate color budget for arbitrarily many distinct singers,
-   especially in the `.cdg` export's fixed 16-color palette - it's a
-   distinct *label*, not a distinct color.
+   retyping. Each custom singer uses one of the voice color slots: naming
+   a line that's still on Default moves it to the first free slot (Male,
+   Female, Duet, then Screaming), so several named singers get different
+   colors automatically. To change which slot a singer uses, open
+   **Colors > Custom singers**. The change applies to all of that singer's
+   lines, and the color pickers show who uses each pair. There's a fixed
+   number of slots (the `.cdg` export only has 16 colors), so past that
+   singers have to share one, and the panel warns you when two do.
 
    **Overlapping backing vocals / two-lane duets.** When a second voice
    sings *different* lyrics at the same time as the lead - a backing

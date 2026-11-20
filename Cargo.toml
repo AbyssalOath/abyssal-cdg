@@ -1,6 +1,6 @@
 [package]
 name = "abyssal-cdg"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2021"
 # Strictest MSRV among dependencies (egui/eframe 0.37) - see
 # BUILD_TROUBLESHOOTING.md.
